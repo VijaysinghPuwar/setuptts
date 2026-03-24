@@ -12,10 +12,10 @@ No Python. No terminal. No setup. Just download and run.
 
 | Platform | File | Notes |
 |----------|------|-------|
-| macOS | `SetupTTS-macOS.dmg` | Drag-to-Applications |
-| macOS | `SetupTTS-macOS.zip` | Fallback zip |
-| Windows 10/11 | `SetupTTS-Windows-Installer.exe` | Guided installer |
-| Windows 10/11 | `SetupTTS-Windows-Portable.zip` | No install needed |
+| macOS (Apple Silicon + Intel via Rosetta) | `SetupTTS-macOS.dmg` | Drag-to-Applications |
+| macOS (Apple Silicon + Intel via Rosetta) | `SetupTTS-macOS.zip` | Fallback zip |
+| Windows 10/11 (64-bit) | `SetupTTS-Windows-Installer.exe` | Guided installer |
+| Windows 10/11 (64-bit) | `SetupTTS-Windows-Portable.zip` | No install needed |
 
 ---
 

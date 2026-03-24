@@ -22,7 +22,7 @@ jobs:
   # ────────────────────────────────────────────────────────────────────────────
   build-macos:
     name: macOS release
-    runs-on: macos-13
+    runs-on: macos-latest   # Apple Silicon (arm64); runs on Intel Macs via Rosetta 2
 
     steps:
       - name: Checkout
