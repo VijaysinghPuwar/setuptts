@@ -1,0 +1,217 @@
+name: Build Release
+
+# Triggers:
+#   - Push of a version tag:  git tag v1.0.0 && git push origin v1.0.0
+#   - Manual run from GitHub Actions UI (workflow_dispatch)
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label (e.g. 1.0.0)"
+        required: false
+        default: "dev"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # macOS build
+  # ──────────────────────────────────────────────────────────────────────────
+  build-macos:
+    name: macOS release
+    runs-on: macos-13        # Intel runner; use macos-14 for Apple Silicon
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build with PyInstaller
+        run: python -m PyInstaller setuptts.spec --noconfirm
+
+      - name: Verify bundle assets
+        run: |
+          RES=dist/SetupTTS.app/Contents/Resources
+          test -f "$RES/app/assets/styles/app.qss" || (echo "QSS missing" && exit 1)
+          test -f "$RES/app/assets/icons/app.png"  || (echo "icon missing" && exit 1)
+          test -d "$RES/edge_tts"                  || (echo "edge_tts missing" && exit 1)
+          echo "Bundle assets OK"
+
+      - name: Create release zip
+        run: |
+          VERSION=${{ steps.ver.outputs.version }}
+          ditto -c -k --keepParent dist/SetupTTS.app \
+            "SetupTTS-macOS-${VERSION}.zip"
+          echo "Zip size: $(du -sh SetupTTS-macOS-${VERSION}.zip | cut -f1)"
+
+      - name: Verify zip can be extracted
+        run: |
+          VERSION=${{ steps.ver.outputs.version }}
+          TMPDIR=$(mktemp -d)
+          ditto -x -k "SetupTTS-macOS-${VERSION}.zip" "$TMPDIR"
+          test -x "$TMPDIR/SetupTTS.app/Contents/MacOS/SetupTTS" \
+            || (echo "binary not executable after extraction" && exit 1)
+          rm -rf "$TMPDIR"
+          echo "Zip verification OK"
+
+      - name: Upload macOS zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: SetupTTS-macOS-${{ steps.ver.outputs.version }}
+          path: SetupTTS-macOS-${{ steps.ver.outputs.version }}.zip
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Windows build
+  # ──────────────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build with PyInstaller
+        run: python -m PyInstaller setuptts.spec --noconfirm
+
+      - name: Verify exe
+        run: |
+          if (!(Test-Path "dist\SetupTTS.exe")) {
+            Write-Error "SetupTTS.exe not found"; exit 1
+          }
+          $size = (Get-Item "dist\SetupTTS.exe").Length / 1MB
+          Write-Host "SetupTTS.exe  $([math]::Round($size,1)) MB"
+        shell: pwsh
+
+      - name: Create release zip
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}"
+          $zip = "SetupTTS-Windows-${ver}.zip"
+          Compress-Archive -Force -Path "dist\SetupTTS.exe" -DestinationPath $zip
+          $size = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          Write-Host "Created ${zip}  (${size} MB)"
+
+      - name: Verify zip contents
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}"
+          $zip = "SetupTTS-Windows-${ver}.zip"
+          $tmp = New-Item -ItemType Directory -Path "$env:TEMP\st_verify"
+          Expand-Archive -Path $zip -DestinationPath $tmp.FullName
+          if (!(Test-Path "$($tmp.FullName)\SetupTTS.exe")) {
+            Write-Error "SetupTTS.exe missing after extraction"; exit 1
+          }
+          Write-Host "Zip verification OK"
+          Remove-Item -Recurse -Force $tmp.FullName
+
+      - name: Upload Windows zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: SetupTTS-Windows-${{ steps.ver.outputs.version }}
+          path: SetupTTS-Windows-${{ steps.ver.outputs.version }}.zip
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Create GitHub Release (only on tag push)
+  # ──────────────────────────────────────────────────────────────────────────
+  create-release:
+    name: Publish GitHub Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Resolve version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS zip
+        uses: actions/download-artifact@v4
+        with:
+          name: SetupTTS-macOS-${{ steps.ver.outputs.version }}
+
+      - name: Download Windows zip
+        uses: actions/download-artifact@v4
+        with:
+          name: SetupTTS-Windows-${{ steps.ver.outputs.version }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SetupTTS v${{ steps.ver.outputs.version }}
+          body: |
+            ## SetupTTS v${{ steps.ver.outputs.version }}
+
+            Convert any text to natural-sounding audio using Microsoft Neural voices.
+
+            ### Download
+
+            | Platform | File |
+            |----------|------|
+            | macOS (Intel + Apple Silicon) | `SetupTTS-macOS-${{ steps.ver.outputs.version }}.zip` |
+            | Windows 10/11 (64-bit) | `SetupTTS-Windows-${{ steps.ver.outputs.version }}.zip` |
+
+            ### macOS install
+            1. Download and extract the zip
+            2. Drag **SetupTTS.app** to your Applications folder (optional)
+            3. Double-click to open
+            4. **First launch only:** right-click → Open to bypass Gatekeeper
+               (required for unsigned apps; only needed once)
+
+            ### Windows install
+            1. Download and extract the zip
+            2. Double-click **SetupTTS.exe**
+            3. No Python or installation required
+
+            ### Requirements
+            - Internet connection (voices are streamed from Microsoft's Neural TTS service)
+            - macOS 12+ or Windows 10/11 (64-bit)
+          files: |
+            SetupTTS-macOS-${{ steps.ver.outputs.version }}.zip
+            SetupTTS-Windows-${{ steps.ver.outputs.version }}.zip
+          draft: false
+          prerelease: false
