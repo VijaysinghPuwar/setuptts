@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "setuptts"
+version = "1.0.0"
+description = "Professional text-to-audio desktop application"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7.0",
+    "edge-tts>=6.1.0",
+    "platformdirs>=4.0.0",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0.0",
+]
+dev = [
+    "pyinstaller>=6.0.0",
+    "pytest>=7.0",
+    "pytest-qt>=4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
