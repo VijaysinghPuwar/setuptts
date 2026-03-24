@@ -1,17 +1,40 @@
 ; =============================================================================
-;  VoiceCraft — Inno Setup Installer Script
+;  SetupTTS — Inno Setup Installer Script
 ;  Inno Setup 6 required: https://jrsoftware.org/isdl.php
+;
+;  CI invocation (from repo root, PowerShell):
+;    & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+;        /DAppVersion=1.0.0 `
+;        /DSourceDir=C:\path\to\dist `
+;        /DOutputDir=C:\path\to\installer_out `
+;        installers\windows.iss
+;
+;  Local invocation (from repo root):
+;    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installers\windows.iss
+;    (uses defaults: AppVersion=1.0.0, SourceDir=..\dist, OutputDir=out)
 ; =============================================================================
 
-#define AppName      "VoiceCraft"
-#define AppVersion   "1.0.0"
-#define AppPublisher "VoiceCraft"
-#define AppURL       "https://github.com/your-username/voicecraft"
-#define AppExe       "VoiceCraft.exe"
-#define SourceDir    "..\dist"
+; ── Overridable via ISCC /D command-line defines ─────────────────────────────
+#ifndef AppVersion
+  #define AppVersion "1.0.0"
+#endif
+
+#ifndef SourceDir
+  #define SourceDir "..\dist"
+#endif
+
+#ifndef OutputDir
+  #define OutputDir "out"
+#endif
+
+; ── Fixed defines ─────────────────────────────────────────────────────────────
+#define AppName      "SetupTTS"
+#define AppPublisher "SetupTTS"
+#define AppURL       "https://github.com/VijaysinghPuwar/setuptts"
+#define AppExe       "SetupTTS.exe"
 
 [Setup]
-AppId={{A3F7E2B1-4D8C-4E5F-9A1B-2C3D4E5F6A7B}
+AppId={{29A84364-234A-48E0-99EA-B69C984270F3}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
@@ -22,17 +45,16 @@ AppUpdatesURL={#AppURL}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 AllowNoIcons=yes
-OutputDir=out
-OutputBaseFilename=VoiceCraftSetup
+OutputDir={#OutputDir}
+OutputBaseFilename=SetupTTS-Windows-Installer
 SetupIconFile=..\app\assets\icons\app.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 
-; Visual: modern UI style
 WizardImageFile=compiler:WizModernImage.bmp
 WizardSmallImageFile=compiler:WizModernSmallImage.bmp
 
@@ -40,28 +62,21 @@ WizardSmallImageFile=compiler:WizModernSmallImage.bmp
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon";   Description: "{cm:CreateDesktopIcon}";   GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "quicklaunch";   Description: "Add to Quick Launch bar";   GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked; OnlyBelowVersion: 6.1
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; The PyInstaller single-file EXE
+; PyInstaller single-file EXE — fully self-contained, no Python required
 Source: "{#SourceDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 
-; Optional: if you switch to one-folder build, use this instead:
-; Source: "{#SourceDir}\VoiceCraft\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-
 [Icons]
-Name: "{group}\{#AppName}";                       Filename: "{app}\{#AppExe}"
-Name: "{group}\Uninstall {#AppName}";             Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}";                 Filename: "{app}\{#AppExe}"; Tasks: desktopicon
-Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: quicklaunch
+Name: "{group}\{#AppName}";           Filename: "{app}\{#AppExe}"
+Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#AppName}";     Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; Clean up user data only if the user wants — we leave it alone by default.
-; Type: filesandordirs; Name: "{localappdata}\VoiceCraft"
-
-[Code]
-// Nothing custom needed — Inno Setup handles everything.
+; User data (settings, history) is left untouched on uninstall by default.
+; Uncomment below to also remove user data on uninstall:
+; Type: filesandordirs; Name: "{localappdata}\SetupTTS"
