@@ -148,8 +148,7 @@ GitHub Actions builds both macOS and Windows packages and publishes them as a Gi
 |-------|-----------|
 | UI | PySide6 (Qt 6) |
 | TTS | edge-tts (Microsoft Neural TTS) |
-| Networking | aiohttp |
-| Storage | SQLite WAL |
+| Storage | SQLite (job history) |
 | Packaging | PyInstaller |
 
 ### Project structure

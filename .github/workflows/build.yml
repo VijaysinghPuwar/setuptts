@@ -268,8 +268,8 @@ jobs:
 
             | Platform | File | Description |
             |----------|------|-------------|
-            | **macOS** (Intel) | `SetupTTS-macOS.dmg` | Drag-to-Applications installer |
-            | **macOS** (Intel) | `SetupTTS-macOS.zip` | Fallback — extract and run |
+            | **macOS** (Apple Silicon + Intel via Rosetta) | `SetupTTS-macOS.dmg` | Drag-to-Applications installer |
+            | **macOS** (Apple Silicon + Intel via Rosetta) | `SetupTTS-macOS.zip` | Fallback — extract and run |
             | **Windows** 10/11 | `SetupTTS-Windows-Installer.exe` | Guided installer |
             | **Windows** 10/11 | `SetupTTS-Windows-Portable.zip` | No install needed |
 
