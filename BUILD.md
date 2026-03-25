@@ -9,10 +9,16 @@ It is packaged as a native desktop application — no Python, no terminal, no se
 
 ## For end users
 
-| Platform | What to share                  | What users do                              |
-|----------|--------------------------------|--------------------------------------------|
-| macOS    | `SetupTTS-macOS-1.0.0.zip`    | Extract zip, double-click SetupTTS.app     |
-| Windows  | `SetupTTS-Windows-1.0.0.zip`  | Extract zip, double-click SetupTTS.exe     |
+End users download from **GitHub Releases** — not from source.
+
+**→ [github.com/VijaysinghPuwar/setuptts/releases/latest](https://github.com/VijaysinghPuwar/setuptts/releases/latest)**
+
+| Platform | File | Notes |
+|----------|------|-------|
+| macOS | `SetupTTS-macOS.dmg` | Drag-to-Applications (recommended) |
+| macOS | `SetupTTS-macOS.zip` | Fallback — extract and double-click |
+| Windows 10/11 | `SetupTTS-Windows-Installer.exe` | Guided installer (recommended) |
+| Windows 10/11 | `SetupTTS-Windows-Portable.zip` | No install needed |
 
 No Python. No pip. No terminal. No extra steps. The app handles everything.
 
@@ -23,7 +29,7 @@ No Python. No pip. No terminal. No extra steps. The app handles everything.
 ### 1. Clone and create a virtual environment
 
 ```bash
-git clone https://github.com/your-username/setuptts.git
+git clone https://github.com/VijaysinghPuwar/setuptts.git
 cd setuptts
 python3.12 -m venv .venv
 source .venv/bin/activate        # macOS / Linux
@@ -62,13 +68,13 @@ chmod +x build_macos.sh
 
 **Output:**
 - `dist/SetupTTS.app` — the app bundle
-- `releases/SetupTTS-macOS-1.0.0.zip` — distributable zip
+- `releases/SetupTTS-macOS-1.0.0.zip` — local distributable zip
 
-**Share:** Send `SetupTTS-macOS-1.0.0.zip` to users. They extract and double-click.
+> **Note:** The local script produces a versioned zip for ad-hoc sharing. The CI/CD pipeline (GitHub Actions) produces the full release artifacts: `SetupTTS-macOS.dmg` and `SetupTTS-macOS.zip`.
 
 ---
 
-### Windows → .exe + zip
+### Windows → .exe + installer + portable zip
 
 **Prerequisites (once):**
 ```powershell
@@ -86,10 +92,10 @@ build_windows.bat
 ```
 
 **Output:**
-- `dist/SetupTTS.exe` — standalone executable (no install needed)
-- `releases\SetupTTS-Windows-1.0.0.zip` — distributable zip
+- `dist/SetupTTS.exe` — standalone executable
+- `releases\SetupTTS-Windows-1.0.0.zip` — local distributable zip
 
-**Share:** Send `SetupTTS-Windows-1.0.0.zip` to users. They extract and double-click.
+> **Note:** The local scripts produce a versioned zip for ad-hoc use. The CI/CD pipeline (GitHub Actions) produces the full release artifacts: `SetupTTS-Windows-Installer.exe` (Inno Setup) and `SetupTTS-Windows-Portable.zip`. To build the installer locally, you also need [Inno Setup 6](https://jrsoftware.org/isinfo.php) installed.
 
 ---
 
@@ -103,9 +109,11 @@ git push origin v1.0.0
 ```
 
 The workflow (`.github/workflows/build.yml`) will:
-1. Build on a real macOS runner → produces `SetupTTS-macOS-1.0.0.zip`
-2. Build on a real Windows runner → produces `SetupTTS-Windows-1.0.0.zip`
-3. Attach both to a GitHub Release automatically
+1. Build on a real macOS runner (Apple Silicon) → produces `SetupTTS-macOS.dmg` + `SetupTTS-macOS.zip`
+2. Build on a real Windows runner → produces `SetupTTS-Windows-Installer.exe` + `SetupTTS-Windows-Portable.zip`
+3. Attach all four artifacts to a GitHub Release automatically
+
+All four release artifacts use clean, non-versioned filenames — the release title (`SetupTTS vX.Y.Z`) carries the version.
 
 You can also trigger a manual build from the GitHub Actions UI using `workflow_dispatch`.
 
