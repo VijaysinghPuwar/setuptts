@@ -110,8 +110,23 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # Windows build
-  # Produces: SetupTTS-Windows-Installer.exe  (guided installer)
-  #           SetupTTS-Windows-Portable.zip   (no-install single EXE)
+  #
+  # Two separate PyInstaller builds for two distinct use cases:
+  #
+  #   setuptts.spec          → onedir  → dist\SetupTTS\   (for Inno Setup installer)
+  #   setuptts_portable.spec → onefile → dist_portable\SetupTTS.exe (portable zip)
+  #
+  # Why two builds?
+  #   onedir is reliable when installed by Inno Setup (files stay together in
+  #   Program Files, launched via Start Menu shortcut).  For portable use, onedir
+  #   breaks because Windows Explorer lets users run EXEs from inside a zip
+  #   without extracting — the _internal/ folder stays in the zip → python312.dll
+  #   not found.  onefile embeds everything inside the EXE so it runs from
+  #   anywhere with no folder-structure requirement.
+  #
+  # Produces:
+  #   SetupTTS-Windows-Installer.exe  (guided installer — recommended)
+  #   SetupTTS-Windows-Portable.zip   (single EXE — extract and double-click)
   # ────────────────────────────────────────────────────────────────────────────
   build-windows:
     name: Windows release
@@ -141,27 +156,25 @@ jobs:
             echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build with PyInstaller
+      - name: Build installer (onedir)
         run: python -m PyInstaller setuptts.spec --noconfirm
 
       - name: Verify onedir build
         shell: pwsh
         run: |
-          # onedir produces dist\SetupTTS\SetupTTS.exe (not dist\SetupTTS.exe)
           if (!(Test-Path "dist\SetupTTS\SetupTTS.exe")) {
             Write-Error "dist\SetupTTS\SetupTTS.exe not found"; exit 1
           }
           $exeSize = [math]::Round((Get-Item "dist\SetupTTS\SetupTTS.exe").Length / 1MB, 1)
           $dirSize = [math]::Round((Get-ChildItem -Recurse "dist\SetupTTS" |
             Measure-Object -Property Length -Sum).Sum / 1MB, 1)
-          Write-Host "SetupTTS.exe  ${exeSize} MB  |  folder total ${dirSize} MB"
+          Write-Host "Installer build: SetupTTS.exe ${exeSize} MB  |  folder total ${dirSize} MB"
 
       - name: Build Inno Setup installer
         shell: pwsh
         run: |
           $ver       = "${{ steps.ver.outputs.version }}"
           $iscc      = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          # SourceDir must point to the onedir folder, not dist\ itself
           $sourceDir = (Resolve-Path "dist\SetupTTS").Path
           $outputDir = (New-Item -ItemType Directory -Force -Path "installer_out").FullName
 
@@ -181,11 +194,24 @@ jobs:
           Write-Host "Installer: ${size} MB"
           Copy-Item $installer "SetupTTS-Windows-Installer.exe"
 
+      - name: Build portable (onefile)
+        run: |
+          python -m PyInstaller setuptts_portable.spec --noconfirm --distpath dist_portable
+
+      - name: Verify portable EXE
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist_portable\SetupTTS.exe")) {
+            Write-Error "dist_portable\SetupTTS.exe not found"; exit 1
+          }
+          $size = [math]::Round((Get-Item "dist_portable\SetupTTS.exe").Length / 1MB, 1)
+          Write-Host "Portable EXE: ${size} MB"
+
       - name: Create portable zip
         shell: pwsh
         run: |
-          # Zip the whole onedir folder so users get SetupTTS\SetupTTS.exe after extraction
-          Compress-Archive -Force -Path "dist\SetupTTS" `
+          # Zip only the single EXE — users extract and double-click SetupTTS.exe
+          Compress-Archive -Force -Path "dist_portable\SetupTTS.exe" `
             -DestinationPath "SetupTTS-Windows-Portable.zip"
           $size = [math]::Round((Get-Item "SetupTTS-Windows-Portable.zip").Length / 1MB, 1)
           Write-Host "Portable zip: ${size} MB"
@@ -195,10 +221,11 @@ jobs:
         run: |
           $tmp = New-Item -ItemType Directory -Path "$env:TEMP\st_verify"
           Expand-Archive -Path "SetupTTS-Windows-Portable.zip" -DestinationPath $tmp.FullName
-          if (!(Test-Path "$($tmp.FullName)\SetupTTS\SetupTTS.exe")) {
-            Write-Error "SetupTTS\SetupTTS.exe missing after extraction"; exit 1
+          if (!(Test-Path "$($tmp.FullName)\SetupTTS.exe")) {
+            Write-Error "SetupTTS.exe missing after extraction"; exit 1
           }
-          Write-Host "Portable zip verified OK"
+          $size = [math]::Round((Get-Item "$($tmp.FullName)\SetupTTS.exe").Length / 1MB, 1)
+          Write-Host "Portable zip verified OK — SetupTTS.exe ${size} MB"
           Remove-Item -Recurse -Force $tmp.FullName
 
       - name: Upload Windows installer
@@ -306,8 +333,8 @@ jobs:
             3. Launch SetupTTS from the Start Menu or desktop shortcut
 
             **Option 2 — Portable (no install)**
-            1. Download and unzip `SetupTTS-Windows-Portable.zip`
-            2. Open the extracted **SetupTTS** folder
+            1. Download `SetupTTS-Windows-Portable.zip`
+            2. Extract it (right-click → Extract All)
             3. Double-click **SetupTTS.exe**
 
             ---
