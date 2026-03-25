@@ -48,9 +48,11 @@ No Python. No terminal. No setup. Just download and run.
 
 **Option 2 — Portable (no install)**
 
-1. Download `SetupTTS-Windows-Portable.zip` and unzip it anywhere
-2. Open the extracted **SetupTTS** folder
+1. Download `SetupTTS-Windows-Portable.zip`
+2. Right-click → **Extract All** (extract to any folder — Desktop, USB drive, etc.)
 3. Double-click **SetupTTS.exe**
+
+> The portable build is a single self-contained EXE — no extra folder or files needed.
 
 ---
 

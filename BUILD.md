@@ -92,12 +92,17 @@ build_windows.bat
 ```
 
 **Output:**
-- `dist/SetupTTS/` — onedir app folder (EXE + supporting DLLs/data)
-- `releases\SetupTTS-Windows-1.0.0.zip` — portable zip of that folder
+- `dist_portable/SetupTTS.exe` — single self-contained onefile EXE (portable)
+- `releases\SetupTTS-Windows-1.0.0.zip` — zip of that EXE
 
-> **Note:** The Windows build uses PyInstaller **onedir** mode (a folder, not a single self-extracting EXE). This eliminates the 5–30 s per-launch extraction overhead that onefile builds impose on Windows.
+> **Two-build architecture:** The CI uses *two* PyInstaller specs:
 >
-> The local scripts produce a versioned zip for ad-hoc use. The CI/CD pipeline (GitHub Actions) produces the full release artifacts: `SetupTTS-Windows-Installer.exe` (Inno Setup) and `SetupTTS-Windows-Portable.zip`. To build the installer locally, you also need [Inno Setup 6](https://jrsoftware.org/isinfo.php) installed.
+> | Artifact | Spec | Mode | Why |
+> |---|---|---|---|
+> | `SetupTTS-Windows-Installer.exe` | `setuptts.spec` | onedir | Inno Setup manages all files in Program Files; launched via shortcut |
+> | `SetupTTS-Windows-Portable.zip` | `setuptts_portable.spec` | onefile | Single EXE users can run from anywhere without folder-structure requirements |
+>
+> The local scripts build only the portable (onefile). For the full installer locally, you also need [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 
 ---
 
