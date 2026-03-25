@@ -10,7 +10,11 @@
 ::   - pip install -r requirements.txt pyinstaller
 ::
 :: Output:
-::   releases\SetupTTS-Windows-1.0.0.zip  (single self-contained .exe)
+::   releases\SetupTTS-Windows-1.0.0.zip  (folder-based portable build)
+::
+:: Note: Uses PyInstaller onedir mode — a folder of files, not a single EXE.
+:: This eliminates the per-launch self-extraction overhead (5-30 s on Windows).
+:: Users extract the zip, open the SetupTTS folder, and double-click SetupTTS.exe.
 :: ─────────────────────────────────────────────────────────────────────────────
 
 setlocal enabledelayedexpansion
@@ -18,7 +22,8 @@ setlocal enabledelayedexpansion
 set APP_NAME=SetupTTS
 set VERSION=1.0.0
 set SPEC=setuptts.spec
-set EXE=dist\%APP_NAME%.exe
+set APP_DIR=dist\%APP_NAME%
+set EXE=%APP_DIR%\%APP_NAME%.exe
 set RELEASES_DIR=releases
 set ZIP_NAME=%APP_NAME%-Windows-%VERSION%.zip
 set ZIP_PATH=%RELEASES_DIR%\%ZIP_NAME%
@@ -50,11 +55,11 @@ if not exist "%EXE%" (
 )
 echo        %EXE% found OK
 
-:: 4. Create release zip using PowerShell
+:: 4. Create release zip of the whole folder using PowerShell
 echo [4/4] Creating release zip...
 if not exist "%RELEASES_DIR%" mkdir "%RELEASES_DIR%"
 powershell -NoProfile -Command ^
-    "Compress-Archive -Force -Path '%EXE%' -DestinationPath '%ZIP_PATH%'"
+    "Compress-Archive -Force -Path '%APP_DIR%' -DestinationPath '%ZIP_PATH%'"
 if %errorlevel% neq 0 (
     echo ERROR: Failed to create zip
     exit /b 1
@@ -64,5 +69,6 @@ echo.
 echo === Build complete ===
 echo Release: %ZIP_PATH%
 echo.
-echo Users extract the zip and double-click SetupTTS.exe
+echo Users extract the zip — a '%APP_NAME%' folder appears.
+echo Open that folder and double-click %APP_NAME%.exe.
 echo No Python, no pip, no installation required.

@@ -49,7 +49,8 @@ No Python. No terminal. No setup. Just download and run.
 **Option 2 — Portable (no install)**
 
 1. Download `SetupTTS-Windows-Portable.zip` and unzip it anywhere
-2. Double-click **SetupTTS.exe**
+2. Open the extracted **SetupTTS** folder
+3. Double-click **SetupTTS.exe**
 
 ---
 
