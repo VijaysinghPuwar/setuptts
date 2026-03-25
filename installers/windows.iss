@@ -5,13 +5,16 @@
 ;  CI invocation (from repo root, PowerShell):
 ;    & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
 ;        /DAppVersion=1.0.0 `
-;        /DSourceDir=C:\path\to\dist `
+;        /DSourceDir=C:\path\to\dist\SetupTTS `
 ;        /DOutputDir=C:\path\to\installer_out `
 ;        installers\windows.iss
 ;
 ;  Local invocation (from repo root):
 ;    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installers\windows.iss
-;    (uses defaults: AppVersion=1.0.0, SourceDir=..\dist, OutputDir=out)
+;    (uses defaults: AppVersion=1.0.0, SourceDir=..\dist\SetupTTS, OutputDir=out)
+;
+;  Note: SourceDir must point to the onedir OUTPUT folder (dist\SetupTTS\),
+;  not to dist\ itself. The onedir build avoids per-launch self-extraction.
 ; =============================================================================
 
 ; ── Overridable via ISCC /D command-line defines ─────────────────────────────
@@ -20,7 +23,7 @@
 #endif
 
 #ifndef SourceDir
-  #define SourceDir "..\dist"
+  #define SourceDir "..\dist\SetupTTS"
 #endif
 
 #ifndef OutputDir
@@ -65,8 +68,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; PyInstaller single-file EXE — fully self-contained, no Python required
-Source: "{#SourceDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; PyInstaller onedir build — copy all files from the dist\SetupTTS\ folder.
+; No self-extraction at launch; app starts immediately from installed files.
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}";           Filename: "{app}\{#AppExe}"

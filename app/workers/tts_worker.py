@@ -53,6 +53,7 @@ class TTSWorker(QThread):
         self._cancelled   = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task | None = None
+        self._last_pct: int = 0
 
     # ------------------------------------------------------------------ #
     # Public                                                               #
@@ -161,9 +162,13 @@ class TTSWorker(QThread):
                             processed_chars + len(word) + 1,
                             total_chars,
                         )
-                        # Reserve 3 %–95 % for streaming; 95–100 for file finalise
+                        # Reserve 3 %–95 % for streaming; 95–100 for file finalise.
+                        # Only emit when the integer value changes to avoid flooding
+                        # the Qt cross-thread queue (especially important on Windows).
                         pct = int(3 + (processed_chars / total_chars) * 92)
-                        self.progress.emit(pct)
+                        if pct != self._last_pct:
+                            self._last_pct = pct
+                            self.progress.emit(pct)
 
         except asyncio.CancelledError:
             logger.info("Stream cancelled — removing partial file")

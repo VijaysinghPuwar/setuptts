@@ -155,26 +155,36 @@ if sys.platform != "win32":
         },
     )
 
-# ── Windows single-file EXE ──────────────────────────────────────── #
+# ── Windows onedir build ─────────────────────────────────────────── #
+# onedir (folder) avoids the per-launch self-extraction that onefile
+# requires — eliminating the 5-30 s startup penalty and Windows
+# Defender scanning delay on every run.
+# Produces: dist/SetupTTS/SetupTTS.exe  (plus supporting DLLs/data)
 else:
     exe = EXE(
         pyz,
         a.scripts,
-        a.binaries,
-        a.zipfiles,
-        a.datas,
         [],
+        exclude_binaries=True,   # binaries go in the COLLECT step
         name="SetupTTS",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
         upx=False,           # do not require UPX to be installed on CI
-        upx_exclude=[],
-        runtime_tmpdir=None,
         console=False,
         disable_windowed_traceback=False,
         codesign_identity=None,
         entitlements_file=None,
         icon=str(_ico) if _ico.exists() else None,
         version_file=None,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        name="SetupTTS",
     )
