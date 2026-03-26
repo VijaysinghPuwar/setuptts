@@ -486,6 +486,7 @@ class OutputPanel(QWidget):
         self._queue.job_progress.connect(self._on_job_progress)
         self._queue.job_status_changed.connect(self._on_job_status_changed)
         self._queue.job_stage_changed.connect(self._on_job_stage_changed)
+        self._queue.job_speed_updated.connect(self._on_job_speed_updated)
         self._queue.job_completed.connect(self._on_job_completed)
         self._queue.job_failed.connect(self._on_job_failed)
         self._queue.job_cancelled.connect(self._on_job_cancelled)
@@ -790,6 +791,10 @@ class OutputPanel(QWidget):
         if job_id in self._job_rows:
             self._job_rows[job_id].update_stage(kind, text)
 
+    def _on_job_speed_updated(self, job_id: str, cps: float) -> None:
+        if job_id in self._job_rows:
+            self._job_rows[job_id].update_speed(cps)
+
     def _on_job_completed(self, item: JobItem) -> None:
         self._remove_job_row(item.id)
 
@@ -941,6 +946,24 @@ class _JobRowWidget(QWidget):
 
         root.addLayout(bot)
 
+        # ── Line 3: real-time speed ─────────────────────────────────── #
+        # Indented 123 px (18 left margin + 100 voice label + 5 spacing)
+        # so it sits directly below the progress bar.
+        # Hidden until the first speed measurement arrives.
+        spd_row = QHBoxLayout()
+        spd_row.setContentsMargins(123, 0, 0, 0)
+        spd_row.setSpacing(0)
+
+        self._speed_lbl = QLabel("")
+        self._speed_lbl.setStyleSheet(
+            "font-size: 11px; font-weight: 700; color: #1DB954;"
+            " background: transparent;"
+        )
+        self._speed_lbl.hide()
+        spd_row.addWidget(self._speed_lbl)
+        spd_row.addStretch()
+        root.addLayout(spd_row)
+
     # ------------------------------------------------------------------ #
 
     # Stage-kind → (hex color, badge label)
@@ -982,6 +1005,12 @@ class _JobRowWidget(QWidget):
         )
         self._status_lbl.setTextFormat(Qt.RichText)
         self._status_lbl.setText(html)
+
+    def update_speed(self, cps: float) -> None:
+        """Show real-time generation speed below the progress bar."""
+        if cps > 0:
+            self._speed_lbl.setText(f"{cps:,.0f} chars/s")
+            self._speed_lbl.show()
 
 
 # ══════════════════════════════════════════════════════════════════════ #
