@@ -12,7 +12,7 @@ Outputs (platform-dependent):
 
 import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 ROOT = Path(SPECPATH)
 
@@ -20,15 +20,27 @@ ROOT = Path(SPECPATH)
 edge_tts_datas = collect_data_files("edge_tts")
 certifi_datas  = collect_data_files("certifi")
 
+# aiohttp hard dependencies — collect_all gets data, binaries (C extensions),
+# AND hidden imports for each package.  This prevents "ModuleNotFoundError:
+# No module named 'aiosignal'" crashes in packaged builds, where PyInstaller's
+# static analysis sometimes misses packages that have C extension variants
+# (multidict, frozenlist, yarl all have optional .pyd/.so accelerators).
+_aio_d, _aio_b, _aio_h = collect_all("aiohttp")
+_sig_d, _sig_b, _sig_h = collect_all("aiosignal")
+_fzl_d, _fzl_b, _fzl_h = collect_all("frozenlist")
+_mdi_d, _mdi_b, _mdi_h = collect_all("multidict")
+_yrl_d, _yrl_b, _yrl_h = collect_all("yarl")
+
 # ── Hidden imports ────────────────────────────────────────────────── #
 # PyInstaller's static analysis misses dynamically-imported submodules.
 # edge_tts uses aiohttp for all HTTP/WebSocket connections.
 _hidden = [
-    # edge_tts submodules (collect_submodules catches __main__ etc.)
+    # edge_tts submodules
     *collect_submodules("edge_tts"),
-    # aiohttp — edge_tts network backend (HTTP + WebSocket)
-    *collect_submodules("aiohttp"),
-    "aiohttp",
+    # aiohttp + all its dependencies (collected above via collect_all)
+    *_aio_h, *_sig_h, *_fzl_h, *_mdi_h, *_yrl_h,
+    "aiohttp", "aiosignal", "frozenlist", "multidict", "yarl",
+    "attrs", "attr",
     # async runtime
     "asyncio",
     # typing helpers used by edge_tts
@@ -46,6 +58,7 @@ _hidden = [
     "ctypes",
     "threading",
     "tempfile",
+    "re",
 ]
 
 # Windows-only additions
@@ -62,11 +75,15 @@ block_cipher = None
 a = Analysis(
     [str(ROOT / "main.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=[
+        # C extension binaries for aiohttp dependencies
+        *_aio_b, *_sig_b, *_fzl_b, *_mdi_b, *_yrl_b,
+    ],
     datas=[
         (str(ROOT / "app" / "assets"), "app/assets"),
         *edge_tts_datas,
         *certifi_datas,
+        *_aio_d, *_sig_d, *_fzl_d, *_mdi_d, *_yrl_d,
     ],
     hiddenimports=_hidden,
     hookspath=[],
@@ -146,8 +163,8 @@ if sys.platform != "win32":
         info_plist={
             "CFBundleName":              "SetupTTS",
             "CFBundleDisplayName":       "SetupTTS",
-            "CFBundleVersion":           "1.0.0",
-            "CFBundleShortVersionString":"1.0.0",
+            "CFBundleVersion":           "1.3.0",
+            "CFBundleShortVersionString":"1.3.0",
             "NSHighResolutionCapable":   True,
             "NSRequiresAquaSystemAppearance": False,
             "LSMinimumSystemVersion":    "12.0",

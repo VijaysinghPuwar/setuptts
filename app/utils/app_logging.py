@@ -43,3 +43,5 @@ def setup_logging(log_dir: Path, level: int = logging.DEBUG) -> None:
     logging.getLogger("edge_tts").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("aiosignal").setLevel(logging.WARNING)

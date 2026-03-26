@@ -90,6 +90,7 @@ class PreviewWorker(QThread):
 
         if self._stop_requested:
             self._cleanup()
+            self.finished.emit()   # always notify UI so buttons reset
             return
 
         self.started_playing.emit()
@@ -162,8 +163,11 @@ class PreviewWorker(QThread):
                 break
             time.sleep(0.2)
 
-        winmm.mciSendStringW(f"close {alias}", None, 0, None)
-        self._mci_alias = None
+        # Only close if _kill_playback() hasn't already closed it.
+        # _kill_playback() clears self._mci_alias; alias is a local copy.
+        if self._mci_alias:
+            winmm.mciSendStringW(f"close {self._mci_alias}", None, 0, None)
+            self._mci_alias = None
 
     def _play_windows_fallback(self, path: str) -> None:
         """Last resort: open with OS default media player."""

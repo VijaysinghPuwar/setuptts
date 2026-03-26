@@ -32,7 +32,7 @@ This spec is Windows-only.  Do not run it on macOS.
 
 import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 if sys.platform != "win32":
     raise SystemExit("setuptts_portable.spec is for Windows only. "
@@ -44,11 +44,19 @@ ROOT = Path(SPECPATH)
 edge_tts_datas = collect_data_files("edge_tts")
 certifi_datas  = collect_data_files("certifi")
 
+# aiohttp hard dependencies — same as setuptts.spec
+_aio_d, _aio_b, _aio_h = collect_all("aiohttp")
+_sig_d, _sig_b, _sig_h = collect_all("aiosignal")
+_fzl_d, _fzl_b, _fzl_h = collect_all("frozenlist")
+_mdi_d, _mdi_b, _mdi_h = collect_all("multidict")
+_yrl_d, _yrl_b, _yrl_h = collect_all("yarl")
+
 # ── Hidden imports (identical to setuptts.spec) ───────────────────── #
 _hidden = [
     *collect_submodules("edge_tts"),
-    *collect_submodules("aiohttp"),
-    "aiohttp",
+    *_aio_h, *_sig_h, *_fzl_h, *_mdi_h, *_yrl_h,
+    "aiohttp", "aiosignal", "frozenlist", "multidict", "yarl",
+    "attrs", "attr",
     "asyncio",
     "typing_extensions",
     "PySide6.QtCore",
@@ -61,6 +69,7 @@ _hidden = [
     "ctypes",
     "threading",
     "tempfile",
+    "re",
     # Windows async I/O
     "ctypes.windll",
     "asyncio.proactor_events",
@@ -72,11 +81,14 @@ block_cipher = None
 a = Analysis(
     [str(ROOT / "main.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=[
+        *_aio_b, *_sig_b, *_fzl_b, *_mdi_b, *_yrl_b,
+    ],
     datas=[
         (str(ROOT / "app" / "assets"), "app/assets"),
         *edge_tts_datas,
         *certifi_datas,
+        *_aio_d, *_sig_d, *_fzl_d, *_mdi_d, *_yrl_d,
     ],
     hiddenimports=_hidden,
     hookspath=[],

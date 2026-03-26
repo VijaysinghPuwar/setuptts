@@ -53,6 +53,20 @@ def _set_platform_font(app: QApplication) -> None:
 
 
 def main() -> None:
+    # ── SSL certificate path for packaged builds ────────────────────── #
+    # In a PyInstaller bundle, Python cannot find the certifi CA bundle
+    # through the normal package-data path.  Setting these env vars before
+    # anything else ensures aiohttp (used by edge_tts) can validate TLS
+    # certificates on both macOS and Windows.  Without this, voice loading
+    # and audio generation silently fail with SSL errors in packaged builds.
+    try:
+        import certifi as _certifi
+        os.environ.setdefault("SSL_CERT_FILE",       _certifi.where())
+        os.environ.setdefault("REQUESTS_CA_BUNDLE",  _certifi.where())
+        os.environ.setdefault("WEB_CONCURRENCY",     "1")  # aiohttp safety
+    except Exception:
+        pass  # certifi not installed — network ops may fail on some builds
+
     # Required before QApplication on some platforms
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
