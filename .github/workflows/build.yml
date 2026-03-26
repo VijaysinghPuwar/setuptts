@@ -294,6 +294,23 @@ jobs:
             Convert any text to natural-sounding audio using Microsoft Neural voices.
             No Python, no terminal, no setup required.
 
+            ### What's new in this release
+            - **Long-form audiobook support** — text is split into chunks so a brief
+              network hiccup never fails an entire multi-hour job.
+            - **Per-chunk retry with backoff** — up to 5 attempts per section with
+              exponential backoff (2 s → 4 s → 8 s → 16 s) on transient errors.
+            - **Per-chunk timeout** — each request has a 3-minute ceiling so the app
+              never hangs indefinitely on a stalled connection.
+            - **"Retrying…" status** — users see clear feedback instead of a frozen
+              progress bar when the network is unstable.
+            - **SSL cert fix** — packaged builds now always find the TLS CA bundle,
+              resolving silent connection failures on some Windows setups.
+            - **aiohttp dependency fix** — C-extension packages (multidict, frozenlist,
+              yarl) are now properly collected by PyInstaller, preventing import errors
+              in packaged builds.
+            - **Crash fixes** — worker GC race, MCI double-close on Windows preview,
+              and signal-on-destroyed-widget during shutdown are all resolved.
+
             ---
 
             ### Download

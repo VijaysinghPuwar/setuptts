@@ -110,6 +110,10 @@ class OutputPanel(QWidget):
         self._filtered_voices: list[Voice] = []
         self._voice_loader: VoiceLoaderWorker | None = None
         self._preview_worker: PreviewWorker | None = None
+        # Keep old voice-loader workers alive until their thread exits.
+        # Without this, replacing self._voice_loader on retry can cause
+        # the old QThread object to be GC-collected mid-run → crash.
+        self._finishing_workers: list[QThread] = []
 
         # Job queue — allows multiple concurrent exports
         self._queue    = JobQueue(parent=self)
@@ -171,6 +175,9 @@ class OutputPanel(QWidget):
         """
         Stop all workers cleanly.  Called from MainWindow.closeEvent before
         accepting the close — blocks briefly waiting for threads to exit.
+
+        Signals are disconnected first so that queued cross-thread signals
+        cannot fire on destroyed widget objects after we return.
         """
         self._queue.cancel_all()
 
@@ -183,6 +190,20 @@ class OutputPanel(QWidget):
             if not worker.isRunning():
                 continue
             logger.info("Stopping worker: %s", name)
+
+            # Disconnect all signals first.  Any signals already queued in
+            # the Qt event loop will become no-ops after disconnection, so
+            # they cannot call back into widgets that are being destroyed.
+            for sig_name in ("loaded", "failed", "started_playing",
+                              "finished", "progress", "status_changed",
+                              "completed"):
+                sig = getattr(worker, sig_name, None)
+                if sig is not None:
+                    try:
+                        sig.disconnect()
+                    except Exception:
+                        pass
+
             if hasattr(worker, "cancel"):
                 worker.cancel()
             if hasattr(worker, "stop_playback"):
@@ -194,6 +215,15 @@ class OutputPanel(QWidget):
                 worker.wait(1_000)
             else:
                 logger.info("Worker %s stopped cleanly", name)
+
+        # Also keep finishing_workers alive until they exit
+        for w in list(self._finishing_workers):
+            if w.isRunning():
+                w.quit()
+                if not w.wait(2_000):
+                    w.terminate()
+                    w.wait(500)
+        self._finishing_workers.clear()
 
     # ------------------------------------------------------------------ #
     # UI construction                                                      #
@@ -485,6 +515,25 @@ class OutputPanel(QWidget):
     # ------------------------------------------------------------------ #
 
     def _start_voice_load(self) -> None:
+        # If a previous loader is still running (e.g. retry clicked quickly),
+        # disconnect its callbacks so we don't get duplicate _on_voices_loaded
+        # calls, and keep a strong Python reference until the thread exits to
+        # prevent "QThread destroyed while running" crashes.
+        old = self._voice_loader
+        if old is not None and old.isRunning():
+            try:
+                old.loaded.disconnect(self._on_voices_loaded)
+                old.failed.disconnect(self._on_voices_failed)
+            except Exception:
+                pass
+            self._finishing_workers.append(old)
+            old.finished.connect(
+                lambda w=old: (
+                    self._finishing_workers.remove(w)
+                    if w in self._finishing_workers else None
+                )
+            )
+
         self._voice_error_label.hide()
         self._retry_voices_btn.hide()
         self._voice_combo.clear()
@@ -759,9 +808,19 @@ class OutputPanel(QWidget):
 
     def _on_job_failed(self, item: JobItem) -> None:
         self._remove_job_row(item.id)
-        from PySide6.QtWidgets import QMessageBox
-        QMessageBox.critical(self, "Generation Failed", item.error)
-        self.status_message.emit("Generation failed")
+        # Use a non-blocking (modeless) dialog so that simultaneous failures
+        # from concurrent jobs don't stack up and freeze the UI.
+        from PySide6.QtCore import Qt as _Qt
+        from PySide6.QtWidgets import QMessageBox as _QMB
+        msg = _QMB(self)
+        msg.setIcon(_QMB.Icon.Critical)
+        msg.setWindowTitle("Generation Failed")
+        msg.setText(item.error)
+        msg.setStandardButtons(_QMB.StandardButton.Ok)
+        msg.setModal(False)
+        msg.setAttribute(_Qt.WidgetAttribute.WA_DeleteOnClose)
+        msg.show()
+        self.status_message.emit(f"Generation failed: {item.filename}")
 
     def _on_job_cancelled(self, item: JobItem) -> None:
         self._remove_job_row(item.id)

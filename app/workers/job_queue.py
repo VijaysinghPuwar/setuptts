@@ -101,6 +101,11 @@ class JobQueue(QObject):
         # Workers that were individually cancelled: still running but popped
         # from _running.  Kept here so Python doesn't GC them mid-thread.
         self._finishing: list[TTSWorker] = []
+        # All live workers (running + recently finished).  Holds a Python
+        # strong reference so that CPython's refcount GC cannot destroy a
+        # QThread while its OS thread is still executing.  Removed only
+        # after the QThread.finished signal fires.
+        self._active_workers: list[TTSWorker] = []
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -186,6 +191,7 @@ class JobQueue(QObject):
                     worker.terminate()
                     worker.wait(1_000)
         self._finishing.clear()
+        self._active_workers.clear()
 
     def is_busy(self) -> bool:
         """True if any jobs are running or pending."""
@@ -235,6 +241,15 @@ class JobQueue(QObject):
         item.worker      = worker
         self._running[jid] = (item, worker)
 
+        # Keep a strong Python reference for the lifetime of the OS thread.
+        # Without this, CPython's refcount GC can destroy the QThread object
+        # before the thread has fully exited, causing "QThread destroyed
+        # while still running" crashes — especially on Windows.
+        self._active_workers.append(worker)
+        worker.finished.connect(
+            lambda w=worker: self._on_worker_thread_finished(w)
+        )
+
         logger.info("Job started: id=%s voice=%s", jid, item.voice)
         self.job_started.emit(item)
         worker.start()
@@ -242,6 +257,13 @@ class JobQueue(QObject):
     # ------------------------------------------------------------------ #
     # Worker callbacks                                                     #
     # ------------------------------------------------------------------ #
+
+    def _on_worker_thread_finished(self, worker: TTSWorker) -> None:
+        """Remove from active list once the OS thread has fully exited."""
+        try:
+            self._active_workers.remove(worker)
+        except ValueError:
+            pass
 
     def _on_progress(self, job_id: str, pct: int) -> None:
         if job_id in self._running:
