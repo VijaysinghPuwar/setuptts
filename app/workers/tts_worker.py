@@ -146,6 +146,7 @@ class TTSWorker(QThread):
     progress       = Signal(int)
     status_changed = Signal(str)
     stage_changed  = Signal(str, str)   # (kind, text)  kind="local"|"remote"|"waiting"
+    speed_updated  = Signal(float)      # chars/s, EMA-smoothed; emitted ~1/s during download
     completed      = Signal(str, float)
     failed         = Signal(str)
 
@@ -281,10 +282,19 @@ class TTSWorker(QThread):
         output_path = Path(self._output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Track throughput: chars confirmed by WordBoundary per second.
-        # Sampled lazily — only when we have ≥2 data points, so no extra
-        # timer threads or polling.  Overhead is negligible.
         _job_start = time.monotonic()
+
+        # ── Real-time speed tracking ───────────────────────────────────── #
+        # Chars/s, EMA-smoothed, emitted ≈ once per second via speed_updated.
+        # Uses mutable single-element lists so _stream_chunk can mutate them
+        # via closure without needing `nonlocal` (which can only reach one
+        # level up).  Overhead per WordBoundary event: one float subtraction
+        # and comparison; full update (divide + EMA + Qt signal) at most
+        # once per second.
+        _spd_chars = [0]            # processed_chars at last measurement
+        _spd_time  = [_job_start]   # time of last measurement
+        _spd_ema   = [0.0]          # EMA-smoothed chars/s (α=0.35 for new)
+        # For per-chunk stage summary (kept separate so stage badge stays useful)
         _chars_at_last_speed_emit = 0
         _time_at_last_speed_emit  = _job_start
 
@@ -359,6 +369,9 @@ class TTSWorker(QThread):
                             async def _stream_chunk(
                                 comm=communicate,
                                 _ra=_received_audio,
+                                _sc=_spd_chars,
+                                _st=_spd_time,
+                                _se=_spd_ema,
                             ):
                                 async for ev in comm.stream():
                                     if self._cancelled:
@@ -402,6 +415,27 @@ class TTSWorker(QThread):
                                         if pct != self._last_pct:
                                             self._last_pct = pct
                                             self.progress.emit(pct)
+
+                                        # ── Real-time speed (≤1 emit/s) ── #
+                                        # time.monotonic() is the only per-
+                                        # event cost; full update happens at
+                                        # most once per second.
+                                        _now = time.monotonic()
+                                        _dt  = _now - _st[0]
+                                        if _dt >= 1.0:
+                                            _dc = processed_chars - _sc[0]
+                                            if _dc > 0:
+                                                raw = _dc / _dt
+                                                # EMA: 35% new, 65% old
+                                                _se[0] = (
+                                                    0.65 * _se[0] + 0.35 * raw
+                                                    if _se[0] > 0 else raw
+                                                )
+                                                self.speed_updated.emit(
+                                                    _se[0]
+                                                )
+                                            _sc[0] = processed_chars
+                                            _st[0] = _now
 
                             await asyncio.wait_for(
                                 _stream_chunk(),

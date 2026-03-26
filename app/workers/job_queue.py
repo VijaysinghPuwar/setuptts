@@ -91,6 +91,7 @@ class JobQueue(QObject):
     job_progress       = Signal(str, int)     # job_id, pct
     job_status_changed = Signal(str, str)     # job_id, text
     job_stage_changed  = Signal(str, str, str)  # job_id, kind, text
+    job_speed_updated  = Signal(str, float)   # job_id, chars/s
     job_completed      = Signal(object)       # JobItem
     job_failed         = Signal(object)       # JobItem
     job_cancelled      = Signal(object)       # JobItem
@@ -233,6 +234,9 @@ class JobQueue(QObject):
         worker.stage_changed.connect(
             lambda kind, text, j=jid: self._on_stage_changed(j, kind, text)
         )
+        worker.speed_updated.connect(
+            lambda cps, j=jid: self._on_speed_updated(j, cps)
+        )
         worker.completed.connect(
             lambda p, d, j=jid: self._on_worker_completed(j, p, d)
         )
@@ -272,6 +276,10 @@ class JobQueue(QObject):
     def _on_stage_changed(self, job_id: str, kind: str, text: str) -> None:
         if job_id in self._running:
             self.job_stage_changed.emit(job_id, kind, text)
+
+    def _on_speed_updated(self, job_id: str, cps: float) -> None:
+        if job_id in self._running:
+            self.job_speed_updated.emit(job_id, cps)
 
     def _on_progress(self, job_id: str, pct: int) -> None:
         if job_id in self._running:
