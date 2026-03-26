@@ -145,6 +145,7 @@ class TTSWorker(QThread):
 
     progress       = Signal(int)
     status_changed = Signal(str)
+    stage_changed  = Signal(str, str)   # (kind, text)  kind="local"|"remote"|"waiting"
     completed      = Signal(str, float)
     failed         = Signal(str)
 
@@ -238,16 +239,20 @@ class TTSWorker(QThread):
         """
         Stream audio from the TTS service, writing to disk in real time.
 
-        The text is split into chunks of _MAX_CHUNK_CHARS so that each
-        chunk can be retried independently (up to 3 attempts) on transient
-        network errors.  This is critical for very long audiobook-scale
-        jobs where a brief network hiccup would otherwise fail the entire
-        hour-long generation.
+        Pipeline (what runs where):
+          LOCAL  — text splitting (regex, ~1 ms)
+          REMOTE — WebSocket to Microsoft Neural TTS; they do all synthesis
+          LOCAL  — writing received MP3 bytes to disk, fsync after each chunk
 
         Progress: 3 % → 95 % from WordBoundary events; 100 % on file sync.
         """
         if self._cancelled:
             raise asyncio.CancelledError()
+
+        # ── LOCAL: split text ──────────────────────────────────────────── #
+        self.status_changed.emit("Preparing…")
+        self.stage_changed.emit("local", "Splitting text into chunks")
+        self.progress.emit(3)
 
         chunks = _split_text(self._text)
         n_chunks = len(chunks)
@@ -259,11 +264,29 @@ class TTSWorker(QThread):
             self._voice, self._rate, len(self._text), n_chunks, self._output_path,
         )
 
+        if n_chunks > 1:
+            self.stage_changed.emit(
+                "local",
+                f"Split into {n_chunks} chunks — each sent to Microsoft separately",
+            )
+            logger.info(
+                "Text split into %d chunks (~%d chars each)",
+                n_chunks, _MAX_CHUNK_CHARS,
+            )
+
+        # ── REMOTE: connect ────────────────────────────────────────────── #
         self.status_changed.emit("Connecting…")
-        self.progress.emit(3)
+        self.stage_changed.emit("remote", "Connecting to Microsoft Neural TTS")
 
         output_path = Path(self._output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Track throughput: chars confirmed by WordBoundary per second.
+        # Sampled lazily — only when we have ≥2 data points, so no extra
+        # timer threads or polling.  Overhead is negligible.
+        _job_start = time.monotonic()
+        _chars_at_last_speed_emit = 0
+        _time_at_last_speed_emit  = _job_start
 
         try:
             with open(output_path, "wb") as audio_file:
@@ -271,12 +294,22 @@ class TTSWorker(QThread):
                     if self._cancelled:
                         raise asyncio.CancelledError()
 
+                    chunk_start = time.monotonic()
+
                     if n_chunks > 1:
                         self.status_changed.emit(
                             f"Part {chunk_idx + 1} of {n_chunks}…"
                         )
+                        self.stage_changed.emit(
+                            "remote",
+                            f"Requesting part {chunk_idx + 1}/{n_chunks} "
+                            f"from Microsoft",
+                        )
                     else:
                         self.status_changed.emit("Generating audio…")
+                        self.stage_changed.emit(
+                            "remote", "Sending text to Microsoft Neural TTS"
+                        )
 
                     # Retry each chunk up to _MAX_ATTEMPTS times with
                     # exponential backoff.  Each attempt is wrapped in a
@@ -300,6 +333,11 @@ class TTSWorker(QThread):
                                 f"Network issue — retrying"
                                 f" ({attempt}/{_MAX_ATTEMPTS - 1})…"
                             )
+                            self.stage_changed.emit(
+                                "waiting",
+                                f"Retry {attempt}/{_MAX_ATTEMPTS - 1} — "
+                                f"waiting {wait:.0f}s",
+                            )
                             await asyncio.sleep(wait)
 
                         if self._cancelled:
@@ -313,11 +351,36 @@ class TTSWorker(QThread):
                                 volume=self._volume,
                             )
 
-                            async def _stream_chunk(comm=communicate):
+                            # _received_audio: mutable flag so the inner
+                            # coroutine can emit the "Downloading" stage
+                            # once on the first audio packet of this attempt.
+                            _received_audio = [False]
+
+                            async def _stream_chunk(
+                                comm=communicate,
+                                _ra=_received_audio,
+                            ):
                                 async for ev in comm.stream():
                                     if self._cancelled:
                                         raise asyncio.CancelledError()
                                     if ev["type"] == "audio":
+                                        if not _ra[0]:
+                                            # First byte received — server
+                                            # has started streaming back.
+                                            if n_chunks > 1:
+                                                self.stage_changed.emit(
+                                                    "remote",
+                                                    f"Downloading audio "
+                                                    f"part {chunk_idx+1}"
+                                                    f"/{n_chunks}",
+                                                )
+                                            else:
+                                                self.stage_changed.emit(
+                                                    "remote",
+                                                    "Downloading audio from"
+                                                    " Microsoft",
+                                                )
+                                            _ra[0] = True
                                         audio_file.write(ev["data"])
                                     elif ev["type"] in (
                                         "WordBoundary", "SentenceBoundary"
@@ -345,19 +408,54 @@ class TTSWorker(QThread):
                                 timeout=_CHUNK_TIMEOUT_S,
                             )
 
-                            # Flush write buffers after each successful chunk.
-                            # Ensures data is safe on disk if power/crash
-                            # interrupts a long job mid-way.
+                            # ── LOCAL: flush to disk ───────────────────── #
+                            self.stage_changed.emit(
+                                "local", "Writing audio to disk"
+                            )
                             audio_file.flush()
                             try:
                                 os.fsync(audio_file.fileno())
                             except OSError:
                                 pass  # not all filesystems support fsync
 
+                            chunk_elapsed = time.monotonic() - chunk_start
+
+                            # Throughput: chars/s over the last completed
+                            # chunk.  Only emit if at least 0.5 s has passed
+                            # since the last emit to avoid noisy updates on
+                            # very short chunks.
+                            now = time.monotonic()
+                            dt  = now - _time_at_last_speed_emit
+                            if dt >= 0.5:
+                                dc = processed_chars - _chars_at_last_speed_emit
+                                if dc > 0 and dt > 0:
+                                    cps = dc / dt
+                                    self.stage_changed.emit(
+                                        "local",
+                                        f"Saved part {chunk_idx+1}/{n_chunks}"
+                                        f" ({chunk_elapsed:.1f}s) · "
+                                        f"{cps:.0f} chars/s",
+                                    )
+                                else:
+                                    self.stage_changed.emit(
+                                        "local",
+                                        f"Saved part {chunk_idx+1}/{n_chunks}"
+                                        f" ({chunk_elapsed:.1f}s)",
+                                    )
+                                _chars_at_last_speed_emit = processed_chars
+                                _time_at_last_speed_emit  = now
+                            else:
+                                self.stage_changed.emit(
+                                    "local",
+                                    f"Saved part {chunk_idx+1}/{n_chunks}"
+                                    f" ({chunk_elapsed:.1f}s)",
+                                )
+
                             last_exc = None
                             logger.info(
-                                "Chunk %d/%d succeeded (attempt %d)",
+                                "Chunk %d/%d succeeded (attempt %d) in %.2fs",
                                 chunk_idx + 1, n_chunks, attempt + 1,
+                                chunk_elapsed,
                             )
                             break  # chunk done; move to next
 
@@ -396,10 +494,13 @@ class TTSWorker(QThread):
             raise asyncio.CancelledError()
 
         size = output_path.stat().st_size
+        total_elapsed = time.monotonic() - _job_start
         logger.info(
-            "File written: %s  size=%d bytes  chunks=%d",
-            output_path, size, n_chunks,
+            "File written: %s  size=%d bytes  chunks=%d  total=%.2fs",
+            output_path, size, n_chunks, total_elapsed,
         )
+        # ── LOCAL: finalize ────────────────────────────────────────────── #
+        self.stage_changed.emit("local", "Finalizing MP3 file")
         self.status_changed.emit("Done")
         self.progress.emit(100)
 

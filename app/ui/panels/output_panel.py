@@ -485,6 +485,7 @@ class OutputPanel(QWidget):
         self._queue.job_started.connect(self._on_job_started)
         self._queue.job_progress.connect(self._on_job_progress)
         self._queue.job_status_changed.connect(self._on_job_status_changed)
+        self._queue.job_stage_changed.connect(self._on_job_stage_changed)
         self._queue.job_completed.connect(self._on_job_completed)
         self._queue.job_failed.connect(self._on_job_failed)
         self._queue.job_cancelled.connect(self._on_job_cancelled)
@@ -785,6 +786,10 @@ class OutputPanel(QWidget):
         if job_id in self._job_rows:
             self._job_rows[job_id].update_status(text)
 
+    def _on_job_stage_changed(self, job_id: str, kind: str, text: str) -> None:
+        if job_id in self._job_rows:
+            self._job_rows[job_id].update_stage(kind, text)
+
     def _on_job_completed(self, item: JobItem) -> None:
         self._remove_job_row(item.id)
 
@@ -856,7 +861,8 @@ class _JobRowWidget(QWidget):
 
     def __init__(self, item: JobItem, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._job_id = item.id
+        self._job_id    = item.id
+        self._has_stage = False   # True once first stage_changed event arrives
         self._build(item)
 
     def _build(self, item: JobItem) -> None:
@@ -937,6 +943,13 @@ class _JobRowWidget(QWidget):
 
     # ------------------------------------------------------------------ #
 
+    # Stage-kind → (hex color, badge label)
+    _STAGE_STYLE: dict[str, tuple[str, str]] = {
+        "local":   ("#5A8A6A", "LOCAL"),    # muted green — work on your machine
+        "remote":  ("#4A8CC2", "REMOTE"),   # blue — network / Microsoft servers
+        "waiting": ("#C2944A", "WAIT"),     # amber — blocked on server/retry
+    }
+
     def set_running(self) -> None:
         self._icon_lbl.setText("▶")
         self._icon_lbl.setStyleSheet(
@@ -944,6 +957,7 @@ class _JobRowWidget(QWidget):
         )
         self._progress_bar.show()
         self._pct_lbl.show()
+        self._status_lbl.setTextFormat(Qt.PlainText)
         self._status_lbl.setText("Connecting…")
 
     def update_progress(self, pct: int) -> None:
@@ -951,7 +965,23 @@ class _JobRowWidget(QWidget):
         self._pct_lbl.setText(f"{pct}%")
 
     def update_status(self, text: str) -> None:
-        self._status_lbl.setText(text)
+        # Only update with plain text if no stage event has arrived yet.
+        # Once stage events are flowing they carry richer information.
+        if not self._has_stage:
+            self._status_lbl.setTextFormat(Qt.PlainText)
+            self._status_lbl.setText(text)
+
+    def update_stage(self, kind: str, text: str) -> None:
+        """Show a color-coded LOCAL / REMOTE / WAIT badge + detail text."""
+        self._has_stage = True
+        color, badge = self._STAGE_STYLE.get(kind, ("#7A7A80", kind.upper()))
+        html = (
+            f'<span style="color:{color};font-weight:bold;font-size:9px">'
+            f'[{badge}]</span>'
+            f'<span style="color:#7A7A80;font-size:10px"> {text}</span>'
+        )
+        self._status_lbl.setTextFormat(Qt.RichText)
+        self._status_lbl.setText(html)
 
 
 # ══════════════════════════════════════════════════════════════════════ #

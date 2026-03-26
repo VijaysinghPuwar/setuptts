@@ -90,6 +90,7 @@ class JobQueue(QObject):
     job_started        = Signal(object)       # JobItem
     job_progress       = Signal(str, int)     # job_id, pct
     job_status_changed = Signal(str, str)     # job_id, text
+    job_stage_changed  = Signal(str, str, str)  # job_id, kind, text
     job_completed      = Signal(object)       # JobItem
     job_failed         = Signal(object)       # JobItem
     job_cancelled      = Signal(object)       # JobItem
@@ -229,6 +230,9 @@ class JobQueue(QObject):
         worker.status_changed.connect(
             lambda s, j=jid: self._on_status_changed(j, s)
         )
+        worker.stage_changed.connect(
+            lambda kind, text, j=jid: self._on_stage_changed(j, kind, text)
+        )
         worker.completed.connect(
             lambda p, d, j=jid: self._on_worker_completed(j, p, d)
         )
@@ -264,6 +268,10 @@ class JobQueue(QObject):
             self._active_workers.remove(worker)
         except ValueError:
             pass
+
+    def _on_stage_changed(self, job_id: str, kind: str, text: str) -> None:
+        if job_id in self._running:
+            self.job_stage_changed.emit(job_id, kind, text)
 
     def _on_progress(self, job_id: str, pct: int) -> None:
         if job_id in self._running:
