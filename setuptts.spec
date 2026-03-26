@@ -163,8 +163,8 @@ if sys.platform != "win32":
         info_plist={
             "CFBundleName":              "SetupTTS",
             "CFBundleDisplayName":       "SetupTTS",
-            "CFBundleVersion":           "1.3.0",
-            "CFBundleShortVersionString":"1.3.0",
+            "CFBundleVersion":           "1.3.1",
+            "CFBundleShortVersionString":"1.3.1",
             "NSHighResolutionCapable":   True,
             "NSRequiresAquaSystemAppearance": False,
             "LSMinimumSystemVersion":    "12.0",
