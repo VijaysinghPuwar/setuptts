@@ -92,12 +92,12 @@ class HistoryPanel(QWidget):
         # ── Table ──────────────────────────────────────────────────── #
         self._table = QTableWidget()
         self._table.setColumnCount(5)
-        self._table.setHorizontalHeaderLabels(["When", "Text Preview", "Voice", "Duration", "File"])
+        self._table.setHorizontalHeaderLabels(["When", "Text Preview", "Voice", "Took", "File"])
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self._table.setColumnWidth(0, 84)
         self._table.setColumnWidth(2, 120)
-        self._table.setColumnWidth(3, 72)
+        self._table.setColumnWidth(3, 78)
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -134,15 +134,14 @@ class HistoryPanel(QWidget):
             row = self._table.rowCount()
             self._table.insertRow(row)
 
-            parts  = job.voice.split("-")
+            parts   = job.voice.split("-")
             persona = parts[-1].replace("Neural", "") if parts else job.voice
-            secs   = job.duration_seconds
-            dur    = f"{secs:.1f}s" if secs < 60 else f"{int(secs//60)}m{int(secs%60):02d}s"
+            took    = _fmt_took(job.duration_seconds, job.status)
 
             self._table.setItem(row, 0, _cell(job.created_at_display))
             self._table.setItem(row, 1, _cell(job.text_preview))
             self._table.setItem(row, 2, _cell(persona))
-            self._table.setItem(row, 3, _cell(dur))
+            self._table.setItem(row, 3, _cell(took))
             self._table.setItem(row, 4, _cell(job.output_filename))
 
             if job.status != JobStatus.COMPLETED:
@@ -193,6 +192,30 @@ class HistoryPanel(QWidget):
 
 
 # ── Helpers ───────────────────────────────────────────────────────── #
+
+def _fmt_took(secs: float, status: JobStatus) -> str:
+    """Format generation time as a compact human string.
+
+    12s  |  1m 24s  |  8m 12s  |  2h 14m
+    Failed / Cancelled → status label instead of fake time.
+    """
+    if status == JobStatus.FAILED:
+        return "Failed"
+    if status == JobStatus.CANCELLED:
+        return "Cancelled"
+    if secs <= 0:
+        return "—"
+    total_s = int(secs)
+    if total_s < 60:
+        return f"{total_s}s"
+    m = total_s // 60
+    s = total_s % 60
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h = m // 60
+    m = m % 60
+    return f"{h}h {m:02d}m"
+
 
 def _cell(text: str) -> QTableWidgetItem:
     item = QTableWidgetItem(text)
