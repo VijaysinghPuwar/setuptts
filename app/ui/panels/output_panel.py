@@ -725,6 +725,11 @@ class OutputPanel(QWidget):
     # ------------------------------------------------------------------ #
 
     def _on_generate(self) -> None:
+        # ── Debounce: disable for 1.5 s to prevent rapid double-click ──── #
+        # Button is re-enabled by _restore_generate_btn after the timer fires.
+        self._generate_btn.setEnabled(False)
+        QTimer.singleShot(1500, self._restore_generate_btn)
+
         parent_win = self.window()
         text = parent_win.get_input_text() if hasattr(parent_win, "get_input_text") else ""
 
@@ -738,6 +743,20 @@ class OutputPanel(QWidget):
         output_path  = self.get_output_path()
         rate         = self.get_rate_string()
         volume       = self.get_volume_string()
+
+        # ── Duplicate output-path guard ─────────────────────────────────── #
+        if self._queue.has_active_output_path(output_path):
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Job Already Active",
+                f"A job writing to\n\n"
+                f"  {Path(output_path).name}\n\n"
+                "is already running or queued.\n\n"
+                "Please wait for it to finish, cancel it first, or choose "
+                "a different output file name.",
+            )
+            return
 
         # Build compact voice display for the job row
         parts        = voice.split("-")
@@ -759,7 +778,15 @@ class OutputPanel(QWidget):
             text=text, voice=voice, voice_display=voice_display,
             rate=rate, volume=volume, output_path=output_path,
         )
-        # Note: generate button stays enabled — user can submit more jobs
+
+    def _restore_generate_btn(self) -> None:
+        """Re-enable the Generate button after the debounce timer fires."""
+        parent_win = self.window()
+        has_text = bool(
+            parent_win.get_input_text()
+            if hasattr(parent_win, "get_input_text") else ""
+        )
+        self._generate_btn.setEnabled(has_text)
 
     # ------------------------------------------------------------------ #
     # Job queue event handlers                                             #
