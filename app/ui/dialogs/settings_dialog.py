@@ -1,10 +1,15 @@
 """Settings dialog."""
 
 import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QClipboard
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -13,6 +18,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -103,6 +109,31 @@ class SettingsDialog(QDialog):
 
         root.addLayout(data_form)
 
+        # ── Logs ───────────────────────────────────────────────────── #
+        root.addWidget(self._section_title("Logs"))
+
+        log_note = QLabel("Use these shortcuts for troubleshooting.")
+        log_note.setObjectName("metaLabel")
+        root.addWidget(log_note)
+
+        log_btn_row = QHBoxLayout()
+        log_btn_row.setSpacing(8)
+
+        open_folder_btn = QPushButton("Open Logs Folder")
+        open_folder_btn.clicked.connect(self._open_logs_folder)
+        log_btn_row.addWidget(open_folder_btn)
+
+        open_file_btn = QPushButton("Open Log File")
+        open_file_btn.clicked.connect(self._open_log_file)
+        log_btn_row.addWidget(open_file_btn)
+
+        copy_path_btn = QPushButton("Copy Log Path")
+        copy_path_btn.clicked.connect(self._copy_log_path)
+        log_btn_row.addWidget(copy_path_btn)
+
+        log_btn_row.addStretch()
+        root.addLayout(log_btn_row)
+
         root.addStretch()
 
         # ── Buttons ────────────────────────────────────────────────── #
@@ -128,6 +159,75 @@ class SettingsDialog(QDialog):
         self._settings.output_dir = self._output_dir_edit.text().strip()
         self._settings.save()
         self.accept()
+
+    # ------------------------------------------------------------------ #
+    # Log shortcuts                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _log_file_path(self) -> Path:
+        return self._paths.log_dir / "voicecraft.log"
+
+    def _open_logs_folder(self) -> None:
+        log_dir = self._paths.log_dir
+        if not log_dir.exists():
+            QMessageBox.information(
+                self, "Logs Folder",
+                f"The logs folder does not exist yet:\n\n{log_dir}"
+            )
+            return
+        self._reveal_in_explorer(log_dir, is_dir=True)
+
+    def _open_log_file(self) -> None:
+        log_file = self._log_file_path()
+        if not log_file.exists():
+            QMessageBox.information(
+                self, "Log File",
+                "No log file has been created yet.\n\n"
+                f"Expected location:\n{log_file}"
+            )
+            return
+        self._reveal_in_explorer(log_file, is_dir=False)
+
+    def _copy_log_path(self) -> None:
+        log_file = self._log_file_path()
+        QApplication.clipboard().setText(str(log_file))
+        # Briefly rename button text as a visual confirmation
+        btn = self.sender()
+        if btn:
+            btn.setText("Copied!")
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(1500, lambda: btn.setText("Copy Log Path"))
+
+    @staticmethod
+    def _reveal_in_explorer(path: Path, is_dir: bool) -> None:
+        """
+        Open *path* in the platform file manager.
+
+        - macOS  : ``open -R <file>`` reveals the file in Finder;
+                   ``open <dir>``  opens the folder directly.
+        - Windows: ``explorer /select,<file>`` selects the file;
+                   ``explorer <dir>``          opens the folder.
+        - Linux  : ``xdg-open <dir>`` opens the parent folder.
+        """
+        try:
+            if sys.platform == "darwin":
+                if is_dir:
+                    subprocess.run(["open", str(path)], check=False)
+                else:
+                    subprocess.run(["open", "-R", str(path)], check=False)
+            elif sys.platform == "win32":
+                if is_dir:
+                    os.startfile(str(path))          # type: ignore[attr-defined]
+                else:
+                    subprocess.run(
+                        ["explorer", f"/select,{path}"], check=False
+                    )
+            else:
+                # Linux / other — open the parent folder
+                target = path if is_dir else path.parent
+                subprocess.run(["xdg-open", str(target)], check=False)
+        except Exception as exc:
+            logger.warning("Could not open path in file manager: %s", exc)
 
     # ------------------------------------------------------------------ #
 
