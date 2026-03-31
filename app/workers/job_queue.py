@@ -199,6 +199,34 @@ class JobQueue(QObject):
         """True if any jobs are running or pending."""
         return bool(self._pending or self._running)
 
+    def has_active_output_path(self, output_path: str) -> bool:
+        """
+        Return True if any running or pending job already targets *output_path*.
+
+        Comparison is done on the resolved absolute path so that equivalent
+        paths with different representations (e.g. trailing slash, symlinks)
+        are treated as the same destination.
+        """
+        try:
+            norm = str(Path(output_path).resolve())
+        except Exception:
+            norm = output_path
+        for item, _ in self._running.values():
+            try:
+                if str(Path(item.output_path).resolve()) == norm:
+                    return True
+            except Exception:
+                if item.output_path == output_path:
+                    return True
+        for item in self._pending:
+            try:
+                if str(Path(item.output_path).resolve()) == norm:
+                    return True
+            except Exception:
+                if item.output_path == output_path:
+                    return True
+        return False
+
     @property
     def running_count(self) -> int:
         return len(self._running)

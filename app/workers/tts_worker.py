@@ -2,10 +2,24 @@
 Background QThread worker for TTS generation.
 
 Uses edge_tts streaming API for real word-boundary progress (3 %→95 %).
-Long text is split into chunks of at most _MAX_CHUNK_CHARS characters so
-each chunk can be retried independently on transient network errors.
-This makes 9–12 hour audiobook jobs robust: a brief disconnect at minute 25
-only retries the current chunk, not the whole job.
+Long text is split into chunks that are sent individually to Microsoft's
+Neural TTS service (speech.platform.bing.com).  This makes 9–12 hour
+audiobook jobs robust: a brief disconnect at minute 25 only retries the
+current chunk, not the whole job.
+
+Adaptive chunk sizing
+---------------------
+The service synthesises at roughly 60-100 chars/s.  Large chunks (10 k chars)
+regularly exceed 180 s at that rate, causing every chunk to time out and
+retry.  We therefore scale chunk size down for long texts:
+
+  total chars   max chunk size   ~seconds / chunk
+  ──────────────────────────────────────────────
+  < 50 000      8 000            50–130 s  (comfortable)
+  ≥ 50 000      4 000            25– 65 s  (well inside timeout)
+
+This makes long audiobook jobs far more reliable without changing the
+number of retries or the per-chunk timeout.
 
 Progress: 3 % → 95 % driven by WordBoundary events across all chunks,
 then 100 % once the output file is fully written and synced.
@@ -24,15 +38,17 @@ from PySide6.QtCore import QThread, Signal
 
 logger = logging.getLogger(__name__)
 
-# Maximum characters per TTS request.
-# Small enough for good retry granularity (~2 000 words per chunk),
-# well below the edge_tts service's per-request byte limit.
-_MAX_CHUNK_CHARS = 10_000
+# ── Adaptive chunk sizing ──────────────────────────────────────────────── #
+# Short/medium jobs use larger chunks (fewer round-trips).
+# Long jobs use smaller chunks so each request reliably completes within
+# the timeout window even on the slowest observed service throughput.
+_CHUNK_CHARS_DEFAULT = 8_000    # total text < _LONG_JOB_THRESHOLD
+_CHUNK_CHARS_LONG    = 4_000    # total text ≥ _LONG_JOB_THRESHOLD
+_LONG_JOB_THRESHOLD  = 50_000   # chars
 
 # Timeout (seconds) for a single chunk attempt.
-# A 10 000-char chunk generates ~2-3 min of audio.  At the slowest
-# realistic network (≈ 1 Mbps) that's ~15 s of data transfer.
-# We allow 180 s to cover slow TTS-service processing + slow networks.
+# With adaptive sizing a long-job chunk is ≤ 4 000 chars → ~25–65 s at
+# observed service speed.  180 s gives a 2.5–7× safety margin.
 _CHUNK_TIMEOUT_S = 180
 
 # Retry strategy: attempt counts and backoff delays.
@@ -41,12 +57,21 @@ _BACKOFF_BASE = 2.0                # seconds; doubles each retry: 2, 4, 8, 16
 
 
 # ──────────────────────────────────────────────────────────────────── #
+#  Helpers                                                              #
+# ──────────────────────────────────────────────────────────────────── #
+
+def _chunk_size_for(total_chars: int) -> int:
+    """Return the appropriate max chunk size for a job of *total_chars*."""
+    return _CHUNK_CHARS_LONG if total_chars >= _LONG_JOB_THRESHOLD else _CHUNK_CHARS_DEFAULT
+
+
+# ──────────────────────────────────────────────────────────────────── #
 #  Text-splitting helpers                                               #
 # ──────────────────────────────────────────────────────────────────── #
 
-def _split_text(text: str) -> list[str]:
+def _split_text(text: str, max_chars: int) -> list[str]:
     """
-    Split *text* into chunks of at most _MAX_CHUNK_CHARS characters.
+    Split *text* into chunks of at most *max_chars* characters.
 
     Strategy (in order):
       1. Split at paragraph boundaries (two or more newlines).
@@ -57,26 +82,28 @@ def _split_text(text: str) -> list[str]:
     Returns the original text as a single-element list when no split
     is needed.  Empty chunks are discarded.
     """
-    if len(text) <= _MAX_CHUNK_CHARS:
+    if len(text) <= max_chars:
         return [text] if text.strip() else []
     chunks: list[str] = []
-    _accumulate_para_chunks(re.split(r"\n{2,}", text), chunks)
+    _accumulate_para_chunks(re.split(r"\n{2,}", text), chunks, max_chars)
     return [c for c in chunks if c.strip()]
 
 
-def _accumulate_para_chunks(paras: list[str], out: list[str]) -> None:
+def _accumulate_para_chunks(
+    paras: list[str], out: list[str], max_chars: int
+) -> None:
     current: list[str] = []
     current_len = 0
     for para in paras:
         para = para.strip()
         if not para:
             continue
-        if len(para) > _MAX_CHUNK_CHARS:
+        if len(para) > max_chars:
             if current:
                 out.append("\n\n".join(current))
                 current, current_len = [], 0
-            _split_at_sentences(para, out)
-        elif current_len + len(para) + 2 > _MAX_CHUNK_CHARS and current:
+            _split_at_sentences(para, out, max_chars)
+        elif current_len + len(para) + 2 > max_chars and current:
             out.append("\n\n".join(current))
             current, current_len = [para], len(para)
         else:
@@ -86,19 +113,19 @@ def _accumulate_para_chunks(paras: list[str], out: list[str]) -> None:
         out.append("\n\n".join(current))
 
 
-def _split_at_sentences(text: str, out: list[str]) -> None:
+def _split_at_sentences(text: str, out: list[str], max_chars: int) -> None:
     sentences = re.split(r"(?<=[.!?])\s+", text)
     current: list[str] = []
     current_len = 0
     for sent in sentences:
-        if current_len + len(sent) + 1 > _MAX_CHUNK_CHARS and current:
+        if current_len + len(sent) + 1 > max_chars and current:
             out.append(" ".join(current))
             current, current_len = [], 0
-        if len(sent) > _MAX_CHUNK_CHARS:
+        if len(sent) > max_chars:
             if current:
                 out.append(" ".join(current))
                 current, current_len = [], 0
-            _split_at_words(sent, out)
+            _split_at_words(sent, out, max_chars)
         else:
             current.append(sent)
             current_len += len(sent) + 1
@@ -106,7 +133,7 @@ def _split_at_sentences(text: str, out: list[str]) -> None:
         out.append(" ".join(current))
 
 
-def _split_at_words(text: str, out: list[str]) -> None:
+def _split_at_words(text: str, out: list[str], max_chars: int) -> None:
     words = text.split()
     if not words:
         return
@@ -114,13 +141,13 @@ def _split_at_words(text: str, out: list[str]) -> None:
     current_len = 0
     for word in words:
         # Hard-split pathological single tokens (e.g. very long URLs/hashes)
-        while len(word) > _MAX_CHUNK_CHARS:
+        while len(word) > max_chars:
             if current:
                 out.append(" ".join(current))
                 current, current_len = [], 0
-            out.append(word[:_MAX_CHUNK_CHARS])
-            word = word[_MAX_CHUNK_CHARS:]
-        if current_len + len(word) + 1 > _MAX_CHUNK_CHARS and current:
+            out.append(word[:max_chars])
+            word = word[max_chars:]
+        if current_len + len(word) + 1 > max_chars and current:
             out.append(" ".join(current))
             current, current_len = [], 0
         current.append(word)
@@ -242,7 +269,8 @@ class TTSWorker(QThread):
 
         Pipeline (what runs where):
           LOCAL  — text splitting (regex, ~1 ms)
-          REMOTE — WebSocket to Microsoft Neural TTS; they do all synthesis
+          REMOTE — WebSocket to Microsoft Neural TTS (speech.platform.bing.com)
+                   All speech synthesis happens here; CPU stays near 0 %.
           LOCAL  — writing received MP3 bytes to disk, fsync after each chunk
 
         Progress: 3 % → 95 % from WordBoundary events; 100 % on file sync.
@@ -250,34 +278,41 @@ class TTSWorker(QThread):
         if self._cancelled:
             raise asyncio.CancelledError()
 
-        # ── LOCAL: split text ──────────────────────────────────────────── #
+        # ── LOCAL: prepare text ────────────────────────────────────────── #
         self.status_changed.emit("Preparing…")
-        self.stage_changed.emit("local", "Splitting text into chunks")
+        self.stage_changed.emit("local", "Preparing text locally")
         self.progress.emit(3)
 
-        chunks = _split_text(self._text)
+        total_chars   = max(len(self._text.strip()), 1)
+        max_chunk_chars = _chunk_size_for(total_chars)
+
+        self.stage_changed.emit("local", "Splitting text into chunks")
+        chunks  = _split_text(self._text, max_chunk_chars)
         n_chunks = len(chunks)
-        total_chars = max(len(self._text.strip()), 1)
         processed_chars = 0
 
         logger.info(
-            "Starting: voice=%s rate=%s chars=%d chunks=%d output=%s",
-            self._voice, self._rate, len(self._text), n_chunks, self._output_path,
+            "Starting: voice=%s rate=%s chars=%d chunks=%d "
+            "chunk_size=%d output=%s",
+            self._voice, self._rate, len(self._text), n_chunks,
+            max_chunk_chars, self._output_path,
         )
 
         if n_chunks > 1:
             self.stage_changed.emit(
                 "local",
-                f"Split into {n_chunks} chunks — each sent to Microsoft separately",
-            )
-            logger.info(
-                "Text split into %d chunks (~%d chars each)",
-                n_chunks, _MAX_CHUNK_CHARS,
+                f"Split into {n_chunks} chunks "
+                f"(≤{max_chunk_chars:,} chars each) — "
+                f"sent to Microsoft one by one",
             )
 
         # ── REMOTE: connect ────────────────────────────────────────────── #
         self.status_changed.emit("Connecting…")
-        self.stage_changed.emit("remote", "Connecting to Microsoft Neural TTS")
+        self.stage_changed.emit(
+            "remote",
+            "Connecting to Microsoft Neural TTS  "
+            "(speech.platform.bing.com) — low CPU is expected",
+        )
 
         output_path = Path(self._output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -285,16 +320,9 @@ class TTSWorker(QThread):
         _job_start = time.monotonic()
 
         # ── Real-time speed tracking ───────────────────────────────────── #
-        # Chars/s, EMA-smoothed, emitted ≈ once per second via speed_updated.
-        # Uses mutable single-element lists so _stream_chunk can mutate them
-        # via closure without needing `nonlocal` (which can only reach one
-        # level up).  Overhead per WordBoundary event: one float subtraction
-        # and comparison; full update (divide + EMA + Qt signal) at most
-        # once per second.
-        _spd_chars = [0]            # processed_chars at last measurement
-        _spd_time  = [_job_start]   # time of last measurement
-        _spd_ema   = [0.0]          # EMA-smoothed chars/s (α=0.35 for new)
-        # For per-chunk stage summary (kept separate so stage badge stays useful)
+        _spd_chars = [0]
+        _spd_time  = [_job_start]
+        _spd_ema   = [0.0]
         _chars_at_last_speed_emit = 0
         _time_at_last_speed_emit  = _job_start
 
@@ -305,6 +333,10 @@ class TTSWorker(QThread):
                         raise asyncio.CancelledError()
 
                     chunk_start = time.monotonic()
+                    chunk_label = (
+                        f"chunk {chunk_idx + 1}/{n_chunks}"
+                        if n_chunks > 1 else "text"
+                    )
 
                     if n_chunks > 1:
                         self.status_changed.emit(
@@ -312,13 +344,16 @@ class TTSWorker(QThread):
                         )
                         self.stage_changed.emit(
                             "remote",
-                            f"Requesting part {chunk_idx + 1}/{n_chunks} "
-                            f"from Microsoft",
+                            f"Sending {chunk_label} to Microsoft "
+                            f"({len(text_chunk):,} chars)",
                         )
                     else:
                         self.status_changed.emit("Generating audio…")
                         self.stage_changed.emit(
-                            "remote", "Sending text to Microsoft Neural TTS"
+                            "remote",
+                            f"Sending text to Microsoft Neural TTS "
+                            f"({len(text_chunk):,} chars) — "
+                            "waiting for response…",
                         )
 
                     # Retry each chunk up to _MAX_ATTEMPTS times with
@@ -345,8 +380,9 @@ class TTSWorker(QThread):
                             )
                             self.stage_changed.emit(
                                 "waiting",
-                                f"Retry {attempt}/{_MAX_ATTEMPTS - 1} — "
-                                f"waiting {wait:.0f}s",
+                                f"Retry {attempt}/{_MAX_ATTEMPTS - 1} on "
+                                f"{chunk_label} — waiting {wait:.0f} s "
+                                f"before next attempt",
                             )
                             await asyncio.sleep(wait)
 
@@ -378,20 +414,19 @@ class TTSWorker(QThread):
                                         raise asyncio.CancelledError()
                                     if ev["type"] == "audio":
                                         if not _ra[0]:
-                                            # First byte received — server
+                                            # First byte received — service
                                             # has started streaming back.
                                             if n_chunks > 1:
                                                 self.stage_changed.emit(
                                                     "remote",
-                                                    f"Downloading audio "
-                                                    f"part {chunk_idx+1}"
-                                                    f"/{n_chunks}",
+                                                    f"Receiving audio — "
+                                                    f"{chunk_label}",
                                                 )
                                             else:
                                                 self.stage_changed.emit(
                                                     "remote",
-                                                    "Downloading audio from"
-                                                    " Microsoft",
+                                                    "Receiving audio from "
+                                                    "Microsoft Neural TTS",
                                                 )
                                             _ra[0] = True
                                         audio_file.write(ev["data"])
@@ -417,16 +452,12 @@ class TTSWorker(QThread):
                                             self.progress.emit(pct)
 
                                         # ── Real-time speed (≤1 emit/s) ── #
-                                        # time.monotonic() is the only per-
-                                        # event cost; full update happens at
-                                        # most once per second.
                                         _now = time.monotonic()
                                         _dt  = _now - _st[0]
                                         if _dt >= 1.0:
                                             _dc = processed_chars - _sc[0]
                                             if _dc > 0:
                                                 raw = _dc / _dt
-                                                # EMA: 35% new, 65% old
                                                 _se[0] = (
                                                     0.65 * _se[0] + 0.35 * raw
                                                     if _se[0] > 0 else raw
@@ -444,7 +475,8 @@ class TTSWorker(QThread):
 
                             # ── LOCAL: flush to disk ───────────────────── #
                             self.stage_changed.emit(
-                                "local", "Writing audio to disk"
+                                "local",
+                                f"Writing {chunk_label} to disk",
                             )
                             audio_file.flush()
                             try:
@@ -454,10 +486,6 @@ class TTSWorker(QThread):
 
                             chunk_elapsed = time.monotonic() - chunk_start
 
-                            # Throughput: chars/s over the last completed
-                            # chunk.  Only emit if at least 0.5 s has passed
-                            # since the last emit to avoid noisy updates on
-                            # very short chunks.
                             now = time.monotonic()
                             dt  = now - _time_at_last_speed_emit
                             if dt >= 0.5:
@@ -466,23 +494,23 @@ class TTSWorker(QThread):
                                     cps = dc / dt
                                     self.stage_changed.emit(
                                         "local",
-                                        f"Saved part {chunk_idx+1}/{n_chunks}"
-                                        f" ({chunk_elapsed:.1f}s) · "
+                                        f"Saved {chunk_label} "
+                                        f"({chunk_elapsed:.1f} s) · "
                                         f"{cps:.0f} chars/s",
                                     )
                                 else:
                                     self.stage_changed.emit(
                                         "local",
-                                        f"Saved part {chunk_idx+1}/{n_chunks}"
-                                        f" ({chunk_elapsed:.1f}s)",
+                                        f"Saved {chunk_label} "
+                                        f"({chunk_elapsed:.1f} s)",
                                     )
                                 _chars_at_last_speed_emit = processed_chars
                                 _time_at_last_speed_emit  = now
                             else:
                                 self.stage_changed.emit(
                                     "local",
-                                    f"Saved part {chunk_idx+1}/{n_chunks}"
-                                    f" ({chunk_elapsed:.1f}s)",
+                                    f"Saved {chunk_label} "
+                                    f"({chunk_elapsed:.1f} s)",
                                 )
 
                             last_exc = None
@@ -508,10 +536,14 @@ class TTSWorker(QThread):
                             last_exc = exc
 
                     if last_exc is not None:
-                        raise last_exc  # all retries exhausted
+                        # All retries exhausted — wrap with chunk context so
+                        # _user_message can produce a helpful error string.
+                        raise _ChunkError(
+                            chunk_idx + 1, n_chunks, last_exc
+                        ) from last_exc
 
         except asyncio.CancelledError:
-            logger.info("Generation cancelled — removing partial file")
+            logger.info("Stream cancelled — removing partial file")
             try:
                 output_path.unlink(missing_ok=True)
             except Exception:
@@ -544,26 +576,57 @@ class TTSWorker(QThread):
 
     @staticmethod
     def _user_message(exc: Exception) -> str:
+        # Chunk-level failure with known position
+        if isinstance(exc, _ChunkError):
+            cause_msg = str(exc.cause).lower()
+            chunk_ctx = f"chunk {exc.chunk}/{exc.total}"
+
+            if "timeout" in cause_msg or isinstance(exc.cause, asyncio.TimeoutError):
+                return (
+                    f"Generation timed out on {chunk_ctx} after "
+                    f"{_MAX_ATTEMPTS} attempts.\n\n"
+                    "The Microsoft speech service is responding slowly.\n"
+                    "Try again — transient slowdowns usually resolve quickly."
+                )
+            if any(
+                k in cause_msg
+                for k in ("connection", "network", "resolve", "ssl", "wss",
+                          "websocket", "connecterror", "connectionerror",
+                          "dns", "nodename", "servname", "gaierror")
+            ):
+                return (
+                    f"Could not reach the speech service on {chunk_ctx}.\n\n"
+                    "Please check your internet connection and try again.\n"
+                    "If the problem persists, wait a minute — the service\n"
+                    "may be temporarily unavailable."
+                )
+            return (
+                f"Generation failed on {chunk_ctx} after "
+                f"{_MAX_ATTEMPTS} attempts.\n\n"
+                f"Details: {exc.cause}\n\n"
+                "Please check the log file for more information."
+            )
+
         msg = str(exc).lower()
         if any(
             k in msg
             for k in (
                 "connection", "network", "resolve", "ssl", "wss",
                 "websocket", "connecterror", "connectionerror",
+                "dns", "nodename", "servname", "gaierror",
             )
         ):
             return (
-                "Could not reach the speech service.\n"
-                "Please check your internet connection and try again.\n\n"
+                "Could not reach the Microsoft speech service.\n\n"
+                "Please check your internet connection and try again.\n"
                 "Tip: For very long text, transient network errors are more\n"
-                "common. The app already retries each section automatically\n"
-                "— if this keeps failing, try a shorter text first."
+                "common. The app already retries each section automatically."
             )
         if "timeout" in msg:
             return (
-                "The speech service timed out.\n"
-                "Please try again. For very long text, try splitting it\n"
-                "into smaller files."
+                "The speech service timed out.\n\n"
+                "Please try again. If this keeps happening, check your\n"
+                "internet connection — the service may be under heavy load."
             )
         if any(k in msg for k in ("permission", "access denied", "read-only")):
             return (
@@ -580,3 +643,20 @@ class TTSWorker(QThread):
             f"Details: {exc}\n\n"
             "Please check the log file for more information."
         )
+
+
+# ──────────────────────────────────────────────────────────────────── #
+#  Internal exception used to carry chunk context through the call     #
+#  stack to _user_message.                                             #
+# ──────────────────────────────────────────────────────────────────── #
+
+class _ChunkError(RuntimeError):
+    """Raised when all retries for one chunk are exhausted."""
+
+    def __init__(self, chunk: int, total: int, cause: Exception) -> None:
+        super().__init__(
+            f"All {_MAX_ATTEMPTS} attempts failed for chunk {chunk}/{total}"
+        )
+        self.chunk = chunk
+        self.total = total
+        self.cause = cause
