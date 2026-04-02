@@ -1,7 +1,7 @@
 name: Build Release
 
 # Triggers:
-#   - Push of a version tag:  git tag v1.4.1 && git push origin v1.4.1
+#   - Push of a version tag:  git tag v1.5.1 && git push origin v1.5.1
 #   - Manual run from GitHub Actions UI (workflow_dispatch)
 on:
   push:
@@ -311,20 +311,18 @@ jobs:
 
             ### What's new in v${{ steps.ver.outputs.version }}
 
-            #### Voice/text compatibility guardrails
-            - **Language and script checks before generation** — SetupTTS now inspects the pasted text before a full job starts and warns when the selected voice is a poor fit.
-            - **Recommended voice suggestions** — mismatched combinations now suggest a better voice instead of silently running into low-quality or gibberish output.
-            - **Optional auto-switching** — users can enable an automatic switch to the recommended voice in Settings, or keep manual control with a one-click “Use Recommended Voice” action.
-            - **Lightweight startup synthesis** — long and multi-chunk jobs now run a small preflight request first so no-audio and bad voice/provider combinations fail before the main export begins.
+            #### Speech quality guardrails
+            - **Narration-focused text cleanup** — SetupTTS now normalizes bracket-heavy system text, repeated punctuation, arrows, copied Unicode noise, and other webnovel/UI fragments that used to sound bad when read literally.
+            - **Stronger language/script checks** — the app now treats significant non-Latin text more defensively, so bad pairings like English text with an Icelandic voice or Hindi text with the wrong locale are caught earlier.
+            - **Mixed-language handling** — SetupTTS now distinguishes “mostly Hindi with some Latin text” style input instead of blindly treating everything as one language.
+            - **Clearer startup failures** — when Microsoft returns no audio during preflight, the app now explains that the voice/text combination may be incompatible and points the user to a recommended voice.
 
-            #### Throughput and stability improvements
-            - **Adaptive chunk sizing** — the first chunk is intentionally smaller for warm-up, then SetupTTS uses larger steady-state chunks and shrinks again only when a real job starts getting slow or unhealthy.
-            - **Earlier stalled-request detection** — the app now times out dead first-audio waits earlier instead of burning huge time on chunks that never become healthy.
-            - **Smaller recovery sections on failure** — retries now recreate the connection cleanly and split the exact failed chunk into smaller pieces when Microsoft returns no audio.
-            - **Less local write overhead** — SetupTTS no longer forces a disk sync after every chunk, which removes avoidable local slowdown without affecting output safety.
-            - **Smaller first probe chunk** — long jobs now start with a smaller opening chunk to warm up the session more safely before the rest of the job continues.
-            - **Adaptive recovery split** — if a chunk still fails, SetupTTS now retries with smaller recovery chunks instead of repeatedly hammering the same full-size request.
-            - **Fresh session per retry** — each retry now starts from a clean `edge_tts` communication object instead of reusing any stale websocket state.
+            #### Throughput and observability improvements
+            - **Adaptive chunk growth** — long jobs now start with a safe warm-up chunk, ramp up after a healthy first response, and only back off when latency or retries show the service is struggling.
+            - **Fewer round trips on healthy runs** — large Latin-script jobs can now use materially larger steady chunks instead of staying pinned to the old conservative limits.
+            - **Earlier stall recovery** — chunks that keep timing out before first audio now split down sooner instead of wasting repeated long retries in the same failing shape.
+            - **Per-chunk timing telemetry** — active jobs now surface chunk number, chunk size, ETA, rolling chars/s, and clearer LOCAL / REMOTE / WAIT timing context so users can see whether the bottleneck is Microsoft latency or local file writing.
+            - **Fresh session per retry** — each retry still starts from a clean `edge_tts` communication object instead of reusing any stale websocket state.
 
             #### Better failure reporting and queue safety
             - **Accurate error categories** — DNS resolution failures, repeated timeouts, missing voices, provider no-audio responses, and unstable network/service connections now produce distinct user-facing errors.

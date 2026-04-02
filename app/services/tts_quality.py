@@ -19,6 +19,27 @@ _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,.;:!?])")
 _SPACE_AFTER_OPEN_RE = re.compile(r"([(\[{])\s+")
 _SPACE_BEFORE_CLOSE_RE = re.compile(r"\s+([)\]}])")
 _TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+_SEPARATOR_LINE_RE = re.compile(r"^[\s\-_=~*#<>|/\\+:.,]+$")
+_BRACKETED_PREFIX_RE = re.compile(
+    r"^\s*[\[{【「『《〈〔]\s*([^\]\}】」』》〉〕\n]{1,60}?)\s*[\]\}】」』》〉〕]\s+(.+)$"
+)
+_BRACKETED_SEGMENT_RE = re.compile(
+    r"[\[{【「『《〈〔]\s*([^\[\]{}【】「」『』《》〈〉〔〕\n]{1,120}?)\s*[\]\}】」』》〉〕]"
+)
+_BRACKET_WRAPPER_PAIRS = (
+    ("[", "]"),
+    ("{", "}"),
+    ("【", "】"),
+    ("「", "」"),
+    ("『", "』"),
+    ("《", "》"),
+    ("〈", "〉"),
+    ("〔", "〕"),
+)
+_ARROW_RE = re.compile(r"\s*(?:->|=>|→|➜|➔|➝)\s*")
+_PIPE_RE = re.compile(r"\s*[|¦]+\s*")
+_REPEATED_SYMBOL_RUN_RE = re.compile(r"[_=~]{3,}")
+_NOISY_INLINE_SYMBOLS_RE = re.compile(r"[#*_]{3,}")
 
 _PUNCT_TRANSLATION = str.maketrans(
     {
@@ -371,6 +392,10 @@ class TextProfile:
     locale_hint: str | None
     confidence: float
     reason: str
+    mixed: bool = False
+    secondary_script_code: str | None = None
+    secondary_script_name: str | None = None
+    secondary_share: float = 0.0
 
     @property
     def detected_label(self) -> str:
@@ -379,6 +404,15 @@ class TextProfile:
         if self.script_name:
             return self.script_name
         return "the current text"
+
+    @property
+    def detected_summary(self) -> str:
+        base = self.detected_label
+        if self.mixed and self.secondary_script_name:
+            if self.language_name:
+                return f"mostly {base} with some {self.secondary_script_name.lower()}"
+            return f"mostly {base.lower()} with some {self.secondary_script_name.lower()}"
+        return base
 
 
 @dataclass(frozen=True)
@@ -431,10 +465,7 @@ def normalize_text_for_tts(text: str) -> str:
 
     lines: list[str] = []
     for raw_line in "".join(cleaned_chars).split("\n"):
-        line = _MULTISPACE_RE.sub(" ", raw_line).strip()
-        line = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", line)
-        line = _SPACE_AFTER_OPEN_RE.sub(r"\1", line)
-        line = _SPACE_BEFORE_CLOSE_RE.sub(r"\1", line)
+        line = _normalize_tts_line(raw_line)
         lines.append(line)
 
     collapsed: list[str] = []
@@ -449,6 +480,86 @@ def normalize_text_for_tts(text: str) -> str:
         collapsed.append(line)
 
     return "\n".join(collapsed).strip()
+
+
+def _normalize_tts_line(raw_line: str) -> str:
+    line = _MULTISPACE_RE.sub(" ", raw_line).strip()
+    if not line:
+        return ""
+
+    if _SEPARATOR_LINE_RE.fullmatch(line) and not any(char.isalnum() for char in line):
+        return ""
+
+    line = _unwrap_surrounding_brackets(line)
+    line = _normalize_bracketed_prefix(line)
+    line = _normalize_bracketed_fragments(line)
+    line = _ARROW_RE.sub(" to ", line)
+    line = _PIPE_RE.sub(", ", line)
+    line = _REPEATED_SYMBOL_RUN_RE.sub(" ", line)
+    line = _NOISY_INLINE_SYMBOLS_RE.sub(" ", line)
+    line = _MULTISPACE_RE.sub(" ", line).strip()
+    line = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", line)
+    line = _SPACE_AFTER_OPEN_RE.sub(r"\1", line)
+    line = _SPACE_BEFORE_CLOSE_RE.sub(r"\1", line)
+    return line
+
+
+def _unwrap_surrounding_brackets(line: str) -> str:
+    current = line.strip()
+    while len(current) >= 4:
+        unwrapped = False
+        for opener, closer in _BRACKET_WRAPPER_PAIRS:
+            if current.startswith(opener) and current.endswith(closer):
+                inner = current[len(opener): len(current) - len(closer)].strip()
+                if (
+                    inner
+                    and sum(char.isalnum() for char in inner) >= 3
+                    and opener not in inner
+                    and closer not in inner
+                ):
+                    current = inner
+                    unwrapped = True
+                    break
+        if not unwrapped:
+            break
+    return current
+
+
+def _normalize_bracketed_prefix(line: str) -> str:
+    match = _BRACKETED_PREFIX_RE.match(line)
+    if not match:
+        return line
+
+    label = match.group(1).strip()
+    remainder = match.group(2).strip()
+    if not label or not remainder:
+        return line
+
+    word_count = len(label.split())
+    if word_count > 6:
+        return line
+
+    normalized_label = label.rstrip(":.!? ")
+    return f"{normalized_label}: {remainder}"
+
+
+def _normalize_bracketed_fragments(line: str) -> str:
+    fragments = [match.group(1).strip() for match in _BRACKETED_SEGMENT_RE.finditer(line)]
+    if not fragments:
+        return line
+
+    def _clean_fragment(fragment: str) -> str:
+        return _MULTISPACE_RE.sub(" ", fragment).strip(" -,:;")
+
+    cleaned_fragments = [_clean_fragment(fragment) for fragment in fragments if _clean_fragment(fragment)]
+    if not cleaned_fragments:
+        return line
+
+    stripped = _BRACKETED_SEGMENT_RE.sub("", line).strip()
+    if not stripped and len(cleaned_fragments) >= 2:
+        return ". ".join(cleaned_fragments)
+
+    return _BRACKETED_SEGMENT_RE.sub(lambda match: _clean_fragment(match.group(1)), line)
 
 
 def build_text_profile(text: str) -> TextProfile:
@@ -469,6 +580,9 @@ def build_text_profile(text: str) -> TextProfile:
     script_counts = _script_counts(cleaned)
     dominant_script, dominant_count = _dominant_script(script_counts)
     letter_total = sum(script_counts.values())
+    ordered_scripts = sorted(script_counts.items(), key=lambda item: item[1], reverse=True)
+    secondary_script = ordered_scripts[1][0] if len(ordered_scripts) > 1 else None
+    secondary_count = ordered_scripts[1][1] if len(ordered_scripts) > 1 else 0
 
     if letter_total <= 0:
         return TextProfile(
@@ -489,9 +603,31 @@ def build_text_profile(text: str) -> TextProfile:
             + script_counts.get("katakana", 0)
             + script_counts.get("han", 0)
         )
+        secondary_script = None
+        secondary_count = 0
 
     share = dominant_count / max(letter_total, 1)
-    if share < 0.55 and len([count for count in script_counts.values() if count >= 4]) >= 2:
+    secondary_share = secondary_count / max(letter_total, 1)
+    mixed = secondary_count >= 4 and secondary_share >= 0.18
+
+    if (
+        mixed
+        and dominant_script == "latin"
+        and secondary_script
+        and secondary_script != "latin"
+        and secondary_share >= 0.30
+    ):
+        dominant_script, secondary_script = secondary_script, dominant_script
+        dominant_count, secondary_count = secondary_count, dominant_count
+        share, secondary_share = secondary_share, share
+
+    tokens = [token.lower() for token in _TOKEN_RE.findall(cleaned)]
+    language_code, confidence, reason = _guess_language(tokens, cleaned, dominant_script, share)
+    language_name = _LANGUAGE_NAMES.get(language_code) if language_code else None
+    locale_hint = _DEFAULT_LOCALE_BY_LANGUAGE.get(language_code) if language_code else None
+    secondary_script_name = _SCRIPT_LABELS.get(secondary_script) if secondary_script else None
+
+    if mixed and share < 0.45 and not language_name:
         return TextProfile(
             cleaned_text=cleaned,
             language_code=None,
@@ -501,12 +637,11 @@ def build_text_profile(text: str) -> TextProfile:
             locale_hint=None,
             confidence=share,
             reason="Multiple scripts appear throughout the text.",
+            mixed=True,
+            secondary_script_code=secondary_script,
+            secondary_script_name=secondary_script_name,
+            secondary_share=secondary_share,
         )
-
-    tokens = [token.lower() for token in _TOKEN_RE.findall(cleaned)]
-    language_code, confidence, reason = _guess_language(tokens, cleaned, dominant_script, share)
-    language_name = _LANGUAGE_NAMES.get(language_code) if language_code else None
-    locale_hint = _DEFAULT_LOCALE_BY_LANGUAGE.get(language_code) if language_code else None
 
     if not language_name:
         script_name = _SCRIPT_LABELS.get(dominant_script, dominant_script)
@@ -518,7 +653,16 @@ def build_text_profile(text: str) -> TextProfile:
             script_name=script_name,
             locale_hint=None,
             confidence=share,
-            reason=reason or f"The text mainly uses {script_name.lower()}.",
+            reason=_mixed_reason(
+                reason or f"The text mainly uses {script_name.lower()}.",
+                script_name,
+                secondary_script_name,
+                mixed,
+            ),
+            mixed=mixed,
+            secondary_script_code=secondary_script,
+            secondary_script_name=secondary_script_name,
+            secondary_share=secondary_share,
         )
 
     return TextProfile(
@@ -529,7 +673,11 @@ def build_text_profile(text: str) -> TextProfile:
         script_name=language_name,
         locale_hint=locale_hint,
         confidence=confidence,
-        reason=reason,
+        reason=_mixed_reason(reason, language_name, secondary_script_name, mixed),
+        mixed=mixed,
+        secondary_script_code=secondary_script,
+        secondary_script_name=secondary_script_name,
+        secondary_share=secondary_share,
     )
 
 
@@ -562,8 +710,16 @@ def assess_voice_compatibility(
     multilingual = "multilingual" in selected_voice.lower()
     same_language = bool(profile.language_code and selected_language == profile.language_code)
     same_script = bool(selected_script and selected_script == profile.script_code)
+    secondary_script_match = bool(
+        profile.mixed
+        and profile.secondary_script_code
+        and selected_script == profile.secondary_script_code
+    )
+    detected_summary = profile.detected_summary
 
-    if same_language:
+    if same_language and not (
+        profile.mixed and profile.secondary_share >= 0.30 and not multilingual
+    ):
         return VoiceCompatibilityAssessment(
             severity="ok",
             message="",
@@ -575,12 +731,32 @@ def assess_voice_compatibility(
             profile=profile,
         )
 
+    if same_language and profile.mixed and profile.secondary_share >= 0.30 and not multilingual:
+        message = (
+            f"This text appears to be {detected_summary}, and the selected voice is {selected_label}.\n\n"
+            "The main language matches, but the text also contains a meaningful amount of another script."
+        )
+        return VoiceCompatibilityAssessment(
+            severity="warning",
+            message=_append_recommendation(message, recommended_voice),
+            short_message="Mixed-language text detected.",
+            recommended_voice=recommended_voice,
+            recommended_label=recommended_label,
+            selected_label=selected_label,
+            selected_locale=selected_locale,
+            profile=profile,
+        )
+
     if profile.language_name and not same_language:
         severity = "warning" if multilingual and same_script else "mismatch"
+        if secondary_script_match:
+            severity = "warning"
         message = (
-            f"This text appears to be {profile.language_name}, but the selected voice is {selected_label}.\n\n"
+            f"This text appears to be {detected_summary}, but the selected voice is {selected_label}.\n\n"
             "This voice may produce poor pronunciation for the current text."
         )
+        if secondary_script_match:
+            message += "\nThe selected voice matches part of the text, but not the main language."
         return VoiceCompatibilityAssessment(
             severity=severity,
             message=_append_recommendation(message, recommended_voice),
@@ -593,7 +769,7 @@ def assess_voice_compatibility(
         )
 
     if not same_script:
-        script_label = profile.script_name or "the detected script"
+        script_label = profile.detected_summary
         message = (
             f"This text appears to use {script_label.lower()}, but the selected voice is {selected_label}.\n\n"
             "This voice is likely to produce poor pronunciation or gibberish."
@@ -636,9 +812,15 @@ def recommend_voice(
     if not candidates:
         return None
 
+    prefer_multilingual = profile.mixed and profile.secondary_share >= 0.22
+
     if profile.locale_hint:
         exact = [voice for voice in candidates if _voice_locale(voice) == profile.locale_hint]
-        chosen = _pick_preferred_voice(exact, preferred_gender)
+        chosen = _pick_preferred_voice(
+            exact,
+            preferred_gender,
+            prefer_multilingual=prefer_multilingual,
+        )
         if chosen:
             return _voice_short_name(chosen)
 
@@ -647,7 +829,11 @@ def recommend_voice(
             voice for voice in candidates
             if _voice_language_code(_voice_locale(voice)) == profile.language_code
         ]
-        chosen = _pick_preferred_voice(same_language, preferred_gender)
+        chosen = _pick_preferred_voice(
+            same_language,
+            preferred_gender,
+            prefer_multilingual=prefer_multilingual,
+        )
         if chosen:
             return _voice_short_name(chosen)
 
@@ -656,11 +842,26 @@ def recommend_voice(
             voice for voice in candidates
             if _LANGUAGE_SCRIPTS.get(_voice_language_code(_voice_locale(voice))) == profile.script_code
         ]
-        chosen = _pick_preferred_voice(same_script, preferred_gender)
+        chosen = _pick_preferred_voice(
+            same_script,
+            preferred_gender,
+            prefer_multilingual=prefer_multilingual,
+        )
         if chosen:
             return _voice_short_name(chosen)
 
     return None
+
+
+def _mixed_reason(
+    base_reason: str,
+    dominant_label: str | None,
+    secondary_label: str | None,
+    mixed: bool,
+) -> str:
+    if not mixed or not dominant_label or not secondary_label:
+        return base_reason
+    return f"{base_reason} The text is mostly {dominant_label} with some {secondary_label.lower()}."
 
 
 def _append_recommendation(message: str, recommended_voice: str | None) -> str:
@@ -768,14 +969,20 @@ def _find_voice(voices: list[Any], short_name: str | None) -> Any | None:
     return next((voice for voice in voices if _voice_short_name(voice) == short_name), None)
 
 
-def _pick_preferred_voice(voices: list[Any], preferred_gender: str | None) -> Any | None:
+def _pick_preferred_voice(
+    voices: list[Any],
+    preferred_gender: str | None,
+    *,
+    prefer_multilingual: bool = False,
+) -> Any | None:
     if not voices:
         return None
 
     def sort_key(voice: Any) -> tuple[int, int, str]:
         gender = (_voice_gender(voice) or "").lower()
         gender_match = 0 if preferred_gender and gender == preferred_gender.lower() else 1
-        multilingual_penalty = 0 if "multilingual" in _voice_short_name(voice).lower() else 1
+        is_multilingual = "multilingual" in _voice_short_name(voice).lower()
+        multilingual_penalty = 0 if is_multilingual == prefer_multilingual else 1
         return (gender_match, multilingual_penalty, _voice_short_name(voice))
 
     return sorted(voices, key=sort_key)[0]

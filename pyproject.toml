@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "setuptts"
-version = "1.5.0"
+version = "1.5.1"
 description = "Professional text-to-audio desktop application"
 requires-python = ">=3.11"
 dependencies = [

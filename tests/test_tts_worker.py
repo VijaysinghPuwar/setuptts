@@ -66,8 +66,8 @@ def test_preflight_fails_fast_on_no_audio(tmp_path, monkeypatch):
 
     assert not output.exists()
     message = tts_worker.TTSWorker._user_message(excinfo.value)
-    assert "did not return audio during the startup check" in message
-    assert "Try another voice" in message
+    assert "may not be compatible with this text" in message
+    assert "startup check" in message
 
 
 def test_voice_language_mismatch_is_blocked_before_generation(tmp_path, monkeypatch):
@@ -140,6 +140,48 @@ def test_chunk_recovery_succeeds_with_smaller_sections(tmp_path, monkeypatch):
     assert any(
         tts_worker._edge_payload_size(text) <= 900 for text in successful_texts
     )
+
+
+def test_adaptive_chunk_policy_grows_for_healthy_long_jobs(tmp_path):
+    text = ("alpha beta gamma delta epsilon zeta eta theta iota kappa " * 2000).strip()
+    plan = tts_worker._chunk_plan_for(len(text), "latin")
+    cursor = tts_worker._ChunkCursor(text)
+    worker = tts_worker.TTSWorker(
+        text=text,
+        voice="en-US-AvaNeural",
+        rate="+0%",
+        volume="+0%",
+        output_path=str(tmp_path / "adaptive.mp3"),
+    )
+
+    char_limit = plan.warmup_chars
+    payload_limit = plan.warmup_payload_bytes
+    seen_payloads: list[int] = []
+    chunk_count = 0
+
+    while cursor.has_more():
+        chunk, payload = cursor.take_next(char_limit, payload_limit)
+        assert chunk
+        seen_payloads.append(payload)
+        char_limit, payload_limit = worker._retune_after_chunk(
+            tts_worker._ChunkOutcome(
+                attempts=1,
+                elapsed=8.0,
+                used_recovery=False,
+                first_audio_delay=2.0,
+                receive_duration=4.0,
+                write_duration=0.01,
+            ),
+            char_limit,
+            payload_limit,
+            plan,
+            chunk_index=chunk_count,
+        )
+        chunk_count += 1
+
+    assert seen_payloads[0] <= plan.warmup_payload_bytes
+    assert max(seen_payloads) >= plan.max_payload_bytes * 0.9
+    assert chunk_count < 40
 
 
 def test_chunk_error_messages_are_specific():
