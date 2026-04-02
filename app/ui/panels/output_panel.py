@@ -517,6 +517,7 @@ class OutputPanel(QWidget):
         self._queue.job_status_changed.connect(self._on_job_status_changed)
         self._queue.job_stage_changed.connect(self._on_job_stage_changed)
         self._queue.job_speed_updated.connect(self._on_job_speed_updated)
+        self._queue.job_telemetry_updated.connect(self._on_job_telemetry_updated)
         self._queue.job_completed.connect(self._on_job_completed)
         self._queue.job_failed.connect(self._on_job_failed)
         self._queue.job_cancelled.connect(self._on_job_cancelled)
@@ -982,6 +983,10 @@ class OutputPanel(QWidget):
         if job_id in self._job_rows:
             self._job_rows[job_id].update_speed(cps)
 
+    def _on_job_telemetry_updated(self, job_id: str, telemetry: object) -> None:
+        if job_id in self._job_rows:
+            self._job_rows[job_id].update_telemetry(telemetry)
+
     def _on_job_completed(self, item: JobItem) -> None:
         self._remove_job_row(item.id)
 
@@ -1055,6 +1060,7 @@ class _JobRowWidget(QWidget):
         super().__init__(parent)
         self._job_id    = item.id
         self._has_stage = False   # True once first stage_changed event arrives
+        self._telemetry = None
         self._build(item)
 
     def _build(self, item: JobItem) -> None:
@@ -1129,6 +1135,7 @@ class _JobRowWidget(QWidget):
         self._status_lbl.setStyleSheet(
             "font-size: 10px; color: #5A5A60; background: transparent;"
         )
+        self._status_lbl.setWordWrap(True)
         bot.addWidget(self._status_lbl)
 
         root.addLayout(bot)
@@ -1197,6 +1204,31 @@ class _JobRowWidget(QWidget):
         """Show real-time generation speed below the progress bar."""
         if cps > 0:
             self._speed_lbl.setText(f"{cps:,.0f} chars/s")
+            self._speed_lbl.show()
+
+    def update_telemetry(self, telemetry: object) -> None:
+        self._telemetry = telemetry
+        cps = getattr(telemetry, "rolling_chars_per_second", 0.0) or 0.0
+        current_chunk = getattr(telemetry, "current_chunk", 0) or 0
+        estimated_total = getattr(telemetry, "estimated_total_chunks", None)
+        chunk_chars = getattr(telemetry, "chunk_chars", 0) or 0
+        eta_seconds = getattr(telemetry, "eta_seconds", None)
+
+        parts: list[str] = []
+        if cps > 0:
+            parts.append(f"{cps:,.0f} chars/s")
+        if eta_seconds is not None and eta_seconds > 1:
+            parts.append(f"ETA {_format_eta(eta_seconds)}")
+        if current_chunk > 0:
+            if estimated_total and estimated_total >= current_chunk:
+                parts.append(f"chunk {current_chunk}/~{estimated_total}")
+            else:
+                parts.append(f"chunk {current_chunk}")
+        if chunk_chars > 0:
+            parts.append(f"{chunk_chars:,} chars")
+
+        if parts:
+            self._speed_lbl.setText(" · ".join(parts))
             self._speed_lbl.show()
 
 
@@ -1277,6 +1309,15 @@ def _card() -> QFrame:
     f = QFrame()
     f.setObjectName("card")
     return f
+
+
+def _format_eta(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:d}:{secs:02d}"
 
 
 def _section_label(text: str) -> QLabel:
