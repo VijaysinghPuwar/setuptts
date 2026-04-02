@@ -6,7 +6,7 @@
 #   ./build_macos.sh
 #
 # Outputs:
-#   releases/SetupTTS-macOS-1.4.1.zip   — user-ready .app bundle in a zip
+#   releases/SetupTTS-macOS-1.5.0.zip   — user-ready .app bundle in a zip
 #
 # Requirements:
 #   - macOS with Python 3.11+ and a virtualenv / pip-installed environment
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 APP_NAME="SetupTTS"
-VERSION="1.4.1"
+VERSION="1.5.0"
 SPEC="setuptts.spec"
 DIST_DIR="dist"
 APP_BUNDLE="${DIST_DIR}/${APP_NAME}.app"

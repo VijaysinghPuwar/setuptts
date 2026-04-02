@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -68,6 +69,11 @@ from app.config.settings import AppSettings
 from app.models.job import Job, JobStatus
 from app.models.voice import Voice
 from app.services.history_service import HistoryService
+from app.services.tts_quality import (
+    VoiceCompatibilityAssessment,
+    assess_voice_compatibility,
+    build_text_profile,
+)
 from app.workers.job_queue import JobItem, JobQueue
 from app.workers.preview_worker import PreviewWorker
 from app.workers.voice_loader import VoiceLoaderWorker
@@ -110,6 +116,8 @@ class OutputPanel(QWidget):
         self._filtered_voices: list[Voice] = []
         self._voice_loader: VoiceLoaderWorker | None = None
         self._preview_worker: PreviewWorker | None = None
+        self._current_text = ""
+        self._compatibility: VoiceCompatibilityAssessment | None = None
         # Keep old voice-loader workers alive until their thread exits.
         # Without this, replacing self._voice_loader on retry can cause
         # the old QThread object to be GC-collected mid-run → crash.
@@ -302,6 +310,26 @@ class OutputPanel(QWidget):
         self._voice_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         ly.addWidget(self._voice_combo)
 
+        self._voice_warning = QFrame()
+        self._voice_warning.setStyleSheet(
+            "QFrame { background: rgba(255, 180, 0, 0.10); border: 1px solid rgba(255, 180, 0, 0.32); border-radius: 8px; }"
+            "QLabel { color: #F2C15B; background: transparent; }"
+        )
+        warning_layout = QVBoxLayout(self._voice_warning)
+        warning_layout.setContentsMargins(10, 8, 10, 8)
+        warning_layout.setSpacing(6)
+
+        self._voice_warning_label = QLabel("")
+        self._voice_warning_label.setWordWrap(True)
+        self._voice_warning_label.setStyleSheet("font-size: 11px; line-height: 1.25;")
+        warning_layout.addWidget(self._voice_warning_label)
+
+        self._use_recommended_voice_btn = QPushButton("Use Recommended Voice")
+        self._use_recommended_voice_btn.setObjectName("ghostButton")
+        warning_layout.addWidget(self._use_recommended_voice_btn, alignment=Qt.AlignLeft)
+        self._voice_warning.hide()
+        ly.addWidget(self._voice_warning)
+
         # Error state
         self._voice_error_label = QLabel()
         self._voice_error_label.setObjectName("statusError")
@@ -467,6 +495,7 @@ class OutputPanel(QWidget):
         )
         self._lang_combo.currentIndexChanged.connect(self._on_filter_changed)
         self._gender_combo.currentIndexChanged.connect(self._on_filter_changed)
+        self._voice_combo.currentIndexChanged.connect(self._on_voice_selection_changed)
 
         # Speed
         self._rate_slider.valueChanged.connect(self._on_rate_changed)
@@ -479,6 +508,7 @@ class OutputPanel(QWidget):
         # Preview
         self._preview_btn.clicked.connect(self._on_preview)
         self._stop_preview_btn.clicked.connect(self._on_stop_preview)
+        self._use_recommended_voice_btn.clicked.connect(self._on_use_recommended_voice)
 
         # Job queue signals
         self._queue.job_submitted.connect(self._on_job_submitted)
@@ -496,9 +526,11 @@ class OutputPanel(QWidget):
     # ------------------------------------------------------------------ #
 
     def on_text_changed(self, text: str) -> None:
+        self._current_text = text
         has_text = bool(text.strip())
         self._generate_btn.setEnabled(has_text)
         self._generate_hint.setVisible(not has_text)
+        self._refresh_voice_guidance()
 
     # ------------------------------------------------------------------ #
     # Settings                                                             #
@@ -538,6 +570,7 @@ class OutputPanel(QWidget):
 
         self._voice_error_label.hide()
         self._retry_voices_btn.hide()
+        self._hide_voice_guidance()
         self._voice_combo.clear()
         self._voice_combo.addItem("Loading voices…")
         self._voice_combo.setEnabled(False)
@@ -581,6 +614,7 @@ class OutputPanel(QWidget):
         self._voice_error_label.setText(message)
         self._voice_error_label.show()
         self._retry_voices_btn.show()
+        self._hide_voice_guidance()
         self.status_message.emit("Voice load failed — check internet")
 
     # ------------------------------------------------------------------ #
@@ -666,6 +700,76 @@ class OutputPanel(QWidget):
             f"{total} voices" if total == all_n else f"{total} / {all_n}"
         )
         self._preview_btn.setEnabled(True)
+        self._refresh_voice_guidance()
+
+    def _on_voice_selection_changed(self) -> None:
+        selected = self.get_selected_voice()
+        if selected:
+            self._settings.voice = selected
+        self._refresh_voice_guidance()
+
+    def _refresh_voice_guidance(self) -> None:
+        if not self._all_voices:
+            self._hide_voice_guidance()
+            return
+
+        selected_voice = self.get_selected_voice()
+        if not selected_voice or not self._current_text.strip():
+            self._hide_voice_guidance()
+            return
+
+        profile = build_text_profile(self._current_text)
+        assessment = assess_voice_compatibility(profile, selected_voice, self._all_voices)
+        self._compatibility = assessment
+
+        if not assessment.requires_confirmation:
+            self._hide_voice_guidance()
+            return
+
+        self._voice_warning_label.setText(assessment.message)
+        self._use_recommended_voice_btn.setVisible(bool(assessment.recommended_voice))
+        if assessment.recommended_voice:
+            self._use_recommended_voice_btn.setText(
+                f"Use {assessment.recommended_voice}"
+            )
+        self._voice_warning.show()
+
+    def _hide_voice_guidance(self) -> None:
+        self._compatibility = None
+        self._voice_warning.hide()
+        self._voice_warning_label.clear()
+        self._use_recommended_voice_btn.hide()
+
+    def _on_use_recommended_voice(self) -> None:
+        assessment = self._compatibility
+        if not assessment or not assessment.recommended_voice:
+            return
+        if self._select_voice_by_short_name(assessment.recommended_voice):
+            self.status_message.emit(f"Using recommended voice: {assessment.recommended_voice}")
+
+    def _select_voice_by_short_name(self, short_name: str) -> bool:
+        voice = next((item for item in self._all_voices if item.short_name == short_name), None)
+        if voice is None:
+            return False
+
+        self._search_edit.blockSignals(True)
+        self._search_edit.clear()
+        self._search_edit.blockSignals(False)
+
+        locale_idx = self._lang_combo.findData(voice.locale)
+        if locale_idx >= 0:
+            self._lang_combo.setCurrentIndex(locale_idx)
+        if self._gender_combo.currentText() not in {"All", voice.gender}:
+            all_idx = self._gender_combo.findText("All")
+            if all_idx >= 0:
+                self._gender_combo.setCurrentIndex(all_idx)
+
+        self._apply_filters()
+        for idx in range(self._voice_combo.count()):
+            if self._voice_combo.itemData(idx, _ROLE_SHORT_NAME) == short_name:
+                self._voice_combo.setCurrentIndex(idx)
+                return True
+        return False
 
     # ------------------------------------------------------------------ #
     # Rate slider                                                          #
@@ -734,7 +838,6 @@ class OutputPanel(QWidget):
         text = parent_win.get_input_text() if hasattr(parent_win, "get_input_text") else ""
 
         if not text:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "No Text",
                 "Please add some text on the left before generating.")
             return
@@ -743,10 +846,55 @@ class OutputPanel(QWidget):
         output_path  = self.get_output_path()
         rate         = self.get_rate_string()
         volume       = self.get_volume_string()
+        allow_voice_mismatch = False
+
+        self._refresh_voice_guidance()
+        assessment = self._compatibility
+        if assessment and assessment.requires_confirmation:
+            if (
+                self._settings.auto_switch_recommended_voice
+                and assessment.recommended_voice
+                and self._select_voice_by_short_name(assessment.recommended_voice)
+            ):
+                self.status_message.emit(
+                    f"Auto-switched to recommended voice: {assessment.recommended_voice}"
+                )
+                voice = self.get_selected_voice()
+                self._refresh_voice_guidance()
+            else:
+                prompt = QMessageBox(self)
+                prompt.setIcon(QMessageBox.Icon.Warning)
+                prompt.setWindowTitle("Voice May Not Match Text")
+                prompt.setText(assessment.message)
+
+                use_recommended_btn = None
+                if assessment.recommended_voice:
+                    use_recommended_btn = prompt.addButton(
+                        "Use Recommended Voice",
+                        QMessageBox.ButtonRole.AcceptRole,
+                    )
+                generate_anyway_btn = prompt.addButton(
+                    "Generate Anyway",
+                    QMessageBox.ButtonRole.ActionRole,
+                )
+                cancel_btn = prompt.addButton(QMessageBox.StandardButton.Cancel)
+                prompt.exec()
+
+                clicked = prompt.clickedButton()
+                if clicked == cancel_btn:
+                    return
+                if use_recommended_btn is not None and clicked == use_recommended_btn:
+                    if not self._select_voice_by_short_name(assessment.recommended_voice or ""):
+                        return
+                    voice = self.get_selected_voice()
+                    self._refresh_voice_guidance()
+                elif clicked == generate_anyway_btn:
+                    allow_voice_mismatch = True
+                else:
+                    return
 
         # ── Duplicate output-path guard ─────────────────────────────────── #
         if self._queue.has_active_output_path(output_path):
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self,
                 "Job Already Active",
@@ -778,9 +926,9 @@ class OutputPanel(QWidget):
             self._queue.submit(
                 text=text, voice=voice, voice_display=voice_display,
                 rate=rate, volume=volume, output_path=output_path,
+                allow_voice_mismatch=allow_voice_mismatch,
             )
         except ValueError:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self,
                 "Job Already Active",

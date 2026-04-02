@@ -17,6 +17,7 @@ _DEFAULTS: dict[str, Any] = {
     "gender_filter": "All",         # "All" | "Female" | "Male"
     "voice_search": "",             # last search query (cleared on start)
     "recently_used_voices": [],     # list of ShortName strings, max 5
+    "auto_switch_recommended_voice": False,
     "output_dir": "",               # empty = user's Desktop
     "window_width": 1100,
     "window_height": 660,
@@ -160,6 +161,14 @@ class AppSettings:
             recent.remove(short_name)
         recent.insert(0, short_name)
         self._data["recently_used_voices"] = recent[:5]
+
+    @property
+    def auto_switch_recommended_voice(self) -> bool:
+        return bool(self._data.get("auto_switch_recommended_voice", False))
+
+    @auto_switch_recommended_voice.setter
+    def auto_switch_recommended_voice(self, value: bool) -> None:
+        self._data["auto_switch_recommended_voice"] = bool(value)
 
     def rate_string(self) -> str:
         """Return rate as edge_tts expects: '+5%' or '-10%'."""

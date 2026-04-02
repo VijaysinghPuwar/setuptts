@@ -9,7 +9,7 @@
 #   - pip install -r requirements.txt pyinstaller
 #
 # Output:
-#   releases\SetupTTS-Windows-1.4.1.zip   single self-contained EXE
+#   releases\SetupTTS-Windows-1.5.0.zip   single self-contained EXE
 #
 # This script builds the PORTABLE release using setuptts_portable.spec
 # (onefile mode).  The resulting EXE is fully self-contained — users
@@ -19,7 +19,7 @@
 # the onedir installer build via Inno Setup.
 # ─────────────────────────────────────────────────────────────────────────────
 param(
-    [string]$Version = "1.4.1"
+    [string]$Version = "1.5.0"
 )
 
 $ErrorActionPreference = "Stop"

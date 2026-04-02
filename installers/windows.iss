@@ -4,14 +4,14 @@
 ;
 ;  CI invocation (from repo root, PowerShell):
 ;    & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-;        /DAppVersion=1.4.1 `
+;        /DAppVersion=1.5.0 `
 ;        /DSourceDir=C:\path\to\dist\SetupTTS `
 ;        /DOutputDir=C:\path\to\installer_out `
 ;        installers\windows.iss
 ;
 ;  Local invocation (from repo root):
 ;    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installers\windows.iss
-;    (uses defaults: AppVersion=1.4.1, SourceDir=..\dist\SetupTTS, OutputDir=out)
+;    (uses defaults: AppVersion=1.5.0, SourceDir=..\dist\SetupTTS, OutputDir=out)
 ;
 ;  Note: SourceDir must point to the onedir OUTPUT folder (dist\SetupTTS\),
 ;  not to dist\ itself. The onedir build avoids per-launch self-extraction.
@@ -19,7 +19,7 @@
 
 ; ── Overridable via ISCC /D command-line defines ─────────────────────────────
 #ifndef AppVersion
-  #define AppVersion "1.4.1"
+  #define AppVersion "1.5.0"
 #endif
 
 #ifndef SourceDir
