@@ -123,20 +123,20 @@ python main.py
 ```bash
 pip install pyinstaller
 ./build_macos.sh
-# → releases/SetupTTS-macOS-1.0.0.zip
+# → releases/SetupTTS-macOS-1.4.1.zip
 ```
 
 **Windows** (run on Windows):
 ```powershell
 pip install pyinstaller
 .\build_windows.ps1
-# → releases\SetupTTS-Windows-1.0.0.zip
+# → releases\SetupTTS-Windows-1.4.1.zip
 ```
 
 ### Trigger automated release (both platforms via GitHub Actions)
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.4.1 && git push origin v1.4.1
 ```
 
 GitHub Actions builds both macOS and Windows packages and publishes them as a GitHub Release with four artifacts attached:

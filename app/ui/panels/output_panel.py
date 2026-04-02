@@ -774,10 +774,22 @@ class OutputPanel(QWidget):
             "Submitting job: voice=%s output=%s rate=%s",
             voice, output_path, rate,
         )
-        self._queue.submit(
-            text=text, voice=voice, voice_display=voice_display,
-            rate=rate, volume=volume, output_path=output_path,
-        )
+        try:
+            self._queue.submit(
+                text=text, voice=voice, voice_display=voice_display,
+                rate=rate, volume=volume, output_path=output_path,
+            )
+        except ValueError:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Job Already Active",
+                f"A job writing to\n\n"
+                f"  {Path(output_path).name}\n\n"
+                "is already running or queued.\n\n"
+                "Please wait for it to finish, cancel it first, or choose "
+                "a different output file name.",
+            )
 
     def _restore_generate_btn(self) -> None:
         """Re-enable the Generate button after the debounce timer fires."""

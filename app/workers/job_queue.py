@@ -126,6 +126,11 @@ class JobQueue(QObject):
         Add a job to the queue.  Returns the new job's ID.
         Starts immediately if a concurrency slot is free.
         """
+        if self.has_active_output_path(output_path):
+            raise ValueError(
+                "A job writing to this output path is already running or queued."
+            )
+
         item = JobItem(
             text=text, voice=voice, voice_display=voice_display,
             rate=rate, volume=volume, output_path=output_path,

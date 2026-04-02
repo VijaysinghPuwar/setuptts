@@ -10,7 +10,7 @@
 ::   - pip install -r requirements.txt pyinstaller
 ::
 :: Output:
-::   releases\SetupTTS-Windows-1.0.0.zip  (single self-contained EXE)
+::   releases\SetupTTS-Windows-1.4.1.zip  (single self-contained EXE)
 ::
 :: Uses setuptts_portable.spec (onefile). Users extract the zip and
 :: double-click SetupTTS.exe — no folder structure required.
@@ -19,7 +19,7 @@
 setlocal enabledelayedexpansion
 
 set APP_NAME=SetupTTS
-set VERSION=1.0.0
+set VERSION=1.4.1
 set PORT_SPEC=setuptts_portable.spec
 set DIST_DIR=dist_portable
 set EXE=%DIST_DIR%\%APP_NAME%.exe
