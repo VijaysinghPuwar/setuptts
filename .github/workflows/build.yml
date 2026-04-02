@@ -1,7 +1,7 @@
 name: Build Release
 
 # Triggers:
-#   - Push of a version tag:  git tag v1.0.0 && git push origin v1.0.0
+#   - Push of a version tag:  git tag v1.4.1 && git push origin v1.4.1
 #   - Manual run from GitHub Actions UI (workflow_dispatch)
 on:
   push:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version label (e.g. 1.0.0)"
+        description: "Version label (e.g. 1.4.1)"
         required: false
         default: "dev"
 
@@ -36,7 +36,12 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt pyinstaller pytest
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q
 
       - name: Install create-dmg
         run: brew install create-dmg
@@ -144,7 +149,13 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt pyinstaller pytest
+
+      - name: Run tests
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q
 
       - name: Resolve version
         id: ver
@@ -298,24 +309,22 @@ jobs:
 
             ---
 
-            ### What's new in v1.4.0
+            ### What's new in v1.4.1
 
-            #### Long audiobook reliability (major fix)
-            - **Adaptive chunk sizing** — long jobs (≥ 50 k chars) now use 4 k-char chunks instead of 10 k. At the observed ~70 chars/s service throughput, each chunk completes in 40–65 s — well inside the 180 s timeout. Previously, 10 k-char chunks regularly took 143–180 s and timed out on nearly every first attempt, causing constant retries on large audiobook files.
-            - **Better stage messages** — each step now clearly labels what is happening: *Preparing text locally → Splitting into chunks → Sending chunk N/M to Microsoft → Receiving audio → Writing to disk → Finalizing MP3*. Low CPU is called out explicitly so users know remote generation is working.
+            #### Voice validation and no-audio recovery
+            - **Startup voice validation** — long jobs now run a lightweight synthesis preflight before chunking the full text, so voices that return no audio fail fast instead of burning through chunk 1.
+            - **Selected voice verification** — SetupTTS now confirms the chosen Microsoft voice still exists before generation begins and reports a clearer error when a voice disappears or becomes unavailable.
+            - **Provider-specific no-audio handling** — `NoAudioReceived` is now treated separately from DNS, timeout, and generic network failures, with user messages that explain what actually happened.
 
-            #### Duplicate job submission fix
-            - **Output-path dedup guard** — if you click Generate for a file that is already running or queued, a clear warning dialog appears instead of silently starting a second job writing to the same file.
-            - **1.5-second button cooldown** — the Generate button is briefly disabled after each click to prevent accidental double-clicks from spawning duplicate jobs.
+            #### Chunk reliability improvements
+            - **Byte-safe chunking** — SetupTTS now keeps chunks below a safe payload limit so `edge_tts` does not silently split them internally, which improves long-job reliability and first-chunk behaviour.
+            - **Smaller first probe chunk** — long jobs now start with a smaller opening chunk to warm up the session more safely before the rest of the job continues.
+            - **Adaptive recovery split** — if a chunk still fails, SetupTTS now retries with smaller recovery chunks instead of repeatedly hammering the same full-size request.
+            - **Fresh session per retry** — each retry now starts from a clean `edge_tts` communication object instead of reusing any stale websocket state.
 
-            #### Better error messages
-            - Network and timeout errors now include the chunk number (e.g. *"Generation timed out on chunk 36/55 after 5 attempts"*) so it is clear exactly where the failure occurred.
-            - DNS / connection errors, repeated timeouts, and unexpected errors all produce distinct, actionable messages instead of the generic *"An unexpected error occurred"*.
-
-            #### Log file shortcuts in Settings
-            - **Open Logs Folder** — opens the app's log folder in Finder / Explorer directly from the Settings dialog.
-            - **Open Log File** — reveals `voicecraft.log` in Finder / Explorer (or shows a friendly message if no log has been created yet).
-            - **Copy Log Path** — copies the full log file path to the clipboard for easy sharing when reporting issues.
+            #### Better failure reporting and queue safety
+            - **Accurate error categories** — DNS resolution failures, repeated timeouts, missing voices, provider no-audio responses, and unstable network/service connections now produce distinct user-facing errors.
+            - **Duplicate output-path protection at the queue layer** — duplicate Generate submissions targeting the same output file are blocked even if the UI is hit twice unexpectedly.
 
             ---
 
