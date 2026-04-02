@@ -18,7 +18,6 @@ import asyncio
 from dataclasses import dataclass
 import io
 import logging
-import os
 import re
 import sys
 import time
@@ -29,6 +28,11 @@ from edge_tts import exceptions as edge_exceptions
 from edge_tts.communicate import escape, remove_incompatible_characters
 from PySide6.QtCore import QThread, Signal
 
+from app.services.tts_quality import (
+    VoiceCompatibilityAssessment,
+    assess_voice_compatibility,
+    build_text_profile,
+)
 from app.services.tts_service import (
     DEFAULT_CONNECT_TIMEOUT_S,
     build_communicate,
@@ -38,31 +42,56 @@ from app.services.tts_service import (
 logger = logging.getLogger(__name__)
 
 # ── Chunk sizing ──────────────────────────────────────────────────────────── #
-_CHUNK_CHARS_DEFAULT = 8_000
-_CHUNK_CHARS_LONG = 4_000
-_LONG_JOB_THRESHOLD = 50_000
+_MEDIUM_JOB_THRESHOLD = 12_000
+_LONG_JOB_THRESHOLD = 45_000
+_XL_JOB_THRESHOLD = 90_000
 
 # Keep well under edge_tts's internal 4096-byte boundary so each SetupTTS
 # chunk maps to one actual provider request even for multi-byte languages or
 # XML-escaped content.
+_CHUNK_CHARS_DEFAULT = 8_500
+_CHUNK_CHARS_MEDIUM = 6_500
+_CHUNK_CHARS_LONG = 4_800
+_CHUNK_CHARS_XL = 3_800
+
 _CHUNK_PAYLOAD_BYTES_DEFAULT = 3_600
+_CHUNK_PAYLOAD_BYTES_MEDIUM = 3_350
 _CHUNK_PAYLOAD_BYTES_LONG = 3_000
+_CHUNK_PAYLOAD_BYTES_XL = 2_700
+_FIRST_CHUNK_PROBE_CHARS = 1_000
+_FIRST_CHUNK_PROBE_PAYLOAD_BYTES = 1_100
 
-# Long jobs start with a smaller probe chunk so the first real connection is
-# conservative and any provider issue shows up early.
-_FIRST_CHUNK_PROBE_CHARS = 1_200
-_FIRST_CHUNK_PROBE_PAYLOAD_BYTES = 1_200
+_COMPLEX_SCRIPT_LIMITS = {
+    "devanagari": (4_000, 2_350, 750, 900, 2_500, 24),
+    "arabic": (4_200, 2_500, 800, 950, 2_500, 24),
+    "bengali": (3_800, 2_250, 700, 850, 2_500, 24),
+    "gurmukhi": (3_800, 2_250, 700, 850, 2_500, 24),
+    "gujarati": (3_800, 2_250, 700, 850, 2_500, 24),
+    "tamil": (3_400, 2_100, 650, 800, 2_200, 22),
+    "telugu": (3_400, 2_100, 650, 800, 2_200, 22),
+    "kannada": (3_400, 2_100, 650, 800, 2_200, 22),
+    "malayalam": (3_400, 2_100, 650, 800, 2_200, 22),
+    "odia": (3_500, 2_100, 650, 800, 2_200, 22),
+    "sinhala": (3_500, 2_100, 650, 800, 2_200, 22),
+    "han": (2_800, 2_150, 550, 700, 1_800, 20),
+    "japanese": (2_900, 2_200, 600, 750, 1_800, 20),
+    "hangul": (3_100, 2_250, 650, 800, 1_900, 20),
+    "thai": (3_200, 2_300, 650, 800, 2_000, 22),
+    "mixed": (4_200, 2_450, 750, 900, 2_800, 24),
+}
 
-# ── Validation and timeout strategy ──────────────────────────────────────── #
-_PREFLIGHT_THRESHOLD = 12_000
 _PREFLIGHT_SAMPLE_CHARS = 220
 _PREFLIGHT_SAMPLE_PAYLOAD_BYTES = 360
 _PREFLIGHT_TIMEOUT_S = 45
 
-_CHUNK_TIMEOUT_MIN_S = 90
-_CHUNK_TIMEOUT_MAX_S = 240
-_EDGE_RECEIVE_TIMEOUT_MIN_S = 90
+_CHUNK_TIMEOUT_MIN_S = 65
+_CHUNK_TIMEOUT_MAX_S = 180
+_EDGE_RECEIVE_TIMEOUT_MIN_S = 60
 _EDGE_RECEIVE_TIMEOUT_MAX_S = 180
+_FIRST_AUDIO_TIMEOUT_MIN_S = 18
+_FIRST_AUDIO_TIMEOUT_MAX_S = 40
+_STREAM_IDLE_TIMEOUT_MIN_S = 12
+_STREAM_IDLE_TIMEOUT_MAX_S = 40
 
 # ── Retry strategy ───────────────────────────────────────────────────────── #
 _MAX_ATTEMPTS = 5
@@ -73,20 +102,73 @@ _BACKOFF_BASE = 2.0
 _MAX_RECOVERY_DEPTH = 3
 _MIN_RECOVERY_CHARS = 180
 _MIN_RECOVERY_PAYLOAD_BYTES = 320
+_ADAPTIVE_SHRINK_FACTOR = 0.82
+_SLOW_CHUNK_MULTIPLIER = 1.5
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
 
 
-def _chunk_size_for(total_chars: int) -> int:
-    return _CHUNK_CHARS_LONG if total_chars >= _LONG_JOB_THRESHOLD else _CHUNK_CHARS_DEFAULT
+@dataclass(frozen=True)
+class _ChunkPlan:
+    steady_chars: int
+    steady_payload_bytes: int
+    warmup_chars: int
+    warmup_payload_bytes: int
+    preflight_threshold: int
+    first_audio_timeout_s: int
 
 
-def _payload_limit_for(total_chars: int) -> int:
-    return (
-        _CHUNK_PAYLOAD_BYTES_LONG
-        if total_chars >= _LONG_JOB_THRESHOLD
-        else _CHUNK_PAYLOAD_BYTES_DEFAULT
+def _chunk_plan_for(total_chars: int, script_code: str | None = None) -> _ChunkPlan:
+    if total_chars >= _XL_JOB_THRESHOLD:
+        chars = _CHUNK_CHARS_XL
+        payload = _CHUNK_PAYLOAD_BYTES_XL
+    elif total_chars >= _LONG_JOB_THRESHOLD:
+        chars = _CHUNK_CHARS_LONG
+        payload = _CHUNK_PAYLOAD_BYTES_LONG
+    elif total_chars >= _MEDIUM_JOB_THRESHOLD:
+        chars = _CHUNK_CHARS_MEDIUM
+        payload = _CHUNK_PAYLOAD_BYTES_MEDIUM
+    else:
+        chars = _CHUNK_CHARS_DEFAULT
+        payload = _CHUNK_PAYLOAD_BYTES_DEFAULT
+
+    warmup_chars = min(_FIRST_CHUNK_PROBE_CHARS, chars)
+    warmup_payload = min(_FIRST_CHUNK_PROBE_PAYLOAD_BYTES, payload)
+    preflight_threshold = 4_000
+    first_audio_timeout_s = 28
+
+    if script_code in _COMPLEX_SCRIPT_LIMITS:
+        (
+            script_chars,
+            script_payload,
+            script_warmup_chars,
+            script_warmup_payload,
+            script_preflight_threshold,
+            script_first_audio_timeout,
+        ) = _COMPLEX_SCRIPT_LIMITS[script_code]
+        chars = min(chars, script_chars)
+        payload = min(payload, script_payload)
+        warmup_chars = min(warmup_chars, script_warmup_chars)
+        warmup_payload = min(warmup_payload, script_warmup_payload)
+        preflight_threshold = min(preflight_threshold, script_preflight_threshold)
+        first_audio_timeout_s = min(first_audio_timeout_s, script_first_audio_timeout)
+
+    return _ChunkPlan(
+        steady_chars=chars,
+        steady_payload_bytes=payload,
+        warmup_chars=warmup_chars,
+        warmup_payload_bytes=warmup_payload,
+        preflight_threshold=preflight_threshold,
+        first_audio_timeout_s=first_audio_timeout_s,
     )
+
+
+def _chunk_size_for(total_chars: int, script_code: str | None = None) -> int:
+    return _chunk_plan_for(total_chars, script_code).steady_chars
+
+
+def _payload_limit_for(total_chars: int, script_code: str | None = None) -> int:
+    return _chunk_plan_for(total_chars, script_code).steady_payload_bytes
 
 
 def _edge_payload_size(text: str) -> int:
@@ -247,21 +329,26 @@ def _hard_split_text(text: str, max_chars: int, max_payload_bytes: int) -> list[
     return pieces
 
 
-def _apply_first_chunk_probe(chunks: list[str], total_chars: int) -> list[str]:
-    if total_chars < _PREFLIGHT_THRESHOLD or len(chunks) < 2:
+def _apply_first_chunk_probe(
+    chunks: list[str],
+    total_chars: int,
+    plan: _ChunkPlan | None = None,
+) -> list[str]:
+    if len(chunks) < 2:
         return chunks
 
+    chunk_plan = plan or _chunk_plan_for(total_chars)
     first = chunks[0]
     if (
-        len(first) <= _FIRST_CHUNK_PROBE_CHARS
-        and _edge_payload_size(first) <= _FIRST_CHUNK_PROBE_PAYLOAD_BYTES
+        len(first) <= chunk_plan.warmup_chars
+        and _edge_payload_size(first) <= chunk_plan.warmup_payload_bytes
     ):
         return chunks
 
     probe_chunks = _split_text(
         first,
-        _FIRST_CHUNK_PROBE_CHARS,
-        _FIRST_CHUNK_PROBE_PAYLOAD_BYTES,
+        chunk_plan.warmup_chars,
+        chunk_plan.warmup_payload_bytes,
     )
     if len(probe_chunks) <= 1:
         return chunks
@@ -314,6 +401,17 @@ class _AttemptStats:
     audio_bytes: int = 0
     metadata_events: int = 0
     attempt_chars: int = 0
+    started_at: float = 0.0
+    first_audio_at: float | None = None
+    last_event_at: float | None = None
+
+
+@dataclass
+class _ChunkOutcome:
+    attempts: int
+    elapsed: float
+    used_recovery: bool = False
+    first_audio_delay: float | None = None
 
 
 class _AttemptFailure(RuntimeError):
@@ -379,6 +477,8 @@ class TTSWorker(QThread):
         rate: str,
         volume: str,
         output_path: str,
+        *,
+        allow_voice_mismatch: bool = False,
     ) -> None:
         super().__init__()
         self._text = text
@@ -386,10 +486,13 @@ class TTSWorker(QThread):
         self._rate = rate
         self._volume = volume
         self._output_path = output_path
+        self._allow_voice_mismatch = allow_voice_mismatch
         self._cancelled = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task | None = None
         self._last_pct = 0
+        self._text_profile = build_text_profile(text)
+        self._compatibility: VoiceCompatibilityAssessment | None = None
 
     def cancel(self) -> None:
         """Cancel mid-stream. Interrupts the async Task cleanly."""
@@ -453,10 +556,20 @@ class TTSWorker(QThread):
         self.stage_changed.emit("local", "Preparing text locally")
         self.progress.emit(3)
 
-        stripped_text = self._text.strip()
+        stripped_text = self._text_profile.cleaned_text.strip()
+        if not stripped_text:
+            raise ValueError("No text was available to generate after text cleanup.")
+
+        if stripped_text != self._text.strip():
+            self.stage_changed.emit(
+                "local",
+                "Cleaning punctuation and unicode for more reliable speech output",
+            )
+
         total_chars = max(len(stripped_text), 1)
-        max_chunk_chars = _chunk_size_for(total_chars)
-        max_payload_bytes = _payload_limit_for(total_chars)
+        chunk_plan = _chunk_plan_for(total_chars, self._text_profile.script_code)
+        max_chunk_chars = chunk_plan.steady_chars
+        max_payload_bytes = chunk_plan.steady_payload_bytes
 
         self.status_changed.emit("Validating voice…")
         self.stage_changed.emit(
@@ -479,21 +592,43 @@ class TTSWorker(QThread):
                     suggestion=_suggest_alternative_voice(self._voice, voices),
                 )
 
-        if total_chars >= _PREFLIGHT_THRESHOLD:
-            await self._run_preflight(voices)
+        self._compatibility = assess_voice_compatibility(
+            self._text_profile,
+            self._voice,
+            voices,
+        )
+        if self._compatibility.requires_confirmation and not self._allow_voice_mismatch:
+            raise _PreflightError(
+                self._voice,
+                _AttemptFailure(
+                    "incompatible_voice",
+                    self._compatibility.message,
+                    suggestion=self._compatibility.recommended_voice,
+                ),
+                suggestion=self._compatibility.recommended_voice,
+            )
+        if self._compatibility.requires_confirmation:
+            logger.warning(
+                "Proceeding despite voice/text mismatch: voice=%s message=%s",
+                self._voice,
+                self._compatibility.short_message,
+            )
 
         self.stage_changed.emit("local", "Splitting text into chunks")
         chunks = _split_text(stripped_text, max_chunk_chars, max_payload_bytes)
-        chunks = _apply_first_chunk_probe(chunks, total_chars)
+        chunks = _apply_first_chunk_probe(chunks, total_chars, chunk_plan)
         n_chunks = len(chunks)
         if not chunks:
             raise ValueError("No text was available to generate.")
+
+        if total_chars >= chunk_plan.preflight_threshold or n_chunks > 1:
+            await self._run_preflight(voices)
 
         logger.info(
             "Starting: voice=%s rate=%s chars=%d chunks=%d chunk_size=%d payload_limit=%d output=%s",
             self._voice,
             self._rate,
-            len(self._text),
+            len(stripped_text),
             n_chunks,
             max_chunk_chars,
             max_payload_bytes,
@@ -524,23 +659,46 @@ class TTSWorker(QThread):
             chars_at_last_stage_emit=0,
             time_at_last_stage_emit=job_start,
         )
+        adaptive_char_limit = max_chunk_chars
+        adaptive_payload_limit = max_payload_bytes
 
         try:
             with open(output_path, "wb") as audio_file:
-                for chunk_idx, text_chunk in enumerate(chunks):
+                chunk_idx = 0
+                while chunk_idx < len(chunks):
                     if self._cancelled:
                         raise asyncio.CancelledError()
 
-                    await self._process_chunk(
+                    text_chunk = chunks[chunk_idx]
+                    if not _fits_chunk(text_chunk, adaptive_char_limit, adaptive_payload_limit):
+                        adaptive_chunks = _split_text(
+                            text_chunk,
+                            adaptive_char_limit,
+                            adaptive_payload_limit,
+                        )
+                        if len(adaptive_chunks) > 1:
+                            chunks[chunk_idx:chunk_idx + 1] = adaptive_chunks
+                            n_chunks = len(chunks)
+                            continue
+
+                    outcome = await self._process_chunk(
                         audio_file=audio_file,
                         text_chunk=text_chunk,
                         chunk_idx=chunk_idx,
                         n_chunks=n_chunks,
                         total_chars=total_chars,
                         progress_state=progress_state,
-                        char_limit=max_chunk_chars,
-                        payload_limit=max_payload_bytes,
+                        char_limit=adaptive_char_limit,
+                        payload_limit=adaptive_payload_limit,
+                        plan=chunk_plan,
                     )
+                    adaptive_char_limit, adaptive_payload_limit = self._retune_after_chunk(
+                        outcome,
+                        adaptive_char_limit,
+                        adaptive_payload_limit,
+                        chunk_plan,
+                    )
+                    chunk_idx += 1
 
         except asyncio.CancelledError:
             logger.info("Stream cancelled — removing partial file")
@@ -577,6 +735,10 @@ class TTSWorker(QThread):
         sample = self._preflight_sample_text()
         if not sample:
             return
+        preflight_plan = _chunk_plan_for(
+            len(self._text_profile.cleaned_text),
+            self._text_profile.script_code,
+        )
 
         self.status_changed.emit("Validating voice…")
         self.stage_changed.emit(
@@ -599,6 +761,7 @@ class TTSWorker(QThread):
                     total_chars=1,
                     progress_state=None,
                     timeout_s=_PREFLIGHT_TIMEOUT_S,
+                    first_audio_timeout_s=preflight_plan.first_audio_timeout_s,
                 )
                 return
             except _AttemptFailure as exc:
@@ -626,7 +789,7 @@ class TTSWorker(QThread):
 
     def _preflight_sample_text(self) -> str:
         sample_chunks = _split_text(
-            self._text.strip(),
+            self._text_profile.cleaned_text.strip(),
             _PREFLIGHT_SAMPLE_CHARS,
             _PREFLIGHT_SAMPLE_PAYLOAD_BYTES,
         )
@@ -643,9 +806,10 @@ class TTSWorker(QThread):
         progress_state: _ProgressState,
         char_limit: int,
         payload_limit: int,
+        plan: _ChunkPlan,
         depth: int = 0,
         display_label: str | None = None,
-    ) -> None:
+    ) -> _ChunkOutcome:
         chunk_number = chunk_idx + 1
         chunk_label = display_label or (
             f"chunk {chunk_number}/{n_chunks}" if n_chunks > 1 else "text"
@@ -696,21 +860,17 @@ class TTSWorker(QThread):
 
             try:
                 timeout_s = self._chunk_timeout_for(text_chunk)
-                audio_bytes, attempt_chars = await self._synthesise_attempt(
+                audio_bytes, attempt_chars, stats = await self._synthesise_attempt(
                     text_chunk,
                     chunk_label=chunk_label,
                     total_chars=total_chars,
                     progress_state=progress_state,
                     timeout_s=timeout_s,
+                    first_audio_timeout_s=plan.first_audio_timeout_s,
                 )
 
                 self.stage_changed.emit("local", f"Writing {chunk_label} to disk")
                 audio_file.write(audio_bytes)
-                audio_file.flush()
-                try:
-                    os.fsync(audio_file.fileno())
-                except OSError:
-                    pass
 
                 progress_state.processed_chars = min(
                     progress_state.processed_chars + attempt_chars,
@@ -727,7 +887,16 @@ class TTSWorker(QThread):
                     chunk_elapsed,
                     len(audio_bytes),
                 )
-                return
+                return _ChunkOutcome(
+                    attempts=attempt + 1,
+                    elapsed=chunk_elapsed,
+                    used_recovery=depth > 0,
+                    first_audio_delay=(
+                        stats.first_audio_at - stats.started_at
+                        if stats.first_audio_at is not None
+                        else None
+                    ),
+                )
 
             except asyncio.CancelledError:
                 raise
@@ -768,10 +937,17 @@ class TTSWorker(QThread):
                         progress_state=progress_state,
                         char_limit=next_char_limit,
                         payload_limit=next_payload_limit,
+                        plan=plan,
                         depth=depth + 1,
                         display_label=f"{chunk_label} · recovery {sub_idx}/{len(recovery_chunks)}",
                     )
-                return
+                chunk_elapsed = time.monotonic() - chunk_start
+                return _ChunkOutcome(
+                    attempts=_MAX_ATTEMPTS,
+                    elapsed=chunk_elapsed,
+                    used_recovery=True,
+                    first_audio_delay=None,
+                )
 
         raise _ChunkError(chunk_number, n_chunks, last_failure or _AttemptFailure("unexpected", "Unknown chunk failure"))
 
@@ -782,16 +958,24 @@ class TTSWorker(QThread):
         payload_limit: int,
         depth: int,
     ) -> list[str]:
+        chunk_chars = len(text_chunk)
+        chunk_payload = _edge_payload_size(text_chunk)
         if depth >= _MAX_RECOVERY_DEPTH:
             return []
-        if len(text_chunk) <= _MIN_RECOVERY_CHARS:
+        if chunk_chars <= _MIN_RECOVERY_CHARS:
             return []
-        if _edge_payload_size(text_chunk) <= _MIN_RECOVERY_PAYLOAD_BYTES:
+        if chunk_payload <= _MIN_RECOVERY_PAYLOAD_BYTES:
             return []
 
-        next_char_limit = max(_MIN_RECOVERY_CHARS, char_limit // 2)
-        next_payload_limit = max(_MIN_RECOVERY_PAYLOAD_BYTES, payload_limit // 2)
-        if next_char_limit >= len(text_chunk) and next_payload_limit >= _edge_payload_size(text_chunk):
+        next_char_limit = max(
+            _MIN_RECOVERY_CHARS,
+            min(char_limit // 2, max(_MIN_RECOVERY_CHARS, chunk_chars // 2)),
+        )
+        next_payload_limit = max(
+            _MIN_RECOVERY_PAYLOAD_BYTES,
+            min(payload_limit // 2, max(_MIN_RECOVERY_PAYLOAD_BYTES, chunk_payload // 2)),
+        )
+        if next_char_limit >= chunk_chars and next_payload_limit >= chunk_payload:
             return []
 
         recovery_chunks = _split_text(text_chunk, next_char_limit, next_payload_limit)
@@ -805,8 +989,9 @@ class TTSWorker(QThread):
         total_chars: int,
         progress_state: _ProgressState | None,
         timeout_s: int,
-    ) -> tuple[bytes, int]:
-        stats = _AttemptStats()
+        first_audio_timeout_s: int,
+    ) -> tuple[bytes, int, _AttemptStats]:
+        stats = _AttemptStats(started_at=time.monotonic())
         audio_buffer = io.BytesIO()
         receive_timeout = max(
             _EDGE_RECEIVE_TIMEOUT_MIN_S,
@@ -822,12 +1007,32 @@ class TTSWorker(QThread):
         )
 
         async def _consume_stream() -> None:
-            async for event in communicate.stream():
+            stream = communicate.stream().__aiter__()
+            deadline = stats.started_at + timeout_s
+
+            while True:
                 if self._cancelled:
                     raise asyncio.CancelledError()
 
+                now = time.monotonic()
+                if now >= deadline:
+                    raise asyncio.TimeoutError()
+
+                if stats.audio_bytes == 0:
+                    wait_timeout = min(deadline - now, self._first_audio_timeout_for(text, first_audio_timeout_s))
+                else:
+                    wait_timeout = min(deadline - now, self._stream_idle_timeout_for(text))
+
+                try:
+                    event = await asyncio.wait_for(stream.__anext__(), timeout=max(wait_timeout, 1.0))
+                except StopAsyncIteration:
+                    break
+
+                stats.last_event_at = time.monotonic()
+
                 if event["type"] == "audio":
                     if stats.audio_bytes == 0:
+                        stats.first_audio_at = stats.last_event_at
                         self.stage_changed.emit("remote", f"Receiving audio — {chunk_label}")
                     data = event["data"]
                     stats.audio_bytes += len(data)
@@ -871,7 +1076,7 @@ class TTSWorker(QThread):
             )
             raise _AttemptFailure(kind, detail)
 
-        return audio_buffer.getvalue(), stats.attempt_chars
+        return audio_buffer.getvalue(), stats.attempt_chars, stats
 
     def _rollback_failed_attempt(
         self,
@@ -883,8 +1088,54 @@ class TTSWorker(QThread):
 
     @staticmethod
     def _chunk_timeout_for(text: str) -> int:
-        estimated = 35 + (_edge_payload_size(text) / 30.0)
+        estimated = 28 + (_edge_payload_size(text) / 36.0)
         return int(max(_CHUNK_TIMEOUT_MIN_S, min(_CHUNK_TIMEOUT_MAX_S, estimated)))
+
+    @staticmethod
+    def _first_audio_timeout_for(text: str, base_timeout_s: int) -> int:
+        estimated = base_timeout_s + int(_edge_payload_size(text) / 220.0)
+        return int(max(_FIRST_AUDIO_TIMEOUT_MIN_S, min(_FIRST_AUDIO_TIMEOUT_MAX_S, estimated)))
+
+    @staticmethod
+    def _stream_idle_timeout_for(text: str) -> int:
+        estimated = 12 + int(_edge_payload_size(text) / 260.0)
+        return int(max(_STREAM_IDLE_TIMEOUT_MIN_S, min(_STREAM_IDLE_TIMEOUT_MAX_S, estimated)))
+
+    def _retune_after_chunk(
+        self,
+        outcome: _ChunkOutcome,
+        current_char_limit: int,
+        current_payload_limit: int,
+        plan: _ChunkPlan,
+    ) -> tuple[int, int]:
+        next_chars = current_char_limit
+        next_payload = current_payload_limit
+
+        slow_chunk = (
+            outcome.elapsed > 32.0
+            or (
+                outcome.first_audio_delay is not None
+                and outcome.first_audio_delay >= max(12.0, plan.first_audio_timeout_s * 0.9)
+            )
+        )
+        if outcome.used_recovery or outcome.attempts > 1 or slow_chunk:
+            next_chars = max(_MIN_RECOVERY_CHARS, int(current_char_limit * _ADAPTIVE_SHRINK_FACTOR))
+            next_payload = max(
+                _MIN_RECOVERY_PAYLOAD_BYTES,
+                int(current_payload_limit * _ADAPTIVE_SHRINK_FACTOR),
+            )
+            self.stage_changed.emit(
+                "local",
+                f"Reducing upcoming chunk size to keep throughput stable (≤{next_chars:,} chars)",
+            )
+        else:
+            next_chars = min(plan.steady_chars, max(current_char_limit, int(current_char_limit * 1.12)))
+            next_payload = min(
+                plan.steady_payload_bytes,
+                max(current_payload_limit, int(current_payload_limit * 1.12)),
+            )
+
+        return next_chars, next_payload
 
     @staticmethod
     def _retry_status_text(failure: _AttemptFailure | None, attempt: int) -> str:
@@ -964,6 +1215,12 @@ class TTSWorker(QThread):
                 return _AttemptFailure(
                     "timeout_after_audio",
                     f"The speech request stalled after partial audio on {chunk_label}.",
+                    original=exc,
+                )
+            if stats.metadata_events > 0:
+                return _AttemptFailure(
+                    "metadata_without_audio",
+                    f"The speech service kept returning metadata but no audio for {chunk_label}.",
                     original=exc,
                 )
             return _AttemptFailure(
@@ -1056,6 +1313,12 @@ class TTSWorker(QThread):
                     "The selected voice is no longer available from the Microsoft speech service.\n\n"
                     f"Voice: {exc.voice}\n"
                     "Reload the voice list and choose another voice before generating."
+                    f"{suggestion}"
+                )
+            if exc.cause.kind == "incompatible_voice":
+                return (
+                    f"{exc.cause}\n\n"
+                    "SetupTTS stopped before the full job started to avoid a bad voice/text pairing."
                     f"{suggestion}"
                 )
             if exc.cause.kind in {"no_audio", "metadata_without_audio"}:

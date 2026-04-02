@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QClipboard
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -90,6 +91,11 @@ class SettingsDialog(QDialog):
         audio_note.setObjectName("metaLabel")
         root.addWidget(audio_note)
 
+        self._auto_voice_checkbox = QCheckBox(
+            "Automatically switch to a recommended voice when the current voice looks incompatible"
+        )
+        root.addWidget(self._auto_voice_checkbox)
+
         # ── Data ───────────────────────────────────────────────────── #
         root.addWidget(self._section_title("Data"))
 
@@ -146,6 +152,9 @@ class SettingsDialog(QDialog):
 
     def _load_values(self) -> None:
         self._output_dir_edit.setText(self._settings.output_dir)
+        self._auto_voice_checkbox.setChecked(
+            self._settings.auto_switch_recommended_voice
+        )
         self._data_dir_label.setText(str(self._paths.data_dir))
         self._log_dir_label.setText(str(self._paths.log_dir))
 
@@ -157,6 +166,7 @@ class SettingsDialog(QDialog):
 
     def _save(self) -> None:
         self._settings.output_dir = self._output_dir_edit.text().strip()
+        self._settings.auto_switch_recommended_voice = self._auto_voice_checkbox.isChecked()
         self._settings.save()
         self.accept()
 

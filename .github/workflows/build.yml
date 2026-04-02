@@ -309,15 +309,19 @@ jobs:
 
             ---
 
-            ### What's new in v1.4.1
+            ### What's new in v${{ steps.ver.outputs.version }}
 
-            #### Voice validation and no-audio recovery
-            - **Startup voice validation** — long jobs now run a lightweight synthesis preflight before chunking the full text, so voices that return no audio fail fast instead of burning through chunk 1.
-            - **Selected voice verification** — SetupTTS now confirms the chosen Microsoft voice still exists before generation begins and reports a clearer error when a voice disappears or becomes unavailable.
-            - **Provider-specific no-audio handling** — `NoAudioReceived` is now treated separately from DNS, timeout, and generic network failures, with user messages that explain what actually happened.
+            #### Voice/text compatibility guardrails
+            - **Language and script checks before generation** — SetupTTS now inspects the pasted text before a full job starts and warns when the selected voice is a poor fit.
+            - **Recommended voice suggestions** — mismatched combinations now suggest a better voice instead of silently running into low-quality or gibberish output.
+            - **Optional auto-switching** — users can enable an automatic switch to the recommended voice in Settings, or keep manual control with a one-click “Use Recommended Voice” action.
+            - **Lightweight startup synthesis** — long and multi-chunk jobs now run a small preflight request first so no-audio and bad voice/provider combinations fail before the main export begins.
 
-            #### Chunk reliability improvements
-            - **Byte-safe chunking** — SetupTTS now keeps chunks below a safe payload limit so `edge_tts` does not silently split them internally, which improves long-job reliability and first-chunk behaviour.
+            #### Throughput and stability improvements
+            - **Adaptive chunk sizing** — the first chunk is intentionally smaller for warm-up, then SetupTTS uses larger steady-state chunks and shrinks again only when a real job starts getting slow or unhealthy.
+            - **Earlier stalled-request detection** — the app now times out dead first-audio waits earlier instead of burning huge time on chunks that never become healthy.
+            - **Smaller recovery sections on failure** — retries now recreate the connection cleanly and split the exact failed chunk into smaller pieces when Microsoft returns no audio.
+            - **Less local write overhead** — SetupTTS no longer forces a disk sync after every chunk, which removes avoidable local slowdown without affecting output safety.
             - **Smaller first probe chunk** — long jobs now start with a smaller opening chunk to warm up the session more safely before the rest of the job continues.
             - **Adaptive recovery split** — if a chunk still fails, SetupTTS now retries with smaller recovery chunks instead of repeatedly hammering the same full-size request.
             - **Fresh session per retry** — each retry now starts from a clean `edge_tts` communication object instead of reusing any stale websocket state.

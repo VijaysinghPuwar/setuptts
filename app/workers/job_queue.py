@@ -44,6 +44,7 @@ class JobItem:
     rate:          str
     volume:        str
     output_path:   str
+    allow_voice_mismatch: bool = False
 
     # Derived / mutable
     id:          str   = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -121,6 +122,7 @@ class JobQueue(QObject):
         rate:          str,
         volume:        str,
         output_path:   str,
+        allow_voice_mismatch: bool = False,
     ) -> str:
         """
         Add a job to the queue.  Returns the new job's ID.
@@ -134,6 +136,7 @@ class JobQueue(QObject):
         item = JobItem(
             text=text, voice=voice, voice_display=voice_display,
             rate=rate, volume=volume, output_path=output_path,
+            allow_voice_mismatch=allow_voice_mismatch,
         )
         logger.info(
             "Job queued: id=%s voice=%s output=%s",
@@ -255,6 +258,7 @@ class JobQueue(QObject):
             text=item.text, voice=item.voice,
             rate=item.rate, volume=item.volume,
             output_path=item.output_path,
+            allow_voice_mismatch=item.allow_voice_mismatch,
         )
 
         jid = item.id

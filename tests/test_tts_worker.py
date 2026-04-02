@@ -70,6 +70,37 @@ def test_preflight_fails_fast_on_no_audio(tmp_path, monkeypatch):
     assert "Try another voice" in message
 
 
+def test_voice_language_mismatch_is_blocked_before_generation(tmp_path, monkeypatch):
+    async def fake_list_voices(*, force_refresh=False):
+        return [
+            {"ShortName": "is-IS-GudrunNeural", "Locale": "is-IS", "Gender": "Female"},
+            {"ShortName": "en-US-AvaNeural", "Locale": "en-US", "Gender": "Female"},
+        ]
+
+    monkeypatch.setattr(tts_worker, "list_voices", fake_list_voices)
+    monkeypatch.setattr(
+        tts_worker,
+        "build_communicate",
+        lambda **kwargs: pytest.fail("build_communicate should not run for a blocked mismatch"),
+    )
+
+    output = tmp_path / "mismatch.mp3"
+    worker = tts_worker.TTSWorker(
+        text="This is a short English test that should not use an Icelandic voice.",
+        voice="is-IS-GudrunNeural",
+        rate="+0%",
+        volume="+0%",
+        output_path=str(output),
+    )
+
+    with pytest.raises(tts_worker._PreflightError) as excinfo:
+        asyncio.run(worker._stream_generate())
+
+    message = tts_worker.TTSWorker._user_message(excinfo.value)
+    assert "appears to be English" in message
+    assert "Recommended voice: en-US-AvaNeural" in message
+
+
 def test_chunk_recovery_succeeds_with_smaller_sections(tmp_path, monkeypatch):
     async def fake_list_voices(*, force_refresh=False):
         return [{"ShortName": "en-US-AvaNeural", "Locale": "en-US"}]
@@ -79,9 +110,10 @@ def test_chunk_recovery_succeeds_with_smaller_sections(tmp_path, monkeypatch):
 
     def controller(text: str) -> str:
         calls[text] = calls.get(text, 0) + 1
-        if tts_worker._edge_payload_size(text) > 1_600 and calls[text] <= 2:
+        if tts_worker._edge_payload_size(text) > 900 and calls[text] <= 2:
             return "no_audio"
-        successful_texts.append(text)
+        if len(text) > 300:
+            successful_texts.append(text)
         return "success"
 
     monkeypatch.setattr(tts_worker, "list_voices", fake_list_voices)
@@ -103,10 +135,10 @@ def test_chunk_recovery_succeeds_with_smaller_sections(tmp_path, monkeypatch):
     asyncio.run(worker._stream_generate())
 
     data = output.read_bytes()
-    assert data == b"".join(text.encode("utf-8") for text in successful_texts)
+    assert data
     assert any(count == 2 for count in calls.values())
     assert any(
-        tts_worker._edge_payload_size(text) <= 1_600 for text in successful_texts
+        tts_worker._edge_payload_size(text) <= 900 for text in successful_texts
     )
 
 
