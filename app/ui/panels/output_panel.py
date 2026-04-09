@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -74,7 +75,9 @@ from app.services.tts_quality import (
     assess_voice_compatibility,
     build_text_profile,
 )
+from app.utils.paths import AppPaths
 from app.workers.job_queue import JobItem, JobQueue
+from app.workers.chunk_store import ResumeCandidate, ChunkStore
 from app.workers.preview_worker import PreviewWorker
 from app.workers.voice_loader import VoiceLoaderWorker
 
@@ -118,6 +121,8 @@ class OutputPanel(QWidget):
         self._preview_worker: PreviewWorker | None = None
         self._current_text = ""
         self._compatibility: VoiceCompatibilityAssessment | None = None
+        self._visible_recommended_voice: str | None = None
+        self._resume_candidates: list[ResumeCandidate] = []
         # Keep old voice-loader workers alive until their thread exits.
         # Without this, replacing self._voice_loader on retry can cause
         # the old QThread object to be GC-collected mid-run → crash.
@@ -139,6 +144,7 @@ class OutputPanel(QWidget):
         self._connect_signals()
         self._apply_settings()
         self._start_voice_load()
+        self._refresh_resume_jobs()
 
     # ------------------------------------------------------------------ #
     # Public API (used by MainWindow)                                     #
@@ -458,6 +464,21 @@ class OutputPanel(QWidget):
         )
         ly.addWidget(self._generate_hint)
 
+        ly.addSpacing(6)
+        self._resume_job_btn = QPushButton("Resume Saved Job")
+        self._resume_job_btn.setObjectName("ghostButton")
+        self._resume_job_btn.hide()
+        ly.addWidget(self._resume_job_btn)
+
+        self._resume_job_hint = QLabel("")
+        self._resume_job_hint.setObjectName("hintLabel")
+        self._resume_job_hint.setWordWrap(True)
+        self._resume_job_hint.setStyleSheet(
+            "color: #C2944A; font-size: 11px; background: transparent;"
+        )
+        self._resume_job_hint.hide()
+        ly.addWidget(self._resume_job_hint)
+
         return card
 
     # ── Active jobs list ──────────────────────────────────────────────── #
@@ -503,6 +524,7 @@ class OutputPanel(QWidget):
         # Export form
         self._browse_btn.clicked.connect(self._browse_folder)
         self._generate_btn.clicked.connect(self._on_generate)
+        self._resume_job_btn.clicked.connect(self._on_resume_saved_job)
         self._retry_voices_btn.clicked.connect(self._start_voice_load)
 
         # Preview
@@ -518,6 +540,7 @@ class OutputPanel(QWidget):
         self._queue.job_stage_changed.connect(self._on_job_stage_changed)
         self._queue.job_speed_updated.connect(self._on_job_speed_updated)
         self._queue.job_telemetry_updated.connect(self._on_job_telemetry_updated)
+        self._queue.job_resumable.connect(self._on_job_resumable)
         self._queue.job_completed.connect(self._on_job_completed)
         self._queue.job_failed.connect(self._on_job_failed)
         self._queue.job_cancelled.connect(self._on_job_cancelled)
@@ -723,30 +746,75 @@ class OutputPanel(QWidget):
         assessment = assess_voice_compatibility(profile, selected_voice, self._all_voices)
         self._compatibility = assessment
 
-        if not assessment.requires_confirmation:
-            self._hide_voice_guidance()
-            return
+        warning_message = ""
+        recommended_voice = None
 
-        self._voice_warning_label.setText(assessment.message)
-        self._use_recommended_voice_btn.setVisible(bool(assessment.recommended_voice))
-        if assessment.recommended_voice:
+        if assessment.requires_confirmation:
+            warning_message = assessment.message
+            recommended_voice = assessment.recommended_voice
+        else:
+            long_job_warning = self._long_job_voice_warning(profile, selected_voice)
+            if long_job_warning is None:
+                self._hide_voice_guidance()
+                return
+            warning_message, recommended_voice = long_job_warning
+
+        self._voice_warning_label.setText(warning_message)
+        self._visible_recommended_voice = recommended_voice
+        self._use_recommended_voice_btn.setVisible(bool(recommended_voice))
+        if recommended_voice:
             self._use_recommended_voice_btn.setText(
-                f"Use {assessment.recommended_voice}"
+                f"Use {recommended_voice}"
             )
         self._voice_warning.show()
 
     def _hide_voice_guidance(self) -> None:
         self._compatibility = None
+        self._visible_recommended_voice = None
         self._voice_warning.hide()
         self._voice_warning_label.clear()
         self._use_recommended_voice_btn.hide()
 
+    def _long_job_voice_warning(
+        self,
+        profile,
+        selected_voice: str,
+    ) -> tuple[str, str | None] | None:
+        cleaned = profile.cleaned_text.strip()
+        if len(cleaned) < 45_000 or "multilingual" not in selected_voice.lower():
+            return None
+        if profile.language_code not in {None, "en"}:
+            return None
+        if profile.script_code not in {None, "latin", ""}:
+            return None
+
+        parts = selected_voice.split("-")
+        locale = "-".join(parts[:2]) if len(parts) >= 2 else selected_voice
+        recommended_voice = next(
+            (
+                voice.short_name
+                for voice in self._all_voices
+                if voice.short_name != selected_voice
+                and voice.locale == locale
+                and "multilingual" not in voice.short_name.lower()
+            ),
+            None,
+        )
+        message = (
+            f"'{selected_voice}' is a multilingual model. For very long English narration jobs, "
+            "SetupTTS treats it as more failure-prone than a same-locale non-multilingual voice "
+            "and will use smaller chunks plus stronger recovery."
+        )
+        if recommended_voice:
+            message += f"\nRecommended voice: {recommended_voice}"
+        return message, recommended_voice
+
     def _on_use_recommended_voice(self) -> None:
-        assessment = self._compatibility
-        if not assessment or not assessment.recommended_voice:
+        recommended_voice = self._visible_recommended_voice
+        if not recommended_voice:
             return
-        if self._select_voice_by_short_name(assessment.recommended_voice):
-            self.status_message.emit(f"Using recommended voice: {assessment.recommended_voice}")
+        if self._select_voice_by_short_name(recommended_voice):
+            self.status_message.emit(f"Using recommended voice: {recommended_voice}")
 
     def _select_voice_by_short_name(self, short_name: str) -> bool:
         voice = next((item for item in self._all_voices if item.short_name == short_name), None)
@@ -949,6 +1017,108 @@ class OutputPanel(QWidget):
         )
         self._generate_btn.setEnabled(has_text)
 
+    def _refresh_resume_jobs(self) -> None:
+        try:
+            self._resume_candidates = ChunkStore.list_resume_candidates(AppPaths().staging_dir)
+        except Exception:
+            logger.warning("Could not load resumable jobs", exc_info=True)
+            self._resume_candidates = []
+
+        if not self._resume_candidates:
+            self._resume_job_btn.hide()
+            self._resume_job_hint.hide()
+            self._resume_job_hint.clear()
+            return
+
+        latest = self._resume_candidates[0]
+        resume_chunk = latest.failed_at_chunk or (latest.completed_count + 1)
+        latest_name = Path(latest.output_path).name
+        count = len(self._resume_candidates)
+        self._resume_job_btn.setText(
+            "Resume Saved Job" if count == 1 else f"Resume Saved Job ({count})"
+        )
+        self._resume_job_hint.setText(
+            f"{count} resumable job(s) saved locally. Latest: {latest_name} — "
+            f"{latest.completed_count} chunk(s) preserved, resume at chunk {resume_chunk}."
+        )
+        self._resume_job_btn.show()
+        self._resume_job_hint.show()
+
+    def _on_resume_saved_job(self) -> None:
+        if not self._resume_candidates:
+            self._refresh_resume_jobs()
+        if not self._resume_candidates:
+            QMessageBox.information(
+                self,
+                "No Saved Job",
+                "No resumable SetupTTS job was found.",
+            )
+            return
+
+        if len(self._resume_candidates) == 1:
+            self._resume_candidate(self._resume_candidates[0])
+            return
+
+        menu = QMenu(self)
+        for candidate in self._resume_candidates:
+            resume_chunk = candidate.failed_at_chunk or (candidate.completed_count + 1)
+            label = (
+                f"{Path(candidate.output_path).name} — "
+                f"resume at chunk {resume_chunk} ({candidate.completed_count} preserved)"
+            )
+            action = menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, c=candidate: self._resume_candidate(c)
+            )
+        menu.exec(self._resume_job_btn.mapToGlobal(self._resume_job_btn.rect().bottomLeft()))
+
+    def _resume_candidate(self, candidate: ResumeCandidate) -> None:
+        if self._queue.has_active_output_path(candidate.output_path):
+            QMessageBox.warning(
+                self,
+                "Job Already Active",
+                "A job for this output file is already running or queued.",
+            )
+            return
+
+        voice = candidate.voice
+        self._select_voice_by_short_name(voice)
+        output_path = Path(candidate.output_path)
+        self._filename_edit.setText(output_path.name)
+        self._folder_edit.setText(str(output_path.parent))
+        self._settings.output_dir = str(output_path.parent)
+
+        parent_win = self.window()
+        if hasattr(parent_win, "set_input_text"):
+            try:
+                parent_win.set_input_text(candidate.text)
+            except Exception:
+                logger.warning("Could not load resumable text into the editor", exc_info=True)
+
+        parts = voice.split("-")
+        persona = parts[-1].replace("Neural", "").replace("Multilingual", "") if parts else voice
+        locale_key = "-".join(parts[:2]) if len(parts) >= 2 else voice
+        voice_display = f"{persona} · {_locale_label(locale_key)}"
+
+        try:
+            self._queue.submit(
+                text=candidate.text,
+                voice=voice,
+                voice_display=voice_display,
+                rate=candidate.rate,
+                volume=candidate.volume,
+                output_path=candidate.output_path,
+                allow_voice_mismatch=False,
+                job_id=candidate.job_id,
+                resume_staging_dir=str(candidate.staging_dir),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Job Already Active", str(exc))
+            return
+
+        self.status_message.emit(f"Resuming saved job: {output_path.name}")
+        self._refresh_resume_jobs()
+
     # ------------------------------------------------------------------ #
     # Job queue event handlers                                             #
     # ------------------------------------------------------------------ #
@@ -987,6 +1157,12 @@ class OutputPanel(QWidget):
         if job_id in self._job_rows:
             self._job_rows[job_id].update_telemetry(telemetry)
 
+    def _on_job_resumable(self, item: JobItem) -> None:
+        self.status_message.emit(
+            f"Partial progress preserved for {item.filename} — resume from chunk {item.failed_chunk or (item.preserved_chunks + 1)}"
+        )
+        QTimer.singleShot(0, self._refresh_resume_jobs)
+
     def _on_job_completed(self, item: JobItem) -> None:
         self._remove_job_row(item.id)
 
@@ -1007,26 +1183,48 @@ class OutputPanel(QWidget):
 
         self.job_completed.emit(job)
         self.status_message.emit(f"Saved: {item.filename}")
+        self._refresh_resume_jobs()
 
     def _on_job_failed(self, item: JobItem) -> None:
         self._remove_job_row(item.id)
-        # Use a non-blocking (modeless) dialog so that simultaneous failures
-        # from concurrent jobs don't stack up and freeze the UI.
-        from PySide6.QtCore import Qt as _Qt
-        from PySide6.QtWidgets import QMessageBox as _QMB
-        msg = _QMB(self)
-        msg.setIcon(_QMB.Icon.Critical)
-        msg.setWindowTitle("Generation Failed")
-        msg.setText(item.error)
-        msg.setStandardButtons(_QMB.StandardButton.Ok)
-        msg.setModal(False)
-        msg.setAttribute(_Qt.WidgetAttribute.WA_DeleteOnClose)
-        msg.show()
-        self.status_message.emit(f"Generation failed: {item.filename}")
+        self._refresh_resume_jobs()
+        prompt = QMessageBox(self)
+        prompt.setIcon(QMessageBox.Icon.Critical)
+        prompt.setWindowTitle("Generation Failed")
+        prompt.setText(item.error)
+        resume_btn = None
+        if item.resumable and item.resume_staging_dir:
+            resume_btn = prompt.addButton(
+                "Resume Failed Job",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+        prompt.addButton(QMessageBox.StandardButton.Ok)
+        prompt.exec()
+
+        if resume_btn is not None and prompt.clickedButton() == resume_btn:
+            candidate = next(
+                (
+                    saved
+                    for saved in self._resume_candidates
+                    if str(saved.staging_dir) == item.resume_staging_dir
+                ),
+                None,
+            )
+            if candidate is not None:
+                self._resume_candidate(candidate)
+                return
+
+        if item.resumable and item.preserved_chunks > 0:
+            self.status_message.emit(
+                f"Generation failed at chunk {item.failed_chunk}; {item.preserved_chunks} chunk(s) preserved"
+            )
+        else:
+            self.status_message.emit(f"Generation failed: {item.filename}")
 
     def _on_job_cancelled(self, item: JobItem) -> None:
         self._remove_job_row(item.id)
         self.status_message.emit(f"Cancelled: {item.filename}")
+        QTimer.singleShot(300, self._refresh_resume_jobs)
 
     def _remove_job_row(self, job_id: str) -> None:
         row = self._job_rows.pop(job_id, None)

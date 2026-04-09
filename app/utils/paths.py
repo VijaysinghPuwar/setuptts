@@ -1,8 +1,11 @@
 """Platform-aware path resolution for app data, logs, cache, and bundled resources."""
 
+import os
 import sys
+import tempfile
 from pathlib import Path
-from platformdirs import user_data_dir, user_log_dir, user_cache_dir
+
+from platformdirs import user_cache_dir, user_data_dir, user_log_dir
 
 from app import APP_NAME, APP_ORG
 
@@ -29,12 +32,40 @@ class AppPaths:
     """
 
     def __init__(self) -> None:
-        self.data_dir = Path(user_data_dir(APP_NAME, APP_ORG))
-        self.log_dir = Path(user_log_dir(APP_NAME, APP_ORG))
-        self.cache_dir = Path(user_cache_dir(APP_NAME, APP_ORG))
+        override_root = os.environ.get("SETUPTTS_DATA_DIR", "").strip()
+        if override_root:
+            base = Path(override_root).expanduser()
+            self.data_dir = self._ensure_dir(base)
+            self.log_dir = self._ensure_dir(self.data_dir / "logs")
+            self.cache_dir = self._ensure_dir(self.data_dir / "cache")
+            return
 
-        for directory in (self.data_dir, self.log_dir, self.cache_dir):
+        self.data_dir = self._ensure_dir(Path(user_data_dir(APP_NAME, APP_ORG)))
+        self.log_dir = self._ensure_dir(
+            Path(user_log_dir(APP_NAME, APP_ORG)),
+            fallback=self.data_dir / "logs",
+        )
+        self.cache_dir = self._ensure_dir(
+            Path(user_cache_dir(APP_NAME, APP_ORG)),
+            fallback=self.data_dir / "cache",
+        )
+
+    @staticmethod
+    def _ensure_dir(directory: Path, *, fallback: Path | None = None) -> Path:
+        try:
             directory.mkdir(parents=True, exist_ok=True)
+            return directory
+        except OSError:
+            safe_fallback = fallback or (Path(tempfile.gettempdir()) / APP_NAME)
+            safe_fallback.mkdir(parents=True, exist_ok=True)
+            return safe_fallback
+
+    @property
+    def staging_dir(self) -> Path:
+        """Per-job chunk staging area for checkpoint / resume support."""
+        d = self.data_dir / "staging"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     @property
     def db_path(self) -> Path:

@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 from edge_tts import exceptions as edge_exceptions
@@ -22,6 +23,19 @@ class _FakeCommunicate:
 
         yield {"type": "WordBoundary", "text": self._text}
         yield {"type": "audio", "data": self._text.encode("utf-8")}
+
+
+def _small_plan(*_args, **_kwargs):
+    return tts_worker._ChunkPlan(
+        max_chars=120,
+        max_payload_bytes=400,
+        ramp_chars=120,
+        ramp_payload_bytes=400,
+        warmup_chars=120,
+        warmup_payload_bytes=400,
+        preflight_threshold=1_000_000,
+        first_audio_timeout_s=5,
+    )
 
 
 def test_long_jobs_use_a_smaller_probe_first_chunk():
@@ -184,6 +198,128 @@ def test_adaptive_chunk_policy_grows_for_healthy_long_jobs(tmp_path):
     assert chunk_count < 40
 
 
+def test_multilingual_long_jobs_use_smaller_limits():
+    regular = tts_worker._chunk_plan_for(120_000, "latin", multilingual_voice=False)
+    multilingual = tts_worker._chunk_plan_for(120_000, "latin", multilingual_voice=True)
+
+    assert multilingual.max_chars < regular.max_chars
+    assert multilingual.max_payload_bytes < regular.max_payload_bytes
+
+
+def test_failed_chunk_preserves_progress_and_resume_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("SETUPTTS_DATA_DIR", str(tmp_path / "appdata"))
+    monkeypatch.setattr(tts_worker, "_chunk_plan_for", _small_plan)
+
+    async def fake_list_voices(*, force_refresh=False):
+        return [{"ShortName": "en-US-AvaNeural", "Locale": "en-US"}]
+
+    def controller(text: str) -> str:
+        if "omega" in text:
+            return "no_audio"
+        return "success"
+
+    monkeypatch.setattr(tts_worker, "list_voices", fake_list_voices)
+    monkeypatch.setattr(
+        tts_worker,
+        "build_communicate",
+        lambda **kwargs: _FakeCommunicate(kwargs["text"], controller),
+    )
+
+    text = (
+        ("alpha beta gamma delta epsilon " * 12).strip()
+        + "\n\n"
+        + ("omega psi chi phi upsilon " * 12).strip()
+    )
+    output = tmp_path / "preserved.mp3"
+    worker = tts_worker.TTSWorker(
+        text=text,
+        voice="en-US-AvaNeural",
+        rate="+0%",
+        volume="+0%",
+        output_path=str(output),
+    )
+
+    with pytest.raises(tts_worker._ChunkError) as excinfo:
+        asyncio.run(worker._stream_generate())
+
+    err = excinfo.value
+    assert err.preserved_chunks >= 1
+    assert err.staging_dir is not None
+    assert (err.staging_dir / "chunk_0000.mp3").exists()
+    assert (err.staging_dir / "source.txt").exists()
+
+    manifest = json.loads((err.staging_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert len(manifest["chunks_completed"]) == err.preserved_chunks
+
+    message = tts_worker.TTSWorker._user_message(err)
+    assert "preserved" in message.lower()
+    assert "retry/resume" in message.lower()
+
+
+def test_resume_reuses_preserved_chunks_without_regenerating_them(tmp_path, monkeypatch):
+    monkeypatch.setenv("SETUPTTS_DATA_DIR", str(tmp_path / "appdata"))
+    monkeypatch.setattr(tts_worker, "_chunk_plan_for", _small_plan)
+
+    async def fake_list_voices(*, force_refresh=False):
+        return [{"ShortName": "en-US-AvaNeural", "Locale": "en-US"}]
+
+    fail_second_chunk = {"enabled": True}
+    calls: dict[str, int] = {}
+
+    def controller(text: str) -> str:
+        calls[text] = calls.get(text, 0) + 1
+        if "omega" in text and fail_second_chunk["enabled"]:
+            return "no_audio"
+        return "success"
+
+    monkeypatch.setattr(tts_worker, "list_voices", fake_list_voices)
+    monkeypatch.setattr(
+        tts_worker,
+        "build_communicate",
+        lambda **kwargs: _FakeCommunicate(kwargs["text"], controller),
+    )
+
+    text = (
+        ("alpha beta gamma delta epsilon " * 12).strip()
+        + "\n\n"
+        + ("omega psi chi phi upsilon " * 12).strip()
+    )
+    cleaned = tts_worker.build_text_profile(text).cleaned_text.strip()
+    cursor = tts_worker._ChunkCursor(cleaned)
+    first_chunk, _ = cursor.take_next(120, 400)
+
+    output = tmp_path / "resume.mp3"
+    worker = tts_worker.TTSWorker(
+        text=text,
+        voice="en-US-AvaNeural",
+        rate="+0%",
+        volume="+0%",
+        output_path=str(output),
+    )
+
+    with pytest.raises(tts_worker._ChunkError) as excinfo:
+        asyncio.run(worker._stream_generate())
+
+    fail_second_chunk["enabled"] = False
+    resumed = tts_worker.TTSWorker(
+        text=text,
+        voice="en-US-AvaNeural",
+        rate="+0%",
+        volume="+0%",
+        output_path=str(output),
+        job_id=excinfo.value.staging_dir.name if excinfo.value.staging_dir is not None else None,
+        resume_staging_dir=excinfo.value.staging_dir,
+    )
+    asyncio.run(resumed._stream_generate())
+
+    assert output.exists()
+    assert output.read_bytes().startswith(first_chunk.encode("utf-8"))
+    assert calls[first_chunk] == 1
+    assert excinfo.value.staging_dir is not None
+    assert not excinfo.value.staging_dir.exists()
+
+
 def test_chunk_error_messages_are_specific():
     no_audio = tts_worker._ChunkError(
         1,
@@ -207,3 +343,8 @@ def test_chunk_error_messages_are_specific():
     assert "returned no audio" in tts_worker.TTSWorker._user_message(no_audio)
     assert "timed out repeatedly" in tts_worker.TTSWorker._user_message(timeout)
     assert "resolve speech.platform.bing.com" in tts_worker.TTSWorker._user_message(dns)
+
+    no_audio.preserved_chunks = 3
+    message = tts_worker.TTSWorker._user_message(no_audio)
+    assert "preserved" in message.lower()
+    assert "retry/resume" in message.lower()

@@ -22,6 +22,7 @@ import math
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import aiohttp
@@ -39,6 +40,8 @@ from app.services.tts_service import (
     build_communicate,
     list_voices,
 )
+from app.utils.paths import AppPaths
+from app.workers.chunk_store import ChunkStore, cleanup_stale_staging
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +128,12 @@ class _ChunkPlan:
     first_audio_timeout_s: int
 
 
-def _chunk_plan_for(total_chars: int, script_code: str | None = None) -> _ChunkPlan:
+def _chunk_plan_for(
+    total_chars: int,
+    script_code: str | None = None,
+    *,
+    multilingual_voice: bool = False,
+) -> _ChunkPlan:
     if total_chars >= _XL_JOB_THRESHOLD:
         chars = _CHUNK_CHARS_XL
         payload = _CHUNK_PAYLOAD_BYTES_XL
@@ -166,6 +174,16 @@ def _chunk_plan_for(total_chars: int, script_code: str | None = None) -> _ChunkP
         preflight_threshold = min(preflight_threshold, script_preflight_threshold)
         first_audio_timeout_s = min(first_audio_timeout_s, script_first_audio_timeout)
 
+    # Multilingual voices (e.g. en-US-AndrewMultilingualNeural) are more
+    # resource-intensive on the provider side.  On very long jobs reduce the
+    # chunk ceiling by ~15 % to lower the probability of no-audio failures.
+    if multilingual_voice and total_chars >= _LONG_JOB_THRESHOLD:
+        shrink = 0.78 if total_chars >= _XL_JOB_THRESHOLD else 0.84
+        chars = max(7_000 if total_chars >= _XL_JOB_THRESHOLD else 7_600, int(chars * shrink))
+        payload = max(2_650, int(payload * shrink))
+        ramp_chars = max(2_600, int(ramp_chars * shrink))
+        ramp_payload = max(2_050, int(ramp_payload * shrink))
+
     return _ChunkPlan(
         max_chars=chars,
         max_payload_bytes=payload,
@@ -178,12 +196,24 @@ def _chunk_plan_for(total_chars: int, script_code: str | None = None) -> _ChunkP
     )
 
 
-def _chunk_size_for(total_chars: int, script_code: str | None = None) -> int:
-    return _chunk_plan_for(total_chars, script_code).max_chars
+def _chunk_size_for(
+    total_chars: int,
+    script_code: str | None = None,
+    *,
+    multilingual_voice: bool = False,
+) -> int:
+    return _chunk_plan_for(total_chars, script_code, multilingual_voice=multilingual_voice).max_chars
 
 
-def _payload_limit_for(total_chars: int, script_code: str | None = None) -> int:
-    return _chunk_plan_for(total_chars, script_code).max_payload_bytes
+def _payload_limit_for(
+    total_chars: int,
+    script_code: str | None = None,
+    *,
+    multilingual_voice: bool = False,
+) -> int:
+    return _chunk_plan_for(
+        total_chars, script_code, multilingual_voice=multilingual_voice
+    ).max_payload_bytes
 
 
 def _edge_payload_size(text: str) -> int:
@@ -468,6 +498,20 @@ def _suggest_alternative_voice(selected_voice: str, voices: list[dict]) -> str |
     return same_language[0] if same_language else None
 
 
+def _suggest_stable_long_form_voice(selected_voice: str, voices: list[dict]) -> str | None:
+    locale = _voice_locale(selected_voice)
+    same_locale_non_multilingual = [
+        voice.get("ShortName", "")
+        for voice in voices
+        if voice.get("ShortName") != selected_voice
+        and voice.get("Locale") == locale
+        and "multilingual" not in voice.get("ShortName", "").lower()
+    ]
+    if same_locale_non_multilingual:
+        return same_locale_non_multilingual[0]
+    return _suggest_alternative_voice(selected_voice, voices)
+
+
 @dataclass
 class _ProgressState:
     processed_chars: int
@@ -496,6 +540,15 @@ class _ChunkOutcome:
     first_audio_delay: float | None = None
     receive_duration: float | None = None
     write_duration: float | None = None
+    failure_kinds: tuple[str, ...] = ()
+
+
+@dataclass
+class _RollingHealthState:
+    no_audio_events: int = 0
+    timeout_events: int = 0
+    network_events: int = 0
+    conservative_chunks_remaining: int = 0
 
 
 @dataclass(frozen=True)
@@ -552,6 +605,9 @@ class _ChunkError(RuntimeError):
         self.chunk = chunk
         self.total = total
         self.cause = cause
+        # Set by _stream_generate after catching, before re-raising:
+        self.preserved_chunks: int = 0
+        self.staging_dir: Path | None = None
 
 
 class TTSWorker(QThread):
@@ -566,11 +622,14 @@ class TTSWorker(QThread):
 
     progress = Signal(int)
     status_changed = Signal(str)
-    stage_changed = Signal(str, str)   # kind="local"|"remote"|"waiting"
-    speed_updated = Signal(float)      # chars/s
+    stage_changed = Signal(str, str)    # kind="local"|"remote"|"waiting"
+    speed_updated = Signal(float)       # chars/s
     telemetry_updated = Signal(object)  # JobTelemetry
     completed = Signal(str, float)
     failed = Signal(str)
+    # Emitted before `failed` when the job failed after partial success.
+    # Payload: (staging_dir_str, completed_count, failed_chunk, total_chunks)
+    job_resumable = Signal(str, int, int, int)
 
     def __init__(
         self,
@@ -581,6 +640,8 @@ class TTSWorker(QThread):
         output_path: str,
         *,
         allow_voice_mismatch: bool = False,
+        job_id: str | None = None,
+        resume_staging_dir: Path | None = None,
     ) -> None:
         super().__init__()
         self._text = text
@@ -589,12 +650,15 @@ class TTSWorker(QThread):
         self._volume = volume
         self._output_path = output_path
         self._allow_voice_mismatch = allow_voice_mismatch
+        self._job_id: str = job_id or uuid.uuid4().hex
+        self._resume_staging_dir: Path | None = resume_staging_dir
         self._cancelled = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task | None = None
         self._last_pct = 0
         self._text_profile = build_text_profile(text)
         self._compatibility: VoiceCompatibilityAssessment | None = None
+        self._health = _RollingHealthState()
 
     def cancel(self) -> None:
         """Cancel mid-stream. Interrupts the async Task cleanly."""
@@ -650,7 +714,7 @@ class TTSWorker(QThread):
         self._async_task = asyncio.current_task()
         await self._stream_generate()
 
-    async def _stream_generate(self) -> None:
+    async def _stream_generate(self) -> None:  # noqa: C901 – inherently complex
         if self._cancelled:
             raise asyncio.CancelledError()
 
@@ -669,7 +733,12 @@ class TTSWorker(QThread):
             )
 
         total_chars = max(len(stripped_text), 1)
-        chunk_plan = _chunk_plan_for(total_chars, self._text_profile.script_code)
+        is_multilingual = "Multilingual" in self._voice
+        chunk_plan = _chunk_plan_for(
+            total_chars,
+            self._text_profile.script_code,
+            multilingual_voice=is_multilingual,
+        )
         max_chunk_chars = chunk_plan.max_chars
         max_payload_bytes = chunk_plan.max_payload_bytes
 
@@ -716,34 +785,138 @@ class TTSWorker(QThread):
                 self._compatibility.short_message,
             )
 
-        chunk_cursor = _ChunkCursor(stripped_text)
-        if not chunk_cursor.has_more():
-            raise ValueError("No text was available to generate.")
+        # Warn if a multilingual voice is selected for a long English-only job —
+        # multilingual models are more resource-intensive and tend to produce
+        # intermittent no-audio failures on very long runs.
+        if (
+            is_multilingual
+            and total_chars >= _LONG_JOB_THRESHOLD
+            and self._text_profile.script_code in {None, "latin", ""}
+        ):
+            alt = _suggest_stable_long_form_voice(self._voice, voices)
+            alt_hint = f"  Suggested alternative: {alt}." if alt else ""
+            self.stage_changed.emit(
+                "local",
+                f"Note: '{self._voice}' is a multilingual model and may be less stable "
+                f"for long English audiobook jobs (chunk ceiling reduced to {max_chunk_chars:,} chars).{alt_hint}",
+            )
+            logger.info(
+                "Multilingual voice warning: voice=%s total_chars=%d alt=%s",
+                self._voice,
+                total_chars,
+                alt,
+            )
 
         if total_chars >= chunk_plan.preflight_threshold:
             await self._run_preflight(voices)
 
+        # ── Set up chunk staging (checkpoint / resume) ─────────────────── #
+        staging_root = AppPaths().staging_dir
+        # Clean up orphaned staging dirs from previous sessions in the background.
+        try:
+            cleanup_stale_staging(staging_root, max_age_days=7)
+        except Exception:
+            pass
+
+        chunk_store: ChunkStore
+        if self._resume_staging_dir is not None:
+            resumed = ChunkStore.try_resume(self._resume_staging_dir, stripped_text, self._voice)
+            if resumed is not None:
+                chunk_store = resumed
+                logger.info(
+                    "Resuming job %s — %d chunks already completed (%d chars consumed)",
+                    self._job_id,
+                    chunk_store.completed_count,
+                    chunk_store.manifest.chars_consumed,
+                )
+            else:
+                logger.warning(
+                    "Could not resume from %s (mismatch or no valid data) — starting fresh",
+                    self._resume_staging_dir,
+                )
+                chunk_store = ChunkStore.create(
+                    staging_root,
+                    self._job_id,
+                    voice=self._voice,
+                    rate=self._rate,
+                    volume=self._volume,
+                    output_path=self._output_path,
+                    text=stripped_text,
+                )
+        else:
+            chunk_store = ChunkStore.create(
+                staging_root,
+                self._job_id,
+                voice=self._voice,
+                rate=self._rate,
+                volume=self._volume,
+                output_path=self._output_path,
+                text=stripped_text,
+            )
+
+        # ── Initialise cursor, possibly from a resume point ─────────────── #
+        resume_chars = chunk_store.manifest.chars_consumed
+        resume_chunk_idx = chunk_store.resume_from_chunk
+
+        job_start = time.monotonic()
+        progress_state = _ProgressState(
+            processed_chars=resume_chars,
+            spd_chars=resume_chars,
+            spd_time=job_start,
+            spd_ema=0.0,
+            chars_at_last_stage_emit=resume_chars,
+            time_at_last_stage_emit=job_start,
+        )
+
+        # For a fresh run start at warmup size; for a resume start at target
+        # size since the voice is already warmed up.
+        if resume_chunk_idx > 0:
+            adaptive_char_limit = max_chunk_chars
+            adaptive_payload_limit = max_payload_bytes
+        else:
+            adaptive_char_limit = chunk_plan.warmup_chars
+            adaptive_payload_limit = chunk_plan.warmup_payload_bytes
+
+        # Start the text cursor at the already-consumed position.
+        chunk_cursor = _ChunkCursor(stripped_text[resume_chars:] if resume_chars > 0 else stripped_text)
+
+        if not chunk_cursor.has_more() and resume_chunk_idx == 0:
+            raise ValueError("No text was available to generate.")
+
         logger.info(
-            "Starting: voice=%s rate=%s chars=%d chunk_ceiling=%d payload_limit=%d output=%s",
+            "Starting: voice=%s rate=%s chars=%d chunk_ceiling=%d payload_limit=%d "
+            "resume_chunk=%d resume_chars=%d output=%s",
             self._voice,
             self._rate,
             len(stripped_text),
             max_chunk_chars,
             max_payload_bytes,
+            resume_chunk_idx,
+            resume_chars,
             self._output_path,
         )
 
-        estimated_chunks = self._estimate_remaining_chunks(
-            total_chars,
-            0,
-            chunk_plan.ramp_chars,
-        )
-        if estimated_chunks > 1:
+        if resume_chunk_idx > 0:
             self.stage_changed.emit(
                 "local",
-                "Preparing adaptive chunk pipeline "
-                f"(warm-up {chunk_plan.warmup_chars:,} chars, healthy ceiling {max_chunk_chars:,} chars)",
+                f"Resuming from chunk {resume_chunk_idx + 1} — "
+                f"{chunk_store.completed_count} chunk(s) already completed, "
+                f"{resume_chars:,} chars already processed",
             )
+            self._emit_progress_from_chars(resume_chars, total_chars)
+        else:
+            estimated_chunks = self._estimate_remaining_chunks(
+                total_chars,
+                0,
+                chunk_plan.ramp_chars,
+            )
+            if estimated_chunks > 1:
+                self.stage_changed.emit(
+                    "local",
+                    "Preparing adaptive chunk pipeline "
+                    f"(warm-up {chunk_plan.warmup_chars:,} chars, "
+                    f"healthy ceiling {max_chunk_chars:,} chars)",
+                )
 
         self.status_changed.emit("Connecting…")
         self.stage_changed.emit(
@@ -754,80 +927,154 @@ class TTSWorker(QThread):
         output_path = Path(self._output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        job_start = time.monotonic()
-        progress_state = _ProgressState(
-            processed_chars=0,
-            spd_chars=0,
-            spd_time=job_start,
-            spd_ema=0.0,
-            chars_at_last_stage_emit=0,
-            time_at_last_stage_emit=job_start,
-        )
-        adaptive_char_limit = chunk_plan.warmup_chars
-        adaptive_payload_limit = chunk_plan.warmup_payload_bytes
+        chunk_idx = resume_chunk_idx
 
         try:
-            with open(output_path, "wb") as audio_file:
-                chunk_idx = 0
-                while chunk_cursor.has_more():
-                    if self._cancelled:
-                        raise asyncio.CancelledError()
+            while chunk_cursor.has_more():
+                if self._cancelled:
+                    raise asyncio.CancelledError()
 
-                    text_chunk, chunk_payload = chunk_cursor.take_next(
-                        adaptive_char_limit,
-                        adaptive_payload_limit,
-                    )
-                    if not text_chunk:
-                        break
+                text_chunk, chunk_payload = chunk_cursor.take_next(
+                    adaptive_char_limit,
+                    adaptive_payload_limit,
+                )
+                if not text_chunk:
+                    break
 
-                    estimated_total = self._estimate_remaining_chunks(
-                        total_chars,
-                        progress_state.processed_chars,
-                        max(adaptive_char_limit, chunk_plan.ramp_chars),
-                    )
-                    if estimated_total < chunk_idx + 1:
-                        estimated_total = chunk_idx + 1
+                estimated_total = self._estimate_remaining_chunks(
+                    total_chars,
+                    progress_state.processed_chars,
+                    max(adaptive_char_limit, chunk_plan.ramp_chars),
+                )
+                if estimated_total < chunk_idx + 1:
+                    estimated_total = chunk_idx + 1
+                # Account for chunks already completed in the estimate
+                estimated_total = max(estimated_total, chunk_idx + 1)
 
-                    outcome = await self._process_chunk(
-                        audio_file=audio_file,
-                        text_chunk=text_chunk,
-                        chunk_payload=chunk_payload,
-                        chunk_idx=chunk_idx,
-                        estimated_total_chunks=estimated_total,
-                        total_chars=total_chars,
-                        progress_state=progress_state,
-                        char_limit=adaptive_char_limit,
-                        payload_limit=adaptive_payload_limit,
-                        plan=chunk_plan,
-                    )
-                    adaptive_char_limit, adaptive_payload_limit = self._retune_after_chunk(
-                        outcome,
-                        adaptive_char_limit,
-                        adaptive_payload_limit,
-                        chunk_plan,
-                        chunk_index=chunk_idx,
-                    )
-                    chunk_idx += 1
+                chunk_number = chunk_idx + 1
+                chunk_label = (
+                    f"chunk {chunk_number}/{estimated_total}"
+                    if estimated_total > 1
+                    else f"chunk {chunk_number}"
+                )
+
+                chunk_bytes, outcome = await self._process_chunk(
+                    text_chunk=text_chunk,
+                    chunk_payload=chunk_payload,
+                    chunk_idx=chunk_idx,
+                    estimated_total_chunks=estimated_total,
+                    total_chars=total_chars,
+                    progress_state=progress_state,
+                    char_limit=adaptive_char_limit,
+                    payload_limit=adaptive_payload_limit,
+                    plan=chunk_plan,
+                    display_label=chunk_label,
+                )
+
+                # ── Write chunk to staging ──────────────────────────────── #
+                write_started_at = time.monotonic()
+                self.stage_changed.emit("local", f"Writing {chunk_label} to disk")
+                chunk_store.save_chunk(chunk_idx, chunk_bytes)
+                chunk_store.update_chars_consumed(progress_state.processed_chars)
+                write_duration = time.monotonic() - write_started_at
+
+                self._emit_saved_stage(
+                    chunk_label,
+                    outcome.elapsed,
+                    progress_state,
+                    first_audio_delay=outcome.first_audio_delay,
+                    receive_duration=outcome.receive_duration,
+                    write_duration=write_duration,
+                )
+                self._emit_telemetry(
+                    current_chunk=chunk_number,
+                    estimated_total_chunks=estimated_total,
+                    chunk_chars=len(text_chunk),
+                    char_limit=adaptive_char_limit,
+                    payload_limit=adaptive_payload_limit,
+                    progress_state=progress_state,
+                    total_chars=total_chars,
+                    phase="local",
+                    detail="Chunk saved locally",
+                    first_audio_delay=outcome.first_audio_delay,
+                    receive_duration=outcome.receive_duration,
+                    write_duration=write_duration,
+                )
+
+                adaptive_char_limit, adaptive_payload_limit = self._retune_after_chunk(
+                    outcome,
+                    adaptive_char_limit,
+                    adaptive_payload_limit,
+                    chunk_plan,
+                    chunk_index=chunk_idx,
+                )
+                chunk_idx += 1
 
         except asyncio.CancelledError:
-            logger.info("Stream cancelled — removing partial file")
-            try:
-                output_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            logger.info(
+                "Stream cancelled at chunk %d — preserving staged progress for job %s when available",
+                chunk_idx + 1,
+                self._job_id,
+            )
+            if chunk_store.completed_count > 0:
+                chunk_store.mark_cancelled(
+                    preserve_progress=True,
+                    failed_at_chunk=chunk_idx + 1,
+                    total=chunk_idx + self._estimate_remaining_chunks(
+                        total_chars,
+                        progress_state.processed_chars,
+                        max(adaptive_char_limit, 1),
+                    ),
+                )
+            else:
+                chunk_store.mark_cancelled(preserve_progress=False)
+                chunk_store.cleanup()
+            raise
+
+        except _ChunkError as exc:
+            # Preserve completed chunk files and mark job as resumable.
+            preserved = chunk_store.completed_count
+            if preserved > 0:
+                chunk_store.mark_failed(exc.chunk, exc.total)
+                exc.preserved_chunks = preserved
+                exc.staging_dir = chunk_store.staging_dir
+                self.job_resumable.emit(
+                    str(chunk_store.staging_dir),
+                    preserved,
+                    exc.chunk,
+                    exc.total or 0,
+                )
+            else:
+                chunk_store.mark_failed(exc.chunk, exc.total)
+                chunk_store.cleanup()
             raise
 
         if self._cancelled:
-            try:
-                output_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            if chunk_store.completed_count > 0:
+                chunk_store.mark_cancelled(
+                    preserve_progress=True,
+                    failed_at_chunk=chunk_idx + 1,
+                    total=chunk_idx + self._estimate_remaining_chunks(
+                        total_chars,
+                        progress_state.processed_chars,
+                        max(adaptive_char_limit, 1),
+                    ),
+                )
+            else:
+                chunk_store.mark_cancelled(preserve_progress=False)
+                chunk_store.cleanup()
             raise asyncio.CancelledError()
+
+        # ── All chunks done: assemble final file ─────────────────────────── #
+        self.stage_changed.emit("local", "Assembling final audio file from all chunks…")
+        chunk_store.finalize(output_path)
 
         size = output_path.stat().st_size
         total_elapsed = time.monotonic() - job_start
         if size <= 0:
             raise RuntimeError("The speech service completed without writing any audio.")
+
+        chunk_store.cleanup()
 
         logger.info(
             "File written: %s size=%d bytes chunks=%d total=%.2fs",
@@ -884,7 +1131,7 @@ class TTSWorker(QThread):
         suggestion = (
             self._compatibility.recommended_voice
             if self._compatibility and self._compatibility.recommended_voice
-            else _suggest_alternative_voice(self._voice, voices)
+            else _suggest_stable_long_form_voice(self._voice, voices)
         )
         if last_failure.kind in {"no_audio", "metadata_without_audio"}:
             refreshed = await list_voices(force_refresh=True)
@@ -899,7 +1146,7 @@ class TTSWorker(QThread):
                 suggestion = (
                     self._compatibility.recommended_voice
                     if self._compatibility and self._compatibility.recommended_voice
-                    else _suggest_alternative_voice(self._voice, refreshed)
+                    else _suggest_stable_long_form_voice(self._voice, refreshed)
                 )
 
         raise _PreflightError(self._voice, last_failure, suggestion=suggestion)
@@ -915,7 +1162,6 @@ class TTSWorker(QThread):
     async def _process_chunk(
         self,
         *,
-        audio_file,
         text_chunk: str,
         chunk_payload: int,
         chunk_idx: int,
@@ -927,7 +1173,7 @@ class TTSWorker(QThread):
         plan: _ChunkPlan,
         depth: int = 0,
         display_label: str | None = None,
-    ) -> _ChunkOutcome:
+    ) -> tuple[bytes, _ChunkOutcome]:
         chunk_number = chunk_idx + 1
         chunk_label = display_label or (
             f"chunk {chunk_number}/{estimated_total_chunks}"
@@ -962,6 +1208,7 @@ class TTSWorker(QThread):
 
         last_failure: _AttemptFailure | None = None
         chunk_start = time.monotonic()
+        failure_kinds: set[str] = set()
 
         for attempt in range(_MAX_ATTEMPTS):
             if self._cancelled:
@@ -995,11 +1242,6 @@ class TTSWorker(QThread):
                     first_audio_timeout_s=plan.first_audio_timeout_s,
                 )
 
-                write_started_at = time.monotonic()
-                self.stage_changed.emit("local", f"Writing {chunk_label} to disk")
-                audio_file.write(audio_bytes)
-                write_duration = time.monotonic() - write_started_at
-
                 progress_state.processed_chars = min(
                     progress_state.processed_chars + attempt_chars,
                     total_chars,
@@ -1018,45 +1260,23 @@ class TTSWorker(QThread):
                     if stats.first_audio_at is not None and stats.last_event_at is not None
                     else None
                 )
-                self._emit_saved_stage(
-                    chunk_label,
-                    chunk_elapsed,
-                    progress_state,
-                    first_audio_delay=first_audio_delay,
-                    receive_duration=receive_duration,
-                    write_duration=write_duration,
-                )
-                self._emit_telemetry(
-                    current_chunk=chunk_number,
-                    estimated_total_chunks=estimated_total_chunks,
-                    chunk_chars=len(text_chunk),
-                    char_limit=char_limit,
-                    payload_limit=payload_limit,
-                    progress_state=progress_state,
-                    total_chars=total_chars,
-                    phase="local",
-                    detail="Chunk saved locally",
-                    first_audio_delay=first_audio_delay,
-                    receive_duration=receive_duration,
-                    write_duration=write_duration,
-                )
                 logger.info(
-                    "%s succeeded (attempt %d) in %.2fs bytes=%d first_audio=%s receive=%s write=%.3fs",
+                    "%s succeeded (attempt %d) in %.2fs bytes=%d first_audio=%s receive=%s",
                     chunk_label,
                     attempt + 1,
                     chunk_elapsed,
                     len(audio_bytes),
                     f"{first_audio_delay:.2f}s" if first_audio_delay is not None else "n/a",
                     f"{receive_duration:.2f}s" if receive_duration is not None else "n/a",
-                    write_duration,
                 )
-                return _ChunkOutcome(
+                return audio_bytes, _ChunkOutcome(
                     attempts=attempt + 1,
                     elapsed=chunk_elapsed,
                     used_recovery=depth > 0,
                     first_audio_delay=first_audio_delay,
                     receive_duration=receive_duration,
-                    write_duration=write_duration,
+                    write_duration=None,
+                    failure_kinds=tuple(sorted(failure_kinds)),
                 )
 
             except asyncio.CancelledError:
@@ -1064,6 +1284,8 @@ class TTSWorker(QThread):
 
             except _AttemptFailure as exc:
                 last_failure = exc
+                failure_kinds.add(exc.kind)
+                self._record_failure_pattern(exc, chunk_label)
                 logger.warning("%s failed on attempt %d: %s", chunk_label, attempt + 1, exc)
                 if exc.kind in {"no_audio", "metadata_without_audio"} and attempt + 1 >= _NO_AUDIO_MAX_ATTEMPTS:
                     logger.warning(
@@ -1094,9 +1316,12 @@ class TTSWorker(QThread):
                 )
                 next_char_limit = max(_MIN_RECOVERY_CHARS, char_limit // 2)
                 next_payload_limit = max(_MIN_RECOVERY_PAYLOAD_BYTES, payload_limit // 2)
+                recovered_audio = bytearray()
+                recovered_failure_kinds = set(failure_kinds)
+                first_audio_delays: list[float] = []
+                receive_durations: list[float] = []
                 for sub_idx, subchunk in enumerate(recovery_chunks, start=1):
-                    await self._process_chunk(
-                        audio_file=audio_file,
+                    sub_audio, sub_outcome = await self._process_chunk(
                         text_chunk=subchunk,
                         chunk_payload=_edge_payload_size(subchunk),
                         chunk_idx=chunk_idx,
@@ -1109,14 +1334,21 @@ class TTSWorker(QThread):
                         depth=depth + 1,
                         display_label=f"{chunk_label} · recovery {sub_idx}/{len(recovery_chunks)}",
                     )
+                    recovered_audio.extend(sub_audio)
+                    recovered_failure_kinds.update(sub_outcome.failure_kinds)
+                    if sub_outcome.first_audio_delay is not None:
+                        first_audio_delays.append(sub_outcome.first_audio_delay)
+                    if sub_outcome.receive_duration is not None:
+                        receive_durations.append(sub_outcome.receive_duration)
                 chunk_elapsed = time.monotonic() - chunk_start
-                return _ChunkOutcome(
+                return bytes(recovered_audio), _ChunkOutcome(
                     attempts=_MAX_ATTEMPTS,
                     elapsed=chunk_elapsed,
                     used_recovery=True,
-                    first_audio_delay=None,
-                    receive_duration=None,
+                    first_audio_delay=min(first_audio_delays) if first_audio_delays else None,
+                    receive_duration=sum(receive_durations) if receive_durations else None,
                     write_duration=None,
+                    failure_kinds=tuple(sorted(recovered_failure_kinds)),
                 )
 
             if (
@@ -1126,6 +1358,18 @@ class TTSWorker(QThread):
                 and last_failure.suggestion is None
             ):
                 last_failure.suggestion = self._compatibility.recommended_voice
+            elif (
+                last_failure.kind in {"no_audio", "metadata_without_audio", "timeout_waiting_for_audio"}
+                and "multilingual" in self._voice.lower()
+                and last_failure.suggestion is None
+            ):
+                try:
+                    voices = await list_voices()
+                except Exception:
+                    voices = []
+                stable_voice = _suggest_stable_long_form_voice(self._voice, voices)
+                if stable_voice:
+                    last_failure.suggestion = stable_voice
 
         raise _ChunkError(
             chunk_number,
@@ -1298,6 +1542,12 @@ class TTSWorker(QThread):
     ) -> tuple[int, int]:
         next_chars = current_char_limit
         next_payload = current_payload_limit
+        conservative_mode = self._health.conservative_chunks_remaining > 0
+        conservative_chars = max(_MIN_RECOVERY_CHARS, int(plan.max_chars * 0.74))
+        conservative_payload = max(
+            _MIN_RECOVERY_PAYLOAD_BYTES,
+            int(plan.max_payload_bytes * 0.74),
+        )
 
         slow_chunk = (
             outcome.elapsed > 32.0
@@ -1319,6 +1569,9 @@ class TTSWorker(QThread):
         else:
             target_chars = plan.ramp_chars if chunk_index == 0 else plan.max_chars
             target_payload = plan.ramp_payload_bytes if chunk_index == 0 else plan.max_payload_bytes
+            if conservative_mode:
+                target_chars = min(target_chars, conservative_chars)
+                target_payload = min(target_payload, conservative_payload)
             growth_factor = 1.0 if chunk_index == 0 else _HEALTHY_GROWTH_FACTOR
             next_chars = min(
                 target_chars,
@@ -1332,7 +1585,44 @@ class TTSWorker(QThread):
                 next_chars = target_chars
                 next_payload = target_payload
 
+        if conservative_mode and outcome.attempts == 1 and not outcome.used_recovery:
+            self._health.conservative_chunks_remaining = max(
+                0,
+                self._health.conservative_chunks_remaining - 1,
+            )
+
         return next_chars, next_payload
+
+    def _record_failure_pattern(
+        self,
+        failure: _AttemptFailure,
+        chunk_label: str,
+    ) -> None:
+        if failure.kind in {"no_audio", "metadata_without_audio"}:
+            self._health.no_audio_events += 1
+            new_window = max(self._health.conservative_chunks_remaining, 4)
+            if new_window > self._health.conservative_chunks_remaining:
+                self.stage_changed.emit(
+                    "waiting",
+                    f"Repeated no-audio responses detected on {chunk_label} — using safer smaller chunks for the rest of the run",
+                )
+            self._health.conservative_chunks_remaining = new_window
+            return
+
+        if failure.kind.startswith("timeout"):
+            self._health.timeout_events += 1
+            if self._health.timeout_events >= 2:
+                new_window = max(self._health.conservative_chunks_remaining, 3)
+                if new_window > self._health.conservative_chunks_remaining:
+                    self.stage_changed.emit(
+                        "waiting",
+                        f"Repeated speech timeouts detected on {chunk_label} — reducing chunk sizes earlier",
+                    )
+                self._health.conservative_chunks_remaining = new_window
+            return
+
+        if failure.kind == "network":
+            self._health.network_events += 1
 
     @staticmethod
     def _retry_status_text(failure: _AttemptFailure | None, attempt: int) -> str:
@@ -1624,44 +1914,54 @@ class TTSWorker(QThread):
                 f"\nRecommended voice: {cause.suggestion}"
                 if cause.suggestion else ""
             )
+            preserved_note = ""
+            if exc.preserved_chunks > 0:
+                preserved_note = (
+                    f"\n\nCompleted audio up to chunk {exc.preserved_chunks} has been preserved.\n"
+                    "You can retry/resume from the failed section."
+                )
 
             if cause.kind == "invalid_voice":
                 return (
                     f"The selected voice became unavailable while generating {chunk_ctx}.\n\n"
                     "Reload the voice list and choose another voice before trying again."
-                    f"{suggestion}"
+                    f"{suggestion}{preserved_note}"
                 )
             if cause.kind == "dns":
                 return (
                     f"Could not resolve speech.platform.bing.com while generating {chunk_ctx}.\n\n"
                     "Please check your internet connection or DNS settings and try again."
+                    f"{preserved_note}"
                 )
             if cause.kind.startswith("timeout"):
                 return (
                     f"The speech request timed out repeatedly on {chunk_ctx}.\n\n"
                     "The speech service was too slow or stalled before that chunk finished.\n"
                     "Try again — transient slowdowns usually recover."
+                    f"{preserved_note}"
                 )
             if cause.kind in {"no_audio", "metadata_without_audio"}:
                 return (
                     f"{chunk_ctx.capitalize()} failed after multiple attempts; the app could not recover automatically.\n\n"
                     "The speech service returned no audio for that section.\n"
                     "SetupTTS retried with fresh connections and smaller recovery chunks, but the selected voice/provider still returned no audio."
-                    f"{suggestion}"
+                    f"{suggestion}{preserved_note}"
                 )
             if cause.kind == "network":
                 return (
                     f"The network/service connection was unstable during {chunk_ctx}.\n\n"
                     "Please try again. If the problem continues, wait a minute and retry."
+                    f"{preserved_note}"
                 )
             if cause.kind == "service_response":
                 return (
                     f"The speech service returned an unexpected response on {chunk_ctx}.\n\n"
                     "Try again. If the problem keeps happening, choose another voice."
+                    f"{preserved_note}"
                 )
             return (
                 f"Generation failed on {chunk_ctx} after recovery attempts.\n\n"
-                f"Details: {cause}"
+                f"Details: {cause}{preserved_note}"
             )
 
         msg = str(exc).lower()

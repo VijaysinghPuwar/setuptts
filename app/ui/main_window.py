@@ -118,6 +118,9 @@ class MainWindow(QMainWindow):
     def get_input_text(self) -> str:
         return self._input_panel.get_text()
 
+    def set_input_text(self, text: str) -> None:
+        self._input_panel.set_text(text)
+
     # ------------------------------------------------------------------ #
     # Menu                                                                 #
     # ------------------------------------------------------------------ #
@@ -375,4 +378,3 @@ class MainWindow(QMainWindow):
         logger.info("Settings saved — accepting close event")
 
         event.accept()
-
