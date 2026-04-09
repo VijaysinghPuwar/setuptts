@@ -68,7 +68,7 @@ chmod +x build_macos.sh
 
 **Output:**
 - `dist/SetupTTS.app` — the app bundle
-- `releases/SetupTTS-macOS-1.5.1.zip` — local distributable zip
+- `releases/SetupTTS-macOS-1.5.2.zip` — local distributable zip
 
 > **Note:** The local script produces a versioned zip for ad-hoc sharing. The CI/CD pipeline (GitHub Actions) produces the full release artifacts: `SetupTTS-macOS.dmg` and `SetupTTS-macOS.zip`.
 
@@ -93,7 +93,7 @@ build_windows.bat
 
 **Output:**
 - `dist_portable/SetupTTS.exe` — single self-contained onefile EXE (portable)
-- `releases\SetupTTS-Windows-1.5.1.zip` — zip of that EXE
+- `releases\SetupTTS-Windows-1.5.2.zip` — zip of that EXE
 
 > **Two-build architecture:** The CI uses *two* PyInstaller specs:
 >
@@ -111,8 +111,8 @@ build_windows.bat
 Push a version tag to trigger automated builds for both platforms:
 
 ```bash
-git tag v1.5.1
-git push origin v1.5.1
+git tag v1.5.2
+git push origin v1.5.2
 ```
 
 The workflow (`.github/workflows/build.yml`) will:

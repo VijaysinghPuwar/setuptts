@@ -1,7 +1,7 @@
 name: Build Release
 
 # Triggers:
-#   - Push of a version tag:  git tag v1.5.1 && git push origin v1.5.1
+#   - Push of a version tag:  git tag v1.5.2 && git push origin v1.5.2
 #   - Manual run from GitHub Actions UI (workflow_dispatch)
 on:
   push:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version label (e.g. 1.4.1)"
+        description: "Version label (e.g. 1.5.2)"
         required: false
         default: "dev"
 
@@ -311,22 +311,20 @@ jobs:
 
             ### What's new in v${{ steps.ver.outputs.version }}
 
-            #### Speech quality guardrails
-            - **Narration-focused text cleanup** — SetupTTS now normalizes bracket-heavy system text, repeated punctuation, arrows, copied Unicode noise, and other webnovel/UI fragments that used to sound bad when read literally.
-            - **Stronger language/script checks** — the app now treats significant non-Latin text more defensively, so bad pairings like English text with an Icelandic voice or Hindi text with the wrong locale are caught earlier.
-            - **Mixed-language handling** — SetupTTS now distinguishes “mostly Hindi with some Latin text” style input instead of blindly treating everything as one language.
-            - **Clearer startup failures** — when Microsoft returns no audio during preflight, the app now explains that the voice/text combination may be incompatible and points the user to a recommended voice.
+            #### Resumable long-form generation
+            - **True chunk checkpointing** — every completed logical chunk is now staged on disk with a persisted manifest and source text snapshot while the job is running.
+            - **Resume after failure or restart** — if a long audiobook job dies on chunk 18, SetupTTS now preserves chunks 1–17 and can continue from the failed section instead of starting from zero.
+            - **Safe final assembly** — the final MP3 is only assembled after all staged chunks are present, so partial failures never poison the destination output file.
 
-            #### Throughput and observability improvements
-            - **Adaptive chunk growth** — long jobs now start with a safe warm-up chunk, ramp up after a healthy first response, and only back off when latency or retries show the service is struggling.
-            - **Fewer round trips on healthy runs** — large Latin-script jobs can now use materially larger steady chunks instead of staying pinned to the old conservative limits.
-            - **Earlier stall recovery** — chunks that keep timing out before first audio now split down sooner instead of wasting repeated long retries in the same failing shape.
-            - **Per-chunk timing telemetry** — active jobs now surface chunk number, chunk size, ETA, rolling chars/s, and clearer LOCAL / REMOTE / WAIT timing context so users can see whether the bottleneck is Microsoft latency or local file writing.
-            - **Fresh session per retry** — each retry still starts from a clean `edge_tts` communication object instead of reusing any stale websocket state.
+            #### Stronger recovery for repeated no-audio failures
+            - **No-audio and timeout failures are classified separately** — SetupTTS now distinguishes repeated provider no-audio responses from slow timeout paths and adapts recovery accordingly.
+            - **Earlier progressive fallback** — doomed full-size retries stop sooner; the worker falls back to smaller recovery chunks and then preserves progress if the provider still will not return audio.
+            - **Clearer preserved-progress errors** — failure dialogs now explain that completed audio was preserved and that the job can be resumed from the failed chunk.
 
-            #### Better failure reporting and queue safety
-            - **Accurate error categories** — DNS resolution failures, repeated timeouts, missing voices, provider no-audio responses, and unstable network/service connections now produce distinct user-facing errors.
-            - **Duplicate output-path protection at the queue layer** — duplicate Generate submissions targeting the same output file are blocked even if the UI is hit twice unexpectedly.
+            #### Long English job reliability safeguards
+            - **Long-job preflight still runs before the full export** — SetupTTS confirms that Microsoft actually returns audio before it commits to a large run.
+            - **Multilingual voice caution for English narration** — long English jobs using voices like `en-US-AndrewMultilingualNeural` now get a stability warning plus a same-locale non-multilingual recommendation when available.
+            - **Rolling health backoff** — repeated no-audio/timeout patterns force upcoming chunks into a safer smaller-size mode earlier in the job instead of waiting for a catastrophic failure.
 
             ---
 

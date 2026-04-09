@@ -45,6 +45,7 @@ class JobItem:
     volume:        str
     output_path:   str
     allow_voice_mismatch: bool = False
+    resume_staging_dir: str = ""
 
     # Derived / mutable
     id:          str   = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -55,6 +56,10 @@ class JobItem:
     error:       str   = ""
     duration:    float = 0.0
     worker:      object = field(default=None, repr=False)
+    resumable:   bool = False
+    preserved_chunks: int = 0
+    failed_chunk: int = 0
+    failed_total: int = 0
 
     def __post_init__(self) -> None:
         if not self.filename:
@@ -94,6 +99,7 @@ class JobQueue(QObject):
     job_stage_changed  = Signal(str, str, str)  # job_id, kind, text
     job_speed_updated  = Signal(str, float)   # job_id, chars/s
     job_telemetry_updated = Signal(str, object)  # job_id, JobTelemetry
+    job_resumable      = Signal(object)       # JobItem
     job_completed      = Signal(object)       # JobItem
     job_failed         = Signal(object)       # JobItem
     job_cancelled      = Signal(object)       # JobItem
@@ -124,6 +130,9 @@ class JobQueue(QObject):
         volume:        str,
         output_path:   str,
         allow_voice_mismatch: bool = False,
+        *,
+        job_id: str | None = None,
+        resume_staging_dir: str | None = None,
     ) -> str:
         """
         Add a job to the queue.  Returns the new job's ID.
@@ -138,6 +147,8 @@ class JobQueue(QObject):
             text=text, voice=voice, voice_display=voice_display,
             rate=rate, volume=volume, output_path=output_path,
             allow_voice_mismatch=allow_voice_mismatch,
+            id=job_id or uuid.uuid4().hex[:8],
+            resume_staging_dir=resume_staging_dir or "",
         )
         logger.info(
             "Job queued: id=%s voice=%s output=%s",
@@ -260,6 +271,8 @@ class JobQueue(QObject):
             rate=item.rate, volume=item.volume,
             output_path=item.output_path,
             allow_voice_mismatch=item.allow_voice_mismatch,
+            job_id=item.id,
+            resume_staging_dir=Path(item.resume_staging_dir) if item.resume_staging_dir else None,
         )
 
         jid = item.id
@@ -280,6 +293,11 @@ class JobQueue(QObject):
         )
         worker.completed.connect(
             lambda p, d, j=jid: self._on_worker_completed(j, p, d)
+        )
+        worker.job_resumable.connect(
+            lambda staging, completed, failed_chunk, failed_total, j=jid: self._on_worker_resumable(
+                j, staging, completed, failed_chunk, failed_total
+            )
         )
         worker.failed.connect(
             lambda e, j=jid: self._on_worker_failed(j, e)
@@ -357,6 +375,24 @@ class JobQueue(QObject):
         )
         self.job_completed.emit(item)
         self._try_start()
+
+    def _on_worker_resumable(
+        self,
+        job_id: str,
+        staging_dir: str,
+        completed_count: int,
+        failed_chunk: int,
+        failed_total: int,
+    ) -> None:
+        if job_id not in self._running:
+            return
+        item, _ = self._running[job_id]
+        item.resumable = True
+        item.resume_staging_dir = staging_dir
+        item.preserved_chunks = completed_count
+        item.failed_chunk = failed_chunk
+        item.failed_total = failed_total
+        self.job_resumable.emit(item)
 
     def _on_worker_failed(self, job_id: str, error: str) -> None:
         if job_id not in self._running:
