@@ -1351,6 +1351,35 @@ class TTSWorker(QThread):
                     failure_kinds=tuple(sorted(recovered_failure_kinds)),
                 )
 
+            # ── Can't split further AND already in recovery mode ─────────── #
+            # This sub-chunk is too small (or at max recovery depth) to divide
+            # again.  Keeping no-audio / metadata-only failures from a tiny
+            # fragment from aborting the whole job: skip the section and let
+            # the surrounding recovery loop continue.  A few missing chars
+            # in the output is far better than losing all progress.
+            if depth > 0 and last_failure.kind in {"no_audio", "metadata_without_audio"}:
+                chunk_elapsed = time.monotonic() - chunk_start
+                logger.warning(
+                    "%s is too small to split further and returned no audio — "
+                    "skipping this section (~%d chars will be absent from output)",
+                    chunk_label,
+                    len(text_chunk),
+                )
+                self.stage_changed.emit(
+                    "local",
+                    f"{chunk_label} could not be recovered and is too small to split "
+                    f"further — skipping {len(text_chunk):,} chars to preserve the rest of the job",
+                )
+                return b"", _ChunkOutcome(
+                    attempts=_MAX_ATTEMPTS,
+                    elapsed=chunk_elapsed,
+                    used_recovery=True,
+                    first_audio_delay=None,
+                    receive_duration=None,
+                    write_duration=None,
+                    failure_kinds=tuple(sorted(failure_kinds)),
+                )
+
             if (
                 last_failure.kind in {"no_audio", "metadata_without_audio", "timeout_waiting_for_audio"}
                 and self._compatibility
