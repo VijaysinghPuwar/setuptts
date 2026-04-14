@@ -132,6 +132,13 @@ class OutputPanel(QWidget):
         self._queue    = JobQueue(parent=self)
         self._job_rows: dict[str, "_JobRowWidget"] = {}
 
+        # Failure dialog queue — prevents stacking multiple error dialogs when
+        # two concurrent jobs fail near-simultaneously (exec() re-enters the
+        # event loop, which can fire a second _on_job_failed before the first
+        # dialog is dismissed).
+        self._failure_dialog_queue: list = []   # list[JobItem]
+        self._failure_dialog_active = False
+
         # Debounce voice-filter rebuilds so rapid search typing doesn't
         # hammer the combo (400+ addItem() calls per keystroke).
         self._filter_timer = QTimer(self)
@@ -1188,6 +1195,18 @@ class OutputPanel(QWidget):
     def _on_job_failed(self, item: JobItem) -> None:
         self._remove_job_row(item.id)
         self._refresh_resume_jobs()
+        self._failure_dialog_queue.append(item)
+        if not self._failure_dialog_active:
+            self._show_next_failure_dialog()
+
+    def _show_next_failure_dialog(self) -> None:
+        if not self._failure_dialog_queue:
+            self._failure_dialog_active = False
+            return
+
+        self._failure_dialog_active = True
+        item = self._failure_dialog_queue.pop(0)
+
         prompt = QMessageBox(self)
         prompt.setIcon(QMessageBox.Icon.Critical)
         prompt.setWindowTitle("Generation Failed")
@@ -1212,6 +1231,9 @@ class OutputPanel(QWidget):
             )
             if candidate is not None:
                 self._resume_candidate(candidate)
+                # Show next failure dialog (if any) after a brief delay so the
+                # resume job can start before the next error dialog interrupts.
+                QTimer.singleShot(400, self._show_next_failure_dialog)
                 return
 
         if item.resumable and item.preserved_chunks > 0:
@@ -1220,6 +1242,9 @@ class OutputPanel(QWidget):
             )
         else:
             self.status_message.emit(f"Generation failed: {item.filename}")
+
+        # Show the next queued failure dialog, if any.
+        self._show_next_failure_dialog()
 
     def _on_job_cancelled(self, item: JobItem) -> None:
         self._remove_job_row(item.id)
