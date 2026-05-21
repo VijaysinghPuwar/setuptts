@@ -1,5 +1,7 @@
 import asyncio
 import json
+import random
+import string
 
 import pytest
 from edge_tts import exceptions as edge_exceptions
@@ -383,6 +385,78 @@ def test_irrecoverable_subchunk_fails_closed_instead_of_skipping(tmp_path, monke
     assert excinfo.value.staging_dir is not None
     # At least one earlier chunk should still be staged for resume.
     assert excinfo.value.preserved_chunks >= 1
+
+
+def test_recovery_subdivision_ranges_exactly_cover_parent():
+    random.seed(42)
+
+    for _ in range(200):
+        parts = []
+        for _ in range(random.randint(20, 80)):
+            token = "".join(
+                random.choice(string.ascii_lowercase)
+                for _ in range(random.randint(1, 15))
+            )
+            parts.append(token + random.choice([" ", "  ", "\n", "\n\n", ". ", "? ", ""]))
+
+        text = tts_worker.build_text_profile("".join(parts)).cleaned_text.strip()
+        cursor = tts_worker._ChunkCursor(text)
+        while cursor.has_more():
+            _chunk, _payload, start, end = cursor.take_next(
+                random.randint(60, 160),
+                random.randint(180, 540),
+            )
+            sub_chunks = tts_worker._subdivide_range_for_recovery(
+                text,
+                start,
+                end,
+                random.randint(20, 80),
+                random.randint(80, 260),
+            )
+            if len(sub_chunks) <= 1:
+                continue
+
+            ranges = [(sub_start, sub_end) for _text, sub_start, sub_end, _payload in sub_chunks]
+            assert ranges[0][0] == start
+            assert ranges[-1][1] == end
+            assert all(ranges[i][1] == ranges[i + 1][0] for i in range(len(ranges) - 1))
+
+
+def test_duration_sanity_failure_preserves_progress_without_completed_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("SETUPTTS_DATA_DIR", str(tmp_path / "appdata"))
+    monkeypatch.setattr(tts_worker, "_chunk_plan_for", _small_plan)
+    monkeypatch.setattr(tts_worker, "mp3_duration_seconds", lambda _path: 1.0)
+
+    async def fake_list_voices(*, force_refresh=False):
+        return [{"ShortName": "en-US-AvaNeural", "Locale": "en-US"}]
+
+    monkeypatch.setattr(tts_worker, "list_voices", fake_list_voices)
+    monkeypatch.setattr(
+        tts_worker,
+        "build_communicate",
+        lambda **kwargs: _FakeCommunicate(kwargs["text"], lambda _text: "success"),
+    )
+
+    text = ("alpha beta gamma delta epsilon zeta eta theta iota kappa " * 80).strip()
+    output = tmp_path / "too-short.mp3"
+    worker = tts_worker.TTSWorker(
+        text=text,
+        voice="en-US-AvaNeural",
+        rate="+0%",
+        volume="+0%",
+        output_path=str(output),
+    )
+
+    with pytest.raises(tts_worker._ChunkError) as excinfo:
+        asyncio.run(worker._stream_generate())
+
+    err = excinfo.value
+    assert err.cause.kind == "duration_truncated"
+    assert output.exists()
+    assert err.staging_dir is not None
+    manifest = json.loads((err.staging_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["measured_duration_s"] == 1.0
 
 
 def test_estimate_duration_range_seconds_is_widely_bounded_but_realistic():

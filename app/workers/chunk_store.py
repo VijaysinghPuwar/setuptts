@@ -92,13 +92,25 @@ class CoverageReport:
     chunks_recorded: int
     chunks_with_audio: int
     missing_files: list[str]
+    invalid_files: list[str] = field(default_factory=list)
+    invalid_ranges: list[str] = field(default_factory=list)
+    duplicate_indexes: list[int] = field(default_factory=list)
+    text_hash_mismatches: list[int] = field(default_factory=list)
+    source_errors: list[str] = field(default_factory=list)
 
     @property
     def is_complete(self) -> bool:
         return (
             not self.gaps
+            and not self.overlaps
             and not self.missing_files
+            and not self.invalid_files
+            and not self.invalid_ranges
+            and not self.duplicate_indexes
+            and not self.text_hash_mismatches
+            and not self.source_errors
             and self.covered_chars == self.total_chars
+            and self.chunks_with_audio == self.chunks_recorded
             and self.chunks_recorded > 0
         )
 
@@ -113,6 +125,16 @@ class CoverageReport:
             parts.append(f"overlaps={len(self.overlaps)}")
         if self.missing_files:
             parts.append(f"missing_files={len(self.missing_files)}")
+        if self.invalid_files:
+            parts.append(f"invalid_files={len(self.invalid_files)}")
+        if self.invalid_ranges:
+            parts.append(f"invalid_ranges={len(self.invalid_ranges)}")
+        if self.duplicate_indexes:
+            parts.append(f"duplicate_indexes={len(self.duplicate_indexes)}")
+        if self.text_hash_mismatches:
+            parts.append(f"text_hash_mismatches={len(self.text_hash_mismatches)}")
+        if self.source_errors:
+            parts.append(f"source_errors={len(self.source_errors)}")
         return " ".join(parts)
 
 
@@ -257,7 +279,12 @@ class ChunkStore:
             logger.info("Voice changed for %s — not resuming", staging_dir)
             return None
 
-        valid_records, dropped = _validate_chunk_records(staging_dir, manifest.chunks)
+        valid_records, dropped = _validate_chunk_records(
+            staging_dir,
+            manifest.chunks,
+            source_text=compare_text,
+            total_chars=manifest.total_chars,
+        )
         if dropped:
             changed = True
         if valid_records != manifest.chunks:
@@ -324,8 +351,15 @@ class ChunkStore:
                 changed = True
 
             text = cls.load_source_text(entry)
-            valid_records, dropped = _validate_chunk_records(entry, manifest.chunks)
-            if not text or not valid_records:
+            if not text or manifest.text_hash != _text_hash(text):
+                continue
+            valid_records, dropped = _validate_chunk_records(
+                entry,
+                manifest.chunks,
+                source_text=text,
+                total_chars=manifest.total_chars,
+            )
+            if not valid_records:
                 continue
 
             if dropped:
@@ -417,14 +451,21 @@ class ChunkStore:
         sub_ranges: list[tuple[int, int]] | None = None,
     ) -> ChunkRecord:
         """Persist a successfully synthesised chunk's audio and metadata."""
-        if end_char < start_char:
+        if end_char <= start_char:
             raise ValueError(
-                f"Chunk {chunk_idx}: end_char ({end_char}) must be >= start_char ({start_char})"
+                f"Chunk {chunk_idx}: end_char ({end_char}) must be > start_char ({start_char})"
             )
         if start_char < 0 or end_char > self._manifest.total_chars:
             raise ValueError(
                 f"Chunk {chunk_idx}: range [{start_char}, {end_char}) is out of bounds "
                 f"for total_chars={self._manifest.total_chars}"
+            )
+        if not audio_bytes:
+            raise ValueError(f"Chunk {chunk_idx}: audio payload is empty")
+        if sub_ranges and not _ranges_exactly_cover(start_char, end_char, sub_ranges):
+            raise ValueError(
+                f"Chunk {chunk_idx}: recovery sub-ranges do not exactly cover "
+                f"[{start_char}, {end_char})"
             )
 
         target = self.chunk_path(chunk_idx)
@@ -446,17 +487,16 @@ class ChunkStore:
         self._manifest.chunks.append(record)
         self._manifest.chunks.sort(key=lambda c: c.index)
         self._manifest.chunks_completed = sorted(c.index for c in self._manifest.chunks)
-        # Cursor moves forward only — even if the previous chunk overlapped.
-        self._manifest.chars_consumed = max(
-            self._manifest.chars_consumed,
-            _trusted_cursor_from_records(self._manifest.chunks),
+        self._manifest.chars_consumed = _trusted_cursor_from_records(
+            self._manifest.chunks
         )
         self._save_manifest()
         return record
 
     def update_chars_consumed(self, chars: int) -> None:
-        bounded = max(0, min(chars, self._manifest.total_chars))
-        if bounded > self._manifest.chars_consumed:
+        trusted_cursor = _trusted_cursor_from_records(self._manifest.chunks)
+        bounded = max(0, min(chars, self._manifest.total_chars, trusted_cursor))
+        if bounded != self._manifest.chars_consumed:
             self._manifest.chars_consumed = bounded
             self._save_manifest()
 
@@ -477,17 +517,71 @@ class ChunkStore:
         gaps: list[tuple[int, int]] = []
         overlaps: list[tuple[int, int]] = []
         missing_files: list[str] = []
+        invalid_files: list[str] = []
+        invalid_ranges: list[str] = []
+        duplicate_indexes: list[int] = []
+        text_hash_mismatches: list[int] = []
+        source_errors: list[str] = []
         chunks_with_audio = 0
         covered = 0
+        seen_indexes: set[int] = set()
+
+        source_text = self.load_source_text(self._dir)
+        source_text_valid = False
+        if source_text is None:
+            source_errors.append("source_text_missing")
+        elif len(source_text) != self._manifest.total_chars:
+            source_errors.append("source_text_length_mismatch")
+        elif _text_hash(source_text) != self._manifest.text_hash:
+            source_errors.append("source_text_hash_mismatch")
+        else:
+            source_text_valid = True
 
         prev_end = 0
         for record in records:
+            if record.index in seen_indexes:
+                duplicate_indexes.append(record.index)
+            seen_indexes.add(record.index)
+
+            range_valid = True
+            if (
+                record.start_char < 0
+                or record.end_char > self._manifest.total_chars
+                or record.end_char <= record.start_char
+            ):
+                invalid_ranges.append(f"{record.index}:range")
+                range_valid = False
+
+            if record.sub_ranges and not _ranges_exactly_cover(
+                record.start_char,
+                record.end_char,
+                record.sub_ranges,
+            ):
+                invalid_ranges.append(f"{record.index}:sub_ranges")
+                range_valid = False
+
             chunk_file = self._dir / record.file
-            if not chunk_file.exists() or chunk_file.stat().st_size <= 0:
+            try:
+                actual_size = chunk_file.stat().st_size
+            except OSError:
                 missing_files.append(record.file)
                 continue
-            if record.audio_bytes > 0:
-                chunks_with_audio += 1
+            if actual_size <= 0:
+                missing_files.append(record.file)
+                continue
+            if record.audio_bytes <= 0 or actual_size != record.audio_bytes:
+                invalid_files.append(record.file)
+                continue
+            chunks_with_audio += 1
+
+            if source_text_valid and range_valid:
+                expected_hash = _text_hash(source_text[record.start_char:record.end_char])
+                if record.text_hash != expected_hash:
+                    text_hash_mismatches.append(record.index)
+                    range_valid = False
+
+            if not range_valid:
+                continue
 
             if record.start_char > prev_end:
                 gaps.append((prev_end, record.start_char))
@@ -511,6 +605,11 @@ class ChunkStore:
             chunks_recorded=len(records),
             chunks_with_audio=chunks_with_audio,
             missing_files=missing_files,
+            invalid_files=invalid_files,
+            invalid_ranges=invalid_ranges,
+            duplicate_indexes=duplicate_indexes,
+            text_hash_mismatches=text_hash_mismatches,
+            source_errors=source_errors,
         )
 
     def mark_failed(
@@ -544,7 +643,7 @@ class ChunkStore:
             self._manifest.failed_at_chunk_total = total
         self._save_manifest()
 
-    def finalize(self, output_path: Path) -> None:
+    def finalize(self, output_path: Path, *, mark_completed: bool = True) -> None:
         """
         Concatenate all saved chunk files into *output_path* safely.
 
@@ -584,8 +683,14 @@ class ChunkStore:
                         raise RuntimeError(
                             f"Chunk file empty during finalisation: {chunk_file.name}"
                         )
+                    if len(payload) != record.audio_bytes:
+                        raise RuntimeError(
+                            f"Chunk file size mismatch during finalisation: "
+                            f"{chunk_file.name} has {len(payload)} bytes, "
+                            f"manifest expected {record.audio_bytes}"
+                        )
                     out.write(payload)
-                    expected_bytes += len(payload)
+                    expected_bytes += record.audio_bytes
 
             actual_bytes = tmp_output.stat().st_size
             if actual_bytes != expected_bytes:
@@ -602,8 +707,8 @@ class ChunkStore:
                 pass
             raise
 
-        self._manifest.status = "completed"
-        self._save_manifest()
+        if mark_completed:
+            self.mark_completed()
         logger.info(
             "Finalised %d chunks → %s (%d bytes, coverage: %s)",
             len(records_by_range),
@@ -611,6 +716,10 @@ class ChunkStore:
             output_path.stat().st_size,
             coverage.summary(),
         )
+
+    def mark_completed(self) -> None:
+        self._manifest.status = "completed"
+        self._save_manifest()
 
     def cleanup(self) -> None:
         """Remove the staging directory after successful completion."""
@@ -726,6 +835,9 @@ def _load_manifest(staging_dir: Path) -> ChunkManifest | None:
 def _validate_chunk_records(
     staging_dir: Path,
     records: list[ChunkRecord],
+    *,
+    source_text: str | None = None,
+    total_chars: int | None = None,
 ) -> tuple[list[ChunkRecord], list[ChunkRecord]]:
     """Filter the manifest's chunk records to those whose audio files are intact.
 
@@ -737,21 +849,64 @@ def _validate_chunk_records(
     valid: list[ChunkRecord] = []
     dropped: list[ChunkRecord] = []
     indexed = sorted(records, key=lambda c: c.index)
+    expected_index = 0
+    expected_start = 0
+    seen_indexes: set[int] = set()
+    max_chars = total_chars if total_chars is not None else (
+        len(source_text) if source_text is not None else None
+    )
 
     for record in indexed:
+        if record.index in seen_indexes:
+            dropped.append(record)
+            break
+        seen_indexes.add(record.index)
+
+        if record.index != expected_index:
+            dropped.append(record)
+            break
+
+        if record.start_char != expected_start:
+            dropped.append(record)
+            break
+
+        if record.end_char <= record.start_char:
+            dropped.append(record)
+            break
+
+        if max_chars is not None and record.end_char > max_chars:
+            dropped.append(record)
+            break
+
+        if record.sub_ranges and not _ranges_exactly_cover(
+            record.start_char,
+            record.end_char,
+            record.sub_ranges,
+        ):
+            dropped.append(record)
+            break
+
         chunk_file = staging_dir / record.file
-        if not chunk_file.exists() or chunk_file.stat().st_size <= 0:
+        try:
+            actual_size = chunk_file.stat().st_size
+        except OSError:
             dropped.append(record)
             break  # truncate at the first gap
-        # Indexes must be contiguous; gaps mean we can't safely resume past them.
-        if valid and record.index != valid[-1].index + 1:
+        if actual_size <= 0:
             dropped.append(record)
             break
-        # Source ranges must be monotonic for cursor-based resume.
-        if valid and record.start_char < valid[-1].end_char:
+        if record.audio_bytes <= 0 or actual_size != record.audio_bytes:
             dropped.append(record)
             break
+        if source_text is not None:
+            expected_hash = _text_hash(source_text[record.start_char:record.end_char])
+            if record.text_hash != expected_hash:
+                dropped.append(record)
+                break
+
         valid.append(record)
+        expected_index += 1
+        expected_start = record.end_char
 
     # Anything that came after the truncation point also has to be dropped so
     # the manifest stays internally consistent.
@@ -771,9 +926,47 @@ def _validate_chunk_records(
 
 def _trusted_cursor_from_records(records: list[ChunkRecord]) -> int:
     """Return the cursor position implied by a list of validated chunk records."""
-    if not records:
-        return 0
-    return max(record.end_char for record in records)
+    cursor = 0
+    expected_index = 0
+    for record in sorted(records, key=lambda c: c.index):
+        if record.index != expected_index:
+            break
+        if record.start_char != cursor:
+            break
+        if record.end_char <= record.start_char:
+            break
+        cursor = record.end_char
+        expected_index += 1
+    return cursor
+
+
+def _ranges_exactly_cover(
+    start_char: int,
+    end_char: int,
+    ranges: list[tuple[int, int]] | list[list[int]],
+) -> bool:
+    """Return True when child ranges form one contiguous [start, end) span."""
+    if not ranges:
+        return False
+
+    cursor = start_char
+    normalised: list[tuple[int, int]] = []
+    for item in ranges:
+        if len(item) != 2:
+            return False
+        sub_start, sub_end = int(item[0]), int(item[1])
+        normalised.append((sub_start, sub_end))
+
+    for sub_start, sub_end in sorted(normalised):
+        if sub_start != cursor:
+            return False
+        if sub_end <= sub_start:
+            return False
+        if sub_end > end_char:
+            return False
+        cursor = sub_end
+
+    return cursor == end_char
 
 
 def _atomic_write_text(path: Path, text: str) -> None:

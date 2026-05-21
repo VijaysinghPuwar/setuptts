@@ -525,6 +525,11 @@ def _subdivide_range_for_recovery(
             chunk = source_text[sub_start:sub_end].strip()
             payload = _edge_payload_size(chunk) if chunk else 0
         if chunk:
+            if sub_start > cursor_pos:
+                # The spoken text may trim leading whitespace, but the source
+                # range still consumed it. Keep recovery range accounting
+                # contiguous so a recovered parent can prove exact coverage.
+                sub_start = cursor_pos
             sub_chunks.append((chunk, sub_start, sub_end, payload))
         cursor_pos = sub_end
     # Ensure the final sub-range exactly hits the parent end.
@@ -1262,16 +1267,23 @@ class TTSWorker(QThread):
                     f"the full source text ({coverage.summary()})."
                 ),
             )
-            raise _ChunkError(
-                chunk_idx,
-                chunk_idx,
-                failure,
-            )
+            chunk_store.mark_failed(chunk_idx, chunk_idx)
+            error = _ChunkError(chunk_idx, chunk_idx, failure)
+            if chunk_store.completed_count > 0:
+                error.preserved_chunks = chunk_store.completed_count
+                error.staging_dir = chunk_store.staging_dir
+                self.job_resumable.emit(
+                    str(chunk_store.staging_dir),
+                    chunk_store.completed_count,
+                    chunk_idx,
+                    chunk_idx,
+                )
+            raise error
 
         # ── Assemble final file ──────────────────────────────────────────── #
         self.stage_changed.emit("local", "Assembling final audio file from all chunks…")
         try:
-            chunk_store.finalize(output_path)
+            chunk_store.finalize(output_path, mark_completed=False)
         except CoverageError as exc:
             logger.error(
                 "Assembly coverage check failed for job %s: %s",
@@ -1279,7 +1291,41 @@ class TTSWorker(QThread):
                 exc,
             )
             failure = _AttemptFailure("incomplete_coverage", str(exc))
-            raise _ChunkError(chunk_idx, chunk_idx, failure) from exc
+            chunk_store.mark_failed(chunk_idx, chunk_idx)
+            error = _ChunkError(chunk_idx, chunk_idx, failure)
+            if chunk_store.completed_count > 0:
+                error.preserved_chunks = chunk_store.completed_count
+                error.staging_dir = chunk_store.staging_dir
+                self.job_resumable.emit(
+                    str(chunk_store.staging_dir),
+                    chunk_store.completed_count,
+                    chunk_idx,
+                    chunk_idx,
+                )
+            raise error from exc
+        except Exception as exc:
+            logger.error(
+                "Final assembly failed for job %s: %s",
+                self._job_id,
+                exc,
+            )
+            failure = _AttemptFailure(
+                "assembly_failed",
+                f"Final audio assembly failed: {exc}",
+                original=exc,
+            )
+            chunk_store.mark_failed(chunk_idx, chunk_idx)
+            error = _ChunkError(chunk_idx, chunk_idx, failure)
+            if chunk_store.completed_count > 0:
+                error.preserved_chunks = chunk_store.completed_count
+                error.staging_dir = chunk_store.staging_dir
+                self.job_resumable.emit(
+                    str(chunk_store.staging_dir),
+                    chunk_store.completed_count,
+                    chunk_idx,
+                    chunk_idx,
+                )
+            raise error from exc
 
         size = output_path.stat().st_size
         total_elapsed = time.monotonic() - job_start
@@ -1317,7 +1363,7 @@ class TTSWorker(QThread):
                     chunk_idx,
                     chunk_idx,
                 )
-                raise _ChunkError(
+                error = _ChunkError(
                     chunk_idx,
                     chunk_idx,
                     _AttemptFailure(
@@ -1331,7 +1377,11 @@ class TTSWorker(QThread):
                         ),
                     ),
                 )
+                error.preserved_chunks = chunk_store.completed_count
+                error.staging_dir = chunk_store.staging_dir
+                raise error
 
+        chunk_store.mark_completed()
         chunk_store.cleanup()
 
         logger.info(
@@ -2308,6 +2358,14 @@ class TTSWorker(QThread):
                     f"{cause}\n\n"
                     "SetupTTS refused to finalise a truncated file. "
                     "Open Resume Saved Job to retry from the missing range."
+                    f"{preserved_note}"
+                )
+            if cause.kind == "assembly_failed":
+                return (
+                    "SetupTTS could not assemble the final MP3.\n\n"
+                    f"{cause}\n\n"
+                    "The completed chunks were preserved so the job can be retried "
+                    "after the output location issue is fixed."
                     f"{preserved_note}"
                 )
             if cause.kind == "duration_truncated":
