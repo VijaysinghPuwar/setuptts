@@ -55,6 +55,18 @@ def test_long_jobs_use_a_smaller_probe_first_chunk():
     )
 
 
+def test_cursor_take_next_emits_absolute_ranges():
+    text = "abc def ghi jkl mno pqr stu vwx yz"
+    cursor = tts_worker._ChunkCursor(text)
+    chunk, payload, start, end = cursor.take_next(10, 40)
+    assert start == 0
+    assert end > 0
+    assert text[start:end].startswith(chunk)
+    # Next call continues where the previous one left off.
+    next_chunk, _, next_start, _ = cursor.take_next(10, 40)
+    assert next_start >= end
+
+
 def test_preflight_fails_fast_on_no_audio(tmp_path, monkeypatch):
     async def fake_list_voices(*, force_refresh=False):
         return [{"ShortName": "is-IS-GudrunNeural", "Locale": "is-IS"}]
@@ -174,7 +186,7 @@ def test_adaptive_chunk_policy_grows_for_healthy_long_jobs(tmp_path):
     chunk_count = 0
 
     while cursor.has_more():
-        chunk, payload = cursor.take_next(char_limit, payload_limit)
+        chunk, payload, _start, _end = cursor.take_next(char_limit, payload_limit)
         assert chunk
         seen_payloads.append(payload)
         char_limit, payload_limit = worker._retune_after_chunk(
@@ -245,12 +257,13 @@ def test_failed_chunk_preserves_progress_and_resume_metadata(tmp_path, monkeypat
     err = excinfo.value
     assert err.preserved_chunks >= 1
     assert err.staging_dir is not None
-    assert (err.staging_dir / "chunk_0000.mp3").exists()
+    assert (err.staging_dir / "chunk_000000.mp3").exists()
     assert (err.staging_dir / "source.txt").exists()
 
     manifest = json.loads((err.staging_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "failed"
     assert len(manifest["chunks_completed"]) == err.preserved_chunks
+    assert manifest["chunks"][0]["start_char"] == 0
 
     message = tts_worker.TTSWorker._user_message(err)
     assert "preserved" in message.lower()
@@ -287,7 +300,7 @@ def test_resume_reuses_preserved_chunks_without_regenerating_them(tmp_path, monk
     )
     cleaned = tts_worker.build_text_profile(text).cleaned_text.strip()
     cursor = tts_worker._ChunkCursor(cleaned)
-    first_chunk, _ = cursor.take_next(120, 400)
+    first_chunk, _payload, _start, _end = cursor.take_next(120, 400)
 
     output = tmp_path / "resume.mp3"
     worker = tts_worker.TTSWorker(
@@ -320,6 +333,68 @@ def test_resume_reuses_preserved_chunks_without_regenerating_them(tmp_path, monk
     assert not excinfo.value.staging_dir.exists()
 
 
+def test_irrecoverable_subchunk_fails_closed_instead_of_skipping(tmp_path, monkeypatch):
+    """A tiny sub-chunk that refuses to produce audio must fail the job
+    (preserving progress), not silently drop the text. This is the regression
+    we're protecting against for very long audiobook jobs."""
+    monkeypatch.setenv("SETUPTTS_DATA_DIR", str(tmp_path / "appdata"))
+    monkeypatch.setattr(tts_worker, "_chunk_plan_for", _small_plan)
+
+    async def fake_list_voices(*, force_refresh=False):
+        return [{"ShortName": "en-US-AvaNeural", "Locale": "en-US"}]
+
+    # "omega" appears in a single small sentence that will always return
+    # no-audio. The recovery loop will subdivide once or twice, then hit the
+    # min-size floor with the same fragment still failing.
+    def controller(text: str) -> str:
+        if "omega" in text:
+            return "no_audio"
+        return "success"
+
+    monkeypatch.setattr(tts_worker, "list_voices", fake_list_voices)
+    monkeypatch.setattr(
+        tts_worker,
+        "build_communicate",
+        lambda **kwargs: _FakeCommunicate(kwargs["text"], controller),
+    )
+
+    text = (
+        ("alpha beta gamma delta epsilon " * 12).strip()
+        + "\n\nomega irrecoverable fragment.\n\n"
+        + ("zeta eta theta iota kappa " * 12).strip()
+    )
+
+    output = tmp_path / "fail_closed.mp3"
+    worker = tts_worker.TTSWorker(
+        text=text,
+        voice="en-US-AvaNeural",
+        rate="+0%",
+        volume="+0%",
+        output_path=str(output),
+    )
+
+    with pytest.raises(tts_worker._ChunkError) as excinfo:
+        asyncio.run(worker._stream_generate())
+
+    # The job must NOT have produced a "completed" MP3 — the previous version
+    # of SetupTTS would silently skip the irrecoverable fragment and write a
+    # success file. We need the failure to be loud and preserve progress.
+    assert not output.exists()
+    assert excinfo.value.staging_dir is not None
+    # At least one earlier chunk should still be staged for resume.
+    assert excinfo.value.preserved_chunks >= 1
+
+
+def test_estimate_duration_range_seconds_is_widely_bounded_but_realistic():
+    rate = "+5%"
+    min_s, max_s = tts_worker._estimate_duration_range_seconds(180_000, rate, "devanagari")
+    # 180k chars of Devanagari at +5% rate has a plausible range somewhere
+    # between roughly 3 and 8 hours — well over the "2-3 hours bug" zone.
+    assert min_s < max_s
+    assert min_s > 60 * 60      # > 1 hour minimum
+    assert max_s > 3 * 60 * 60  # > 3 hours maximum
+
+
 def test_chunk_error_messages_are_specific():
     no_audio = tts_worker._ChunkError(
         1,
@@ -348,3 +423,15 @@ def test_chunk_error_messages_are_specific():
     message = tts_worker.TTSWorker._user_message(no_audio)
     assert "preserved" in message.lower()
     assert "retry/resume" in message.lower()
+
+    coverage = tts_worker._ChunkError(
+        9,
+        9,
+        tts_worker._AttemptFailure(
+            "incomplete_coverage",
+            "Generation finished but the recorded chunks do not cover the full source text.",
+        ),
+    )
+    coverage_msg = tts_worker.TTSWorker._user_message(coverage)
+    assert "do not cover" in coverage_msg.lower()
+    assert "resume" in coverage_msg.lower()

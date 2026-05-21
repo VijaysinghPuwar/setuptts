@@ -15,7 +15,8 @@ path is now more defensive:
 """
 
 import asyncio
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, field
 import io
 import logging
 import math
@@ -40,8 +41,13 @@ from app.services.tts_service import (
     build_communicate,
     list_voices,
 )
+from app.utils.mp3_duration import mp3_duration_seconds
 from app.utils.paths import AppPaths
-from app.workers.chunk_store import ChunkStore, cleanup_stale_staging
+from app.workers.chunk_store import (
+    ChunkStore,
+    CoverageError,
+    cleanup_stale_staging,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -403,40 +409,67 @@ def _apply_first_chunk_probe(
 
 @dataclass
 class _ChunkCursor:
-    remaining_text: str
+    """Absolute-position cursor over an immutable source text.
+
+    Every ``take_next`` call advances the cursor and returns the chunk's
+    exact ``[start, end)`` range inside the original source. The cursor never
+    skips text silently: ``end`` is the position to continue from, even when
+    trailing whitespace was trimmed from the returned chunk.
+    """
+
+    source_text: str
+    position: int = 0
+
+    @property
+    def remaining_text(self) -> str:
+        return self.source_text[self.position:]
 
     def has_more(self) -> bool:
-        return bool(self.remaining_text.strip())
+        return bool(self.source_text[self.position:].strip())
 
     def remaining_chars(self) -> int:
-        return len(self.remaining_text.lstrip())
+        return max(len(self.source_text) - self.position, 0)
 
-    def take_next(self, max_chars: int, max_payload_bytes: int) -> tuple[str, int]:
-        text = self.remaining_text.lstrip()
-        if not text:
-            self.remaining_text = ""
-            return "", 0
+    def seek(self, position: int) -> None:
+        self.position = max(0, min(position, len(self.source_text)))
 
-        chunk, remainder, payload_bytes = _take_chunk_prefix(
-            text,
+    def take_next(
+        self,
+        max_chars: int,
+        max_payload_bytes: int,
+    ) -> tuple[str, int, int, int]:
+        """Return (chunk_text, payload_bytes, start_char, end_char)."""
+        chunk, start, end, payload = _take_chunk_at(
+            self.source_text,
+            self.position,
             max_chars,
             max_payload_bytes,
         )
-        self.remaining_text = remainder
-        return chunk, payload_bytes
+        self.position = end
+        return chunk, payload, start, end
 
 
-def _take_chunk_prefix(
-    text: str,
+def _take_chunk_at(
+    source_text: str,
+    start: int,
     max_chars: int,
     max_payload_bytes: int,
-) -> tuple[str, str, int]:
-    stripped = text.lstrip()
+) -> tuple[str, int, int, int]:
+    """Return (chunk_text, absolute_start, absolute_end, payload_bytes).
+
+    ``absolute_end`` is the position the cursor should continue from, even
+    when trailing whitespace is trimmed from ``chunk_text``.
+    """
+    text_remaining = source_text[start:]
+    leading_ws = len(text_remaining) - len(text_remaining.lstrip())
+    absolute_start = start + leading_ws
+    stripped = text_remaining[leading_ws:]
+
     if not stripped:
-        return "", "", 0
+        return "", absolute_start, len(source_text), 0
 
     if _fits_chunk(stripped, max_chars, max_payload_bytes):
-        return stripped, "", _edge_payload_size(stripped)
+        return stripped, absolute_start, len(source_text), _edge_payload_size(stripped)
 
     window = stripped[:max_chars]
     boundary_sets = (
@@ -449,13 +482,56 @@ def _take_chunk_prefix(
         for split_at, resume_at in boundaries:
             candidate = stripped[:split_at].strip()
             if candidate and _fits_chunk(candidate, max_chars, max_payload_bytes):
-                remainder = stripped[resume_at:].lstrip()
-                return candidate, remainder, _edge_payload_size(candidate)
+                absolute_end = absolute_start + resume_at
+                return candidate, absolute_start, absolute_end, _edge_payload_size(candidate)
 
     hard_split = _hard_split_text(stripped, max_chars, max_payload_bytes)
     chunk = hard_split[0]
-    remainder = stripped[len(chunk):].lstrip()
-    return chunk, remainder, _edge_payload_size(chunk)
+    absolute_end = absolute_start + len(chunk)
+    return chunk, absolute_start, absolute_end, _edge_payload_size(chunk)
+
+
+def _subdivide_range_for_recovery(
+    source_text: str,
+    start: int,
+    end: int,
+    max_chars: int,
+    max_payload_bytes: int,
+) -> list[tuple[str, int, int, int]]:
+    """Subdivide an already-extracted [start, end) range into smaller sub-chunks.
+
+    Returns a list of ``(chunk_text, absolute_start, absolute_end, payload_bytes)``
+    tuples that exactly cover ``[start, end)`` (the last sub-chunk's
+    ``absolute_end`` equals ``end``).
+    """
+    sub_chunks: list[tuple[str, int, int, int]] = []
+    cursor_pos = start
+    while cursor_pos < end:
+        chunk, sub_start, sub_end, payload = _take_chunk_at(
+            source_text,
+            cursor_pos,
+            max_chars,
+            max_payload_bytes,
+        )
+        if sub_end <= cursor_pos:
+            # Defensive: avoid an infinite loop if something pathological
+            # happens. Force progress by one character.
+            sub_end = min(cursor_pos + 1, end)
+            chunk = source_text[cursor_pos:sub_end].strip()
+            payload = _edge_payload_size(chunk) if chunk else 0
+            sub_start = cursor_pos
+        if sub_end > end:
+            sub_end = end
+            chunk = source_text[sub_start:sub_end].strip()
+            payload = _edge_payload_size(chunk) if chunk else 0
+        if chunk:
+            sub_chunks.append((chunk, sub_start, sub_end, payload))
+        cursor_pos = sub_end
+    # Ensure the final sub-range exactly hits the parent end.
+    if sub_chunks:
+        last_chunk, last_start, _last_end, last_payload = sub_chunks[-1]
+        sub_chunks[-1] = (last_chunk, last_start, end, last_payload)
+    return sub_chunks
 
 
 def _boundary_candidates(text: str, pattern: str) -> list[tuple[int, int]]:
@@ -466,6 +542,72 @@ def _boundary_candidates(text: str, pattern: str) -> list[tuple[int, int]]:
     ]
     candidates.sort(reverse=True)
     return candidates
+
+
+# Coarse chars/second bands used to sanity-check the final audio duration.
+# Numbers come from observed runs in the SetupTTS logs and the published Edge
+# Neural voice behaviour. They are deliberately wide: their only job is to
+# catch *catastrophic* truncation (e.g. a 12-hour run ending up at 3 hours).
+_DURATION_CPS_DEFAULTS = (12.0, 22.0)  # (slow_cps, fast_cps) for Latin-script
+_DURATION_CPS_BY_SCRIPT: dict[str, tuple[float, float]] = {
+    "latin": (12.0, 22.0),
+    "devanagari": (6.5, 16.0),
+    "bengali": (6.5, 16.0),
+    "gurmukhi": (6.5, 16.0),
+    "gujarati": (6.5, 16.0),
+    "tamil": (5.5, 14.0),
+    "telugu": (5.5, 14.0),
+    "kannada": (5.5, 14.0),
+    "malayalam": (5.5, 14.0),
+    "odia": (5.5, 14.0),
+    "sinhala": (5.5, 14.0),
+    "arabic": (7.0, 18.0),
+    "han": (4.0, 12.0),
+    "japanese": (4.0, 12.0),
+    "hangul": (5.0, 13.0),
+    "thai": (5.0, 13.0),
+    "cyrillic": (10.0, 20.0),
+    "mixed": (6.0, 20.0),
+}
+
+
+def _estimate_duration_range_seconds(
+    total_chars: int,
+    rate_string: str,
+    script_code: str | None,
+) -> tuple[float, float]:
+    """Return a (min, max) expected audio duration in seconds.
+
+    The window is wide on purpose — its job is to catch ~50 %+ shortfalls,
+    not to be precise. ``rate_string`` is the edge_tts rate (``"+5%"``,
+    ``"-10%"``, etc).
+    """
+    slow_cps, fast_cps = _DURATION_CPS_BY_SCRIPT.get(
+        script_code or "", _DURATION_CPS_DEFAULTS
+    )
+
+    rate_multiplier = 1.0
+    try:
+        if rate_string:
+            sign = -1.0 if rate_string.startswith("-") else 1.0
+            value = float(rate_string.strip().lstrip("+-").rstrip("%"))
+            rate_multiplier = max(0.25, 1.0 + sign * (value / 100.0))
+    except (TypeError, ValueError):
+        rate_multiplier = 1.0
+
+    if total_chars <= 0:
+        return 0.0, 0.0
+
+    # Faster rate → fewer seconds; chars/sec increases with rate.
+    effective_slow = slow_cps * rate_multiplier
+    effective_fast = fast_cps * rate_multiplier
+    min_seconds = total_chars / effective_fast
+    max_seconds = total_chars / effective_slow
+    return min_seconds, max_seconds
+
+
+def _short_text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 def _voice_locale(short_name: str) -> str:
@@ -541,6 +683,10 @@ class _ChunkOutcome:
     receive_duration: float | None = None
     write_duration: float | None = None
     failure_kinds: tuple[str, ...] = ()
+    # Source sub-ranges that actually produced audio for this chunk. Used by
+    # the assembler so the per-chunk manifest entry records exactly which
+    # ranges contributed bytes — invaluable when chasing silent truncation.
+    sub_ranges: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -855,8 +1001,24 @@ class TTSWorker(QThread):
             )
 
         # ── Initialise cursor, possibly from a resume point ─────────────── #
-        resume_chars = chunk_store.manifest.chars_consumed
+        # The resume position is derived from the manifest's recorded chunk
+        # ranges (max end_char), which is the only trustworthy source — the
+        # word-boundary-driven char counter can lag behind what was actually
+        # synthesised, but ``chunk_store.resume_position`` reflects the true
+        # extent of saved chunks.
+        resume_position = chunk_store.resume_position
         resume_chunk_idx = chunk_store.resume_from_chunk
+        resume_chars = resume_position
+
+        # Set up the expected-duration window for sanity-checking the final
+        # MP3. This is intentionally generous; the bands are tightened later
+        # as we observe real chars/sec from the early chunks.
+        exp_min, exp_max = _estimate_duration_range_seconds(
+            total_chars,
+            self._rate,
+            self._text_profile.script_code,
+        )
+        chunk_store.set_expected_duration(exp_min, exp_max)
 
         job_start = time.monotonic()
         progress_state = _ProgressState(
@@ -877,8 +1039,9 @@ class TTSWorker(QThread):
             adaptive_char_limit = chunk_plan.warmup_chars
             adaptive_payload_limit = chunk_plan.warmup_payload_bytes
 
-        # Start the text cursor at the already-consumed position.
-        chunk_cursor = _ChunkCursor(stripped_text[resume_chars:] if resume_chars > 0 else stripped_text)
+        # Cursor walks the full source text using absolute positions so that
+        # every chunk has an unambiguous [start_char, end_char) range.
+        chunk_cursor = _ChunkCursor(stripped_text, position=resume_position)
 
         if not chunk_cursor.has_more() and resume_chunk_idx == 0:
             raise ValueError("No text was available to generate.")
@@ -934,7 +1097,7 @@ class TTSWorker(QThread):
                 if self._cancelled:
                     raise asyncio.CancelledError()
 
-                text_chunk, chunk_payload = chunk_cursor.take_next(
+                text_chunk, chunk_payload, source_start, source_end = chunk_cursor.take_next(
                     adaptive_char_limit,
                     adaptive_payload_limit,
                 )
@@ -969,13 +1132,32 @@ class TTSWorker(QThread):
                     payload_limit=adaptive_payload_limit,
                     plan=chunk_plan,
                     display_label=chunk_label,
+                    source_text=stripped_text,
+                    source_start=source_start,
+                    source_end=source_end,
                 )
 
                 # ── Write chunk to staging ──────────────────────────────── #
                 write_started_at = time.monotonic()
                 self.stage_changed.emit("local", f"Writing {chunk_label} to disk")
-                chunk_store.save_chunk(chunk_idx, chunk_bytes)
-                chunk_store.update_chars_consumed(progress_state.processed_chars)
+                chunk_store.record_chunk(
+                    chunk_idx,
+                    start_char=source_start,
+                    end_char=source_end,
+                    text_hash=_short_text_hash(stripped_text[source_start:source_end]),
+                    audio_bytes=chunk_bytes,
+                    retries=outcome.attempts - 1,
+                    used_recovery=outcome.used_recovery,
+                    sub_ranges=outcome.sub_ranges,
+                )
+                # Move the word-boundary char counter forward to the end of the
+                # range we have actually committed to disk. Without this, a
+                # resume cursor would lag behind for chunks where the service
+                # under-reports word boundaries.
+                if source_end > progress_state.processed_chars:
+                    progress_state.processed_chars = source_end
+                    self._emit_progress_from_chars(source_end, total_chars)
+                chunk_store.update_chars_consumed(source_end)
                 write_duration = time.monotonic() - write_started_at
 
                 self._emit_saved_stage(
@@ -1065,25 +1247,117 @@ class TTSWorker(QThread):
                 chunk_store.cleanup()
             raise asyncio.CancelledError()
 
-        # ── All chunks done: assemble final file ─────────────────────────── #
+        # ── Coverage check before final assembly ─────────────────────────── #
+        coverage = chunk_store.coverage_report()
+        if not coverage.is_complete:
+            logger.error(
+                "Coverage check failed before finalisation for job %s: %s",
+                self._job_id,
+                coverage.summary(),
+            )
+            failure = _AttemptFailure(
+                "incomplete_coverage",
+                (
+                    "Generation finished but the recorded chunks do not cover "
+                    f"the full source text ({coverage.summary()})."
+                ),
+            )
+            raise _ChunkError(
+                chunk_idx,
+                chunk_idx,
+                failure,
+            )
+
+        # ── Assemble final file ──────────────────────────────────────────── #
         self.stage_changed.emit("local", "Assembling final audio file from all chunks…")
-        chunk_store.finalize(output_path)
+        try:
+            chunk_store.finalize(output_path)
+        except CoverageError as exc:
+            logger.error(
+                "Assembly coverage check failed for job %s: %s",
+                self._job_id,
+                exc,
+            )
+            failure = _AttemptFailure("incomplete_coverage", str(exc))
+            raise _ChunkError(chunk_idx, chunk_idx, failure) from exc
 
         size = output_path.stat().st_size
         total_elapsed = time.monotonic() - job_start
         if size <= 0:
             raise RuntimeError("The speech service completed without writing any audio.")
 
+        # ── Output duration sanity check ─────────────────────────────────── #
+        measured_duration = mp3_duration_seconds(output_path)
+        chunk_store.set_measured_duration(measured_duration)
+
+        expected_min, expected_max = (
+            chunk_store.manifest.expected_duration_min_s or 0.0,
+            chunk_store.manifest.expected_duration_max_s or 0.0,
+        )
+        if measured_duration is not None and expected_min > 0:
+            # Fail-closed when the measured duration is significantly below the
+            # most pessimistic estimate — that pattern is consistent with the
+            # silent-truncation bug this work is meant to prevent.
+            shortfall_threshold = expected_min * 0.55
+            if measured_duration < shortfall_threshold:
+                logger.error(
+                    "Duration sanity check failed for job %s: "
+                    "measured=%.1fs expected_min=%.1fs expected_max=%.1fs",
+                    self._job_id,
+                    measured_duration,
+                    expected_min,
+                    expected_max,
+                )
+                # Preserve the assembled file so the user can inspect it, but
+                # report the job as resumable so progress is not lost.
+                chunk_store.mark_failed(chunk_idx, chunk_idx)
+                self.job_resumable.emit(
+                    str(chunk_store.staging_dir),
+                    chunk_store.completed_count,
+                    chunk_idx,
+                    chunk_idx,
+                )
+                raise _ChunkError(
+                    chunk_idx,
+                    chunk_idx,
+                    _AttemptFailure(
+                        "duration_truncated",
+                        (
+                            f"Final audio is unexpectedly short: "
+                            f"{measured_duration:.0f}s measured vs "
+                            f"{expected_min:.0f}-{expected_max:.0f}s expected. "
+                            "The output may be truncated — staged progress has "
+                            "been preserved for review/resume."
+                        ),
+                    ),
+                )
+
         chunk_store.cleanup()
 
         logger.info(
-            "File written: %s size=%d bytes chunks=%d total=%.2fs",
+            "File written: %s size=%d bytes chunks=%d total=%.2fs "
+            "measured_duration=%s expected=%s-%s coverage=%s",
             output_path,
             size,
             chunk_idx,
             total_elapsed,
+            (f"{measured_duration:.1f}s" if measured_duration is not None else "n/a"),
+            f"{expected_min:.0f}s",
+            f"{expected_max:.0f}s",
+            coverage.summary(),
         )
-        self.stage_changed.emit("local", "Finalizing MP3 file")
+        self.stage_changed.emit(
+            "local",
+            (
+                f"Saved {output_path.name} — {coverage.chunks_recorded} chunks, "
+                f"full coverage verified"
+                + (
+                    f", duration {measured_duration:.0f}s"
+                    if measured_duration is not None
+                    else ""
+                )
+            ),
+        )
         self.status_changed.emit("Done")
         self.progress.emit(100)
 
@@ -1173,6 +1447,9 @@ class TTSWorker(QThread):
         plan: _ChunkPlan,
         depth: int = 0,
         display_label: str | None = None,
+        source_text: str | None = None,
+        source_start: int | None = None,
+        source_end: int | None = None,
     ) -> tuple[bytes, _ChunkOutcome]:
         chunk_number = chunk_idx + 1
         chunk_label = display_label or (
@@ -1269,6 +1546,11 @@ class TTSWorker(QThread):
                     f"{first_audio_delay:.2f}s" if first_audio_delay is not None else "n/a",
                     f"{receive_duration:.2f}s" if receive_duration is not None else "n/a",
                 )
+                sub_ranges = (
+                    [(int(source_start), int(source_end))]
+                    if source_start is not None and source_end is not None
+                    else []
+                )
                 return audio_bytes, _ChunkOutcome(
                     attempts=attempt + 1,
                     elapsed=chunk_elapsed,
@@ -1277,6 +1559,7 @@ class TTSWorker(QThread):
                     receive_duration=receive_duration,
                     write_duration=None,
                     failure_kinds=tuple(sorted(failure_kinds)),
+                    sub_ranges=sub_ranges,
                 )
 
             except asyncio.CancelledError:
@@ -1301,26 +1584,37 @@ class TTSWorker(QThread):
                     break
 
         if last_failure is not None:
-            recovery_chunks = self._split_for_recovery(text_chunk, char_limit, payload_limit, depth)
-            if recovery_chunks:
+            recovery_sub_chunks = self._subdivide_for_recovery(
+                text_chunk,
+                char_limit,
+                payload_limit,
+                depth,
+                source_text=source_text,
+                source_start=source_start,
+                source_end=source_end,
+            )
+            if recovery_sub_chunks:
                 self.status_changed.emit("Recovering failed chunk…")
                 self.stage_changed.emit(
                     "waiting",
-                    f"{chunk_label} kept failing — retrying {len(recovery_chunks)} smaller sections",
+                    f"{chunk_label} kept failing — retrying {len(recovery_sub_chunks)} smaller sections",
                 )
                 logger.warning(
                     "%s failed after retries (%s) — splitting into %d smaller sections",
                     chunk_label,
                     last_failure.kind,
-                    len(recovery_chunks),
+                    len(recovery_sub_chunks),
                 )
                 next_char_limit = max(_MIN_RECOVERY_CHARS, char_limit // 2)
                 next_payload_limit = max(_MIN_RECOVERY_PAYLOAD_BYTES, payload_limit // 2)
                 recovered_audio = bytearray()
                 recovered_failure_kinds = set(failure_kinds)
+                recovered_sub_ranges: list[tuple[int, int]] = []
                 first_audio_delays: list[float] = []
                 receive_durations: list[float] = []
-                for sub_idx, subchunk in enumerate(recovery_chunks, start=1):
+                for sub_idx, (subchunk, sub_start, sub_end) in enumerate(
+                    recovery_sub_chunks, start=1
+                ):
                     sub_audio, sub_outcome = await self._process_chunk(
                         text_chunk=subchunk,
                         chunk_payload=_edge_payload_size(subchunk),
@@ -1332,10 +1626,14 @@ class TTSWorker(QThread):
                         payload_limit=next_payload_limit,
                         plan=plan,
                         depth=depth + 1,
-                        display_label=f"{chunk_label} · recovery {sub_idx}/{len(recovery_chunks)}",
+                        display_label=f"{chunk_label} · recovery {sub_idx}/{len(recovery_sub_chunks)}",
+                        source_text=source_text,
+                        source_start=sub_start,
+                        source_end=sub_end,
                     )
                     recovered_audio.extend(sub_audio)
                     recovered_failure_kinds.update(sub_outcome.failure_kinds)
+                    recovered_sub_ranges.extend(sub_outcome.sub_ranges)
                     if sub_outcome.first_audio_delay is not None:
                         first_audio_delays.append(sub_outcome.first_audio_delay)
                     if sub_outcome.receive_duration is not None:
@@ -1349,36 +1647,19 @@ class TTSWorker(QThread):
                     receive_duration=sum(receive_durations) if receive_durations else None,
                     write_duration=None,
                     failure_kinds=tuple(sorted(recovered_failure_kinds)),
+                    sub_ranges=recovered_sub_ranges,
                 )
 
             # ── Can't split further AND already in recovery mode ─────────── #
-            # This sub-chunk is too small (or at max recovery depth) to divide
-            # again.  Keeping no-audio / metadata-only failures from a tiny
-            # fragment from aborting the whole job: skip the section and let
-            # the surrounding recovery loop continue.  A few missing chars
-            # in the output is far better than losing all progress.
-            if depth > 0 and last_failure.kind in {"no_audio", "metadata_without_audio"}:
-                chunk_elapsed = time.monotonic() - chunk_start
-                logger.warning(
-                    "%s is too small to split further and returned no audio — "
-                    "skipping this section (~%d chars will be absent from output)",
-                    chunk_label,
-                    len(text_chunk),
-                )
-                self.stage_changed.emit(
-                    "local",
-                    f"{chunk_label} could not be recovered and is too small to split "
-                    f"further — skipping {len(text_chunk):,} chars to preserve the rest of the job",
-                )
-                return b"", _ChunkOutcome(
-                    attempts=_MAX_ATTEMPTS,
-                    elapsed=chunk_elapsed,
-                    used_recovery=True,
-                    first_audio_delay=None,
-                    receive_duration=None,
-                    write_duration=None,
-                    failure_kinds=tuple(sorted(failure_kinds)),
-                )
+            # Previous versions silently returned ``b""`` for a tiny fragment
+            # that kept refusing to produce audio. That bug caused long-form
+            # exports to truncate (the parent chunk file would only contain
+            # the bytes of the successful sub-chunks, while the failed
+            # fragment's text was permanently absent from the final MP3).
+            #
+            # Long-form correctness wins over partial output: we now raise so
+            # the job is preserved as resumable rather than being marked
+            # "complete" with missing audio.
 
             if (
                 last_failure.kind in {"no_audio", "metadata_without_audio", "timeout_waiting_for_audio"}
@@ -1406,13 +1687,22 @@ class TTSWorker(QThread):
             last_failure or _AttemptFailure("unexpected", "Unknown chunk failure"),
         )
 
-    def _split_for_recovery(
+    def _subdivide_for_recovery(
         self,
         text_chunk: str,
         char_limit: int,
         payload_limit: int,
         depth: int,
-    ) -> list[str]:
+        *,
+        source_text: str | None,
+        source_start: int | None,
+        source_end: int | None,
+    ) -> list[tuple[str, int, int]]:
+        """Return [(sub_text, sub_start, sub_end), ...] covering the parent range.
+
+        Returns an empty list when the parent chunk cannot meaningfully be
+        subdivided further.
+        """
         chunk_chars = len(text_chunk)
         chunk_payload = _edge_payload_size(text_chunk)
         if depth >= _MAX_RECOVERY_DEPTH:
@@ -1433,8 +1723,31 @@ class TTSWorker(QThread):
         if next_char_limit >= chunk_chars and next_payload_limit >= chunk_payload:
             return []
 
+        if source_text is not None and source_start is not None and source_end is not None:
+            sub_chunks = _subdivide_range_for_recovery(
+                source_text,
+                source_start,
+                source_end,
+                next_char_limit,
+                next_payload_limit,
+            )
+            if len(sub_chunks) > 1:
+                return [(sc[0], sc[1], sc[2]) for sc in sub_chunks]
+            return []
+
+        # Fallback for unit tests or unusual call paths that don't supply
+        # source context — synthesize fake absolute ranges from the local
+        # text. Coverage tracking is best-effort here.
         recovery_chunks = _split_text(text_chunk, next_char_limit, next_payload_limit)
-        return recovery_chunks if len(recovery_chunks) > 1 else []
+        if len(recovery_chunks) <= 1:
+            return []
+        results: list[tuple[str, int, int]] = []
+        cursor = source_start if source_start is not None else 0
+        for sub_text in recovery_chunks:
+            sub_end = cursor + len(sub_text)
+            results.append((sub_text, cursor, sub_end))
+            cursor = sub_end
+        return results
 
     async def _synthesise_attempt(
         self,
@@ -1986,6 +2299,23 @@ class TTSWorker(QThread):
                 return (
                     f"The speech service returned an unexpected response on {chunk_ctx}.\n\n"
                     "Try again. If the problem keeps happening, choose another voice."
+                    f"{preserved_note}"
+                )
+            if cause.kind == "incomplete_coverage":
+                return (
+                    "Generation finished, but the recorded chunks do not cover "
+                    "the full source text.\n\n"
+                    f"{cause}\n\n"
+                    "SetupTTS refused to finalise a truncated file. "
+                    "Open Resume Saved Job to retry from the missing range."
+                    f"{preserved_note}"
+                )
+            if cause.kind == "duration_truncated":
+                return (
+                    "The final audio looks much shorter than expected.\n\n"
+                    f"{cause}\n\n"
+                    "SetupTTS preserved the staged chunks and the assembled "
+                    "MP3 so you can either resume the job or inspect it."
                     f"{preserved_note}"
                 )
             return (
