@@ -146,14 +146,7 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
         self._connect_signals()
 
-        # An explicit minimum overrides the layout's own minimumSizeHint, so
-        # the constant alone would promise a size the layout cannot render
-        # once the system font is larger than we assumed.  Take whichever is
-        # bigger; at normal font sizes the hint is well under the constant and
-        # this changes nothing.
-        hint = self.minimumSizeHint()
-        self.setMinimumSize(max(_MIN_WINDOW_SIZE[0], hint.width()),
-                            max(_MIN_WINDOW_SIZE[1], hint.height()))
+        self._sync_window_minimum()
 
         self.status_bar.showMessage("Ready")
         logger.info("MainWindow shown")
@@ -344,8 +337,14 @@ class MainWindow(QMainWindow):
         if panel is None:
             return
 
+        # Same reasoning as the editor and history floors: 310 px is only
+        # enough for the sidebar's controls at the font size we assumed.
+        sidebar_min = max(_RIGHT_PANEL_MIN, panel.minimumSizeHint().width())
+        if panel.minimumWidth() != sidebar_min:
+            panel.setMinimumWidth(sidebar_min)
+
         allowed = int(self.width() * 0.40)
-        target  = max(_RIGHT_PANEL_MIN, min(_RIGHT_PANEL_MAX, allowed))
+        target  = max(sidebar_min, min(max(_RIGHT_PANEL_MAX, sidebar_min), allowed))
         if panel.maximumWidth() != target:
             panel.setMaximumWidth(target)
 
@@ -358,7 +357,7 @@ class MainWindow(QMainWindow):
 
         if self._sidebar_user_sized:
             # Respect the user's width, but never exceed the responsive cap.
-            right = max(_RIGHT_PANEL_MIN, min(target, sizes[1]))
+            right = max(sidebar_min, min(target, sizes[1]))
         else:
             right = target
 
@@ -374,6 +373,28 @@ class MainWindow(QMainWindow):
         left = max(editor_min, sum(sizes) - right)
         if [left, right] != sizes:
             self._h_splitter.setSizes([left, right])
+
+        self._sync_window_minimum()
+
+    def _sync_window_minimum(self) -> None:
+        """
+        Keep the window's minimum at least as large as the layout needs.
+
+        An explicit minimum overrides the layout's own minimumSizeHint, so the
+        constant alone promises a size the layout cannot render once the system
+        font is larger than we assumed — and a window allowed below what the
+        layout needs pushes the editor off the right-hand edge.  The panels'
+        minimums are themselves derived from their content, so this has to be
+        re-derived whenever they change, not only at construction.
+
+        Never goes below _MIN_WINDOW_SIZE, and is skipped when unchanged, so
+        the resize it can trigger settles on the next pass.
+        """
+        needed = self.minimumSizeHint()
+        floor_w = max(_MIN_WINDOW_SIZE[0], needed.width())
+        floor_h = max(_MIN_WINDOW_SIZE[1], needed.height())
+        if (self.minimumWidth(), self.minimumHeight()) != (floor_w, floor_h):
+            self.setMinimumSize(floor_w, floor_h)
 
     @staticmethod
     def _density_for_height(height: int) -> str:

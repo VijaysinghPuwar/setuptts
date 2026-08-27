@@ -160,9 +160,14 @@ def test_generate_button_label_keeps_its_ampersand(window):
     Qt eats a single '&' in a button label as a keyboard mnemonic, which
     rendered the CTA as "Generate Export MP3".  The literal form is '&&'.
     """
-    text = window._output_panel._generate_btn.text()
-    assert "&&" in text
-    assert text.replace("&&", "&") == "Generate & Export MP3"
+    # Asserted on the label set, not the label currently shown: the button
+    # steps down to a shorter label on a narrow sidebar or a wide font, and
+    # the escaping has to be right for every label it can show.
+    for label in window._output_panel._generate_btn._labels:
+        assert "&" not in label.replace("&&", "")
+    full = window._output_panel._generate_btn._labels[0]
+    assert "&&" in full
+    assert full.replace("&&", "&") == "Generate & Export MP3"
 
 
 # ------------------------------------------------------------------ #

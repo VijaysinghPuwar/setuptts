@@ -1731,9 +1731,6 @@ class _AdaptiveLabelButton(QPushButton):
     what gets measured, since that is what is drawn.
     """
 
-    #: Stylesheet padding either side, plus a little slack for the border.
-    _CHROME_WIDTH = 36
-
     def __init__(self, labels: list[str], parent: QWidget | None = None) -> None:
         super().__init__(labels[0], parent)
         self._labels = list(labels)
@@ -1748,9 +1745,17 @@ class _AdaptiveLabelButton(QPushButton):
 
     def refresh_label(self) -> None:
         """Re-choose the label — call after anything that changes the font."""
-        metrics   = QFontMetrics(self.font())
-        available = self.width() - self._CHROME_WIDTH
-        chosen    = self._labels[-1]
+        metrics = QFontMetrics(self.font())
+
+        # Derive the chrome (padding, border, and whatever minimum the style
+        # imposes) from the live size hint rather than guessing it from the
+        # stylesheet: the guess was wrong by enough to step the label down
+        # while the full one still fitted.
+        drawn  = self.text().replace("&&", "&")
+        chrome = max(0, self.sizeHint().width() - metrics.horizontalAdvance(drawn))
+        available = self.width() - chrome
+
+        chosen = self._labels[-1]
         for label in self._labels:
             if metrics.horizontalAdvance(label.replace("&&", "&")) <= available:
                 chosen = label

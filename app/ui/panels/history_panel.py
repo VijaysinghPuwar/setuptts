@@ -45,6 +45,29 @@ class HistoryPanel(QWidget):
 
     # ------------------------------------------------------------------ #
 
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        # Only now is the header polished and its real height known.  Pinning
+        # it as a hard minimum stops the layout shaving the header — and
+        # clipping its Clear All button — when the strip is squeezed; the
+        # table below absorbs the loss instead, which is what scrolls.
+        self._header.setMinimumHeight(
+            max(36, self._header.sizeHint().height())
+        )
+
+    def minimumSizeHint(self):  # type: ignore[override]
+        """
+        Report the height the strip genuinely needs: its header plus one row.
+
+        The default hint is derived from the table, whose own minimum is tiny,
+        so the strip could be given less height than its header alone needs
+        and the header's Clear All button was clipped.  MainWindow uses this
+        as the floor when sizing the split.
+        """
+        hint = super().minimumSizeHint()
+        hint.setHeight(max(hint.height(), self._header.sizeHint().height() + 36))
+        return hint
+
     def refresh(self) -> None:
         try:
             self._jobs = self._history.get_jobs(limit=50)
@@ -75,6 +98,7 @@ class HistoryPanel(QWidget):
         # height its own content needs — under a larger system font the
         # default let it sit at its 36 px minimum and clip its button.
         header.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._header = header
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 0, 12, 0)
         hl.setSpacing(8)
