@@ -164,6 +164,9 @@ class OutputPanel(QWidget):
         self._filter_timer.timeout.connect(self._apply_filters)
 
         self.setObjectName("sidePanel")
+        # Density level; MainWindow re-derives it from the window height on
+        # every resize.  Comfortable until then.
+        self._density = self.DENSITY_COMFORTABLE
         self._build_ui()
         self._connect_signals()
         self._apply_settings()
@@ -305,6 +308,7 @@ class OutputPanel(QWidget):
         il = QVBoxLayout(inner)
         il.setContentsMargins(8, 8, 8, 8)
         il.setSpacing(6)
+        self._scroll_inner_layout = il
 
         il.addWidget(self._build_voice_section())
         il.addWidget(self._build_speed_section())
@@ -508,13 +512,21 @@ class OutputPanel(QWidget):
         Primary CTA + resume controls, pinned to the bottom of the sidebar.
 
         Kept outside the QScrollArea so that "Generate & Export MP3" stays
-        reachable at every window height, including the 780x520 minimum.
+        reachable at every window height, including the window minimum.
+
+        Everything below the CTA is *secondary*: it must never grow tall
+        enough to starve the scroll viewport above it.  The footer is what
+        the scroll area has to give way to, so a wrapping paragraph in here
+        costs three lines of voice/speed/export controls.  Both hints are
+        therefore single-line and elided, with the full text on the tooltip,
+        and both collapse entirely in compact mode (see set_compact).
         """
         footer = QWidget()
         footer.setObjectName("actionFooter")
         ly = QVBoxLayout(footer)
         ly.setContentsMargins(12, 10, 12, 10)
         ly.setSpacing(0)
+        self._footer_layout = ly
 
         # Generate button — always available when text exists.
         # "&&" renders as a literal ampersand; a single "&" would be swallowed
@@ -524,13 +536,16 @@ class OutputPanel(QWidget):
         self._generate_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._generate_btn.setEnabled(False)
         ly.addWidget(self._generate_btn)
-        ly.addSpacing(5)
 
-        # Hint shown when no text
-        self._generate_hint = QLabel("Type or paste text on the left to get started")
+        # Hint shown when no text.  Elided rather than wrapped: a second line
+        # here is a second line stolen from the controls above.
+        self._generate_hint = _ElidingLabel(
+            "Type or paste text on the left to get started", mode=Qt.ElideRight
+        )
         self._generate_hint.setObjectName("hintLabel")
         self._generate_hint.setAlignment(Qt.AlignCenter)
-        self._generate_hint.setWordWrap(True)
+        self._generate_hint.setToolTip("Type or paste text on the left to get started")
+        ly.addSpacing(5)
         ly.addWidget(self._generate_hint)
 
         ly.addSpacing(6)
@@ -539,13 +554,82 @@ class OutputPanel(QWidget):
         self._resume_job_btn.hide()
         ly.addWidget(self._resume_job_btn)
 
-        self._resume_job_hint = QLabel("")
+        self._resume_job_hint = _ElidingLabel("", mode=Qt.ElideRight)
         self._resume_job_hint.setObjectName("resumeHint")
-        self._resume_job_hint.setWordWrap(True)
         self._resume_job_hint.hide()
         ly.addWidget(self._resume_job_hint)
 
         return footer
+
+    # ── Height-aware density ──────────────────────────────────────────── #
+
+    #: Density levels, loosest first.  MainWindow picks one from the window
+    #: height; see DENSITY_* in app/ui/main_window.py for the thresholds.
+    DENSITY_COMFORTABLE = "comfortable"
+    DENSITY_COMPACT     = "compact"
+    DENSITY_MINIMAL     = "minimal"
+
+    _DENSITIES = (DENSITY_COMFORTABLE, DENSITY_COMPACT, DENSITY_MINIMAL)
+
+    def set_density(self, level: str) -> None:
+        """
+        Trade padding, then secondary chrome, for scroll-viewport height.
+
+        The sidebar is a scrollable column of controls above a pinned CTA, so
+        the viewport between them is what a short window takes its space from.
+        At full density that viewport held barely two controls and sliced the
+        voice card in half against the footer edge.
+
+        Space is given up in the order that costs the user least:
+
+        ``comfortable``  full padding, both explanatory hints shown.
+        ``compact``      tight control padding (app.qss ``[compact="true"]``),
+                         hints kept — roughly two more controls fit.
+        ``minimal``      also drops the two hints, whose text stays reachable
+                         as the tooltip of the widget each one explains.
+
+        The primary CTA keeps a large touch target at every level; it is the
+        one control that must stay easy to hit.
+        """
+        if level not in self._DENSITIES:
+            raise ValueError(f"unknown density level: {level!r}")
+        if getattr(self, "_density", None) == level:
+            return
+
+        previous     = getattr(self, "_density", None)
+        self._density = level
+        tight        = level != self.DENSITY_COMFORTABLE
+        show_hints   = level != self.DENSITY_MINIMAL
+
+        margin = 6 if tight else 10
+        self._footer_layout.setContentsMargins(12, margin, 12, margin)
+        self._scroll_inner_layout.setSpacing(4 if tight else 6)
+
+        self._generate_hint.setVisible(
+            show_hints and not self._generate_btn.isEnabled()
+        )
+        self._resume_job_hint.setVisible(
+            show_hints and bool(self._resume_job_hint.full_text())
+        )
+
+        # Tighter control padding — see the compact block in app.qss.  Skip
+        # the re-polish when only the hint visibility changed: it walks the
+        # whole subtree and runs on every resize that crosses a threshold.
+        was_tight = previous is not None and previous != self.DENSITY_COMFORTABLE
+        if previous is None or was_tight != tight:
+            # A property change only re-evaluates the stylesheet for widgets
+            # that are re-polished, and the rules target descendants, so the
+            # whole subtree has to be re-polished, not just this panel.
+            self.setProperty("compact", "true" if tight else "false")
+            style = self.style()
+            for widget in [self, *self.findChildren(QWidget)]:
+                style.unpolish(widget)
+                style.polish(widget)
+            self.updateGeometry()
+
+    @property
+    def density(self) -> str:
+        return self._density
 
     # ── Active jobs list ──────────────────────────────────────────────── #
 
@@ -619,7 +703,9 @@ class OutputPanel(QWidget):
         self._current_text = text
         has_text = bool(text.strip())
         self._generate_btn.setEnabled(has_text)
-        self._generate_hint.setVisible(not has_text)
+        self._generate_hint.setVisible(
+            not has_text and self._density != self.DENSITY_MINIMAL
+        )
         self._refresh_voice_guidance()
 
     # ------------------------------------------------------------------ #
@@ -1098,8 +1184,9 @@ class OutputPanel(QWidget):
 
         if not self._resume_candidates:
             self._resume_job_btn.hide()
+            self._resume_job_btn.setToolTip("")
             self._resume_job_hint.hide()
-            self._resume_job_hint.clear()
+            self._resume_job_hint.setText("")
             return
 
         latest = self._resume_candidates[0]
@@ -1109,12 +1196,17 @@ class OutputPanel(QWidget):
         self._resume_job_btn.setText(
             "Resume Saved Job" if count == 1 else f"Resume Saved Job ({count})"
         )
-        self._resume_job_hint.setText(
+        detail = (
             f"{count} resumable job(s) saved locally. Latest: {latest_name} — "
             f"{latest.completed_count} chunk(s) preserved, resume at chunk {resume_chunk}."
         )
+        self._resume_job_hint.setText(detail)
+        # The hint elides to one line and collapses in compact mode, so the
+        # full detail has to stay reachable from the button it belongs to.
+        self._resume_job_btn.setToolTip(detail)
+        self._resume_job_hint.setToolTip(detail)
         self._resume_job_btn.show()
-        self._resume_job_hint.show()
+        self._resume_job_hint.setVisible(self._density != self.DENSITY_MINIMAL)
 
     def _on_resume_saved_job(self) -> None:
         if not self._resume_candidates:
@@ -1200,9 +1292,23 @@ class OutputPanel(QWidget):
         row.cancel_requested.connect(self._queue.cancel)
         self._job_rows[item.id] = row
         self._jobs_list_layout.addWidget(row)
+        first_job = not self._jobs_card.isVisible()
         self._jobs_card.setVisible(True)
         self._update_jobs_header()
         self.status_message.emit(f"Queued: {item.filename}")
+
+        # ACTIVE JOBS sits at the bottom of the scrollable column, so on a
+        # short window it lands below the fold and the user watches a blank
+        # sidebar while their export runs.  Bring it into view for the first
+        # job of a batch.  Deferred: the card has just been shown, so its
+        # geometry is only valid after the pending layout pass.
+        if first_job:
+            QTimer.singleShot(0, self._scroll_to_jobs)
+
+    def _scroll_to_jobs(self) -> None:
+        """Scroll the sidebar so the ACTIVE JOBS card is visible."""
+        if self._jobs_card.isVisible():
+            self._scroll.ensureWidgetVisible(self._jobs_card, 0, 0)
 
     def _on_job_started(self, item: JobItem) -> None:
         if item.id in self._job_rows:
@@ -1605,11 +1711,21 @@ class _ElidingLabel(QLabel):
 
     A plain QLabel reports its full text width as a minimum, so one long
     filename can push the whole sidebar past its maximum width and clip.
+
+    ``mode`` picks where the ellipsis goes: the default middle elide keeps both
+    ends of a filename readable, while running prose should elide at the end
+    (a sentence cut in the middle reads as two fragments).
     """
 
-    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        text: str = "",
+        parent: QWidget | None = None,
+        mode: Qt.TextElideMode = Qt.ElideMiddle,
+    ) -> None:
         super().__init__(parent)
         self._full_text = text
+        self._elide_mode = mode
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.setMinimumWidth(40)
         self._apply_elide()
@@ -1628,7 +1744,7 @@ class _ElidingLabel(QLabel):
     def _apply_elide(self) -> None:
         metrics = QFontMetrics(self.font())
         super().setText(
-            metrics.elidedText(self._full_text, Qt.ElideMiddle, max(30, self.width()))
+            metrics.elidedText(self._full_text, self._elide_mode, max(30, self.width()))
         )
 
 

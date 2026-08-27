@@ -111,8 +111,8 @@ build_windows.bat
 Push a version tag to trigger automated builds for both platforms:
 
 ```bash
-git tag v1.5.7
-git push origin v1.5.7
+git tag v1.5.8
+git push origin v1.5.8
 ```
 
 The workflow (`.github/workflows/build.yml`) will:

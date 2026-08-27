@@ -136,7 +136,7 @@ pip install pyinstaller
 ### Trigger automated release (both platforms via GitHub Actions)
 
 ```bash
-git tag v1.5.7 && git push origin v1.5.7
+git tag v1.5.8 && git push origin v1.5.8
 ```
 
 GitHub Actions builds both macOS and Windows packages and publishes them as a GitHub Release with four artifacts attached:

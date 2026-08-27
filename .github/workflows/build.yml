@@ -311,6 +311,15 @@ jobs:
 
             ### What's new in v${{ steps.ver.outputs.version }}
 
+            #### Responsive layout — the window works at every size
+            - **The sidebar no longer collapses on a short window.** Its pinned footer could grow without bound, leaving barely 160 px of scrollable controls above it: the voice picker was sliced in half against the CTA, and speed, export and the running-job list all sat below the fold. The footer is now bounded and the viewport never drops below three controls.
+            - **Control density adapts to window height.** Padding is given up first, then the two explanatory hints (whose text moves to the tooltip of the control they explain) — so a short window loses chrome, never controls.
+            - **Recent Conversions scales with the window** instead of holding a fixed height that swallowed a quarter of a small window. Dragging the split pins your own height, clamped so the editor always keeps the majority.
+            - **Active jobs scroll into view** when an export starts, instead of the sidebar looking idle while it runs.
+            - **Smaller minimum window** — 720x480, down from 780x520, verified to render without clipping.
+            - **Long filenames, long resume prompts and voice warnings** now elide instead of widening or clipping the sidebar.
+            - Backed by 90 new layout regression tests covering 13 window sizes from 720x480 to 3840x2160, each with the sidebar at its fullest.
+
             #### Long-form truncation hardening
             - **Stricter coverage verification** — final assembly now rejects gaps, overlaps, duplicate manifest records, missing chunk files, byte-count mismatches, source text hash mismatches, and invalid recovery sub-ranges.
             - **Safer resume after crashes or corruption** — SetupTTS only resumes from the first contiguous, verified source range and drops any later chunk records after a missing, corrupt, or non-contiguous range.

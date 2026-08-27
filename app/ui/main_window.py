@@ -13,10 +13,21 @@ Layout
   │  drag & drop                     │                         │
   │                                  │  [Generate & Export MP3]│
   ├──────────────────────────────────┴─────────────────────────┤
-  │  RECENT CONVERSIONS  (collapsible, 140 px default)         │
+  │  RECENT CONVERSIONS  (collapsible, ~20 % of window height)  │
   ├────────────────────────────────────────────────────────────┤
   │  status bar (24 px)                                        │
   └────────────────────────────────────────────────────────────┘
+
+Responsive behaviour
+--------------------
+Both splits are re-derived from the window size on every resize
+(_apply_responsive_layout), and the sidebar's control density steps down as
+the window gets shorter (OutputPanel.set_density).  Without this the sidebar
+kept a fixed footprint: at short heights its scroll viewport collapsed to
+~160 px, slicing the voice card against the pinned CTA and hiding the speed,
+export and running-job controls below the fold.  A drag of either splitter
+pins that dimension to the user's choice, clamped so it can never starve the
+other side.
 
 Shutdown lifecycle
 ------------------
@@ -60,10 +71,32 @@ from app import APP_NAME, APP_VERSION
 
 logger = logging.getLogger(__name__)
 
+# Verified floor: the whole layout renders without clipping at this size and
+# the sidebar still shows the voice card above the pinned CTA.  Kept low so the
+# window fits alongside other windows on a small laptop display.
+_MIN_WINDOW_SIZE = (720, 480)
+
 _RIGHT_PANEL_MIN = 310
 _RIGHT_PANEL_MAX = 400
 _RIGHT_PANEL_DEFAULT = 340
 _INPUT_PANEL_MIN = 320
+
+# History strip: a fixed height is wrong at both extremes — it swallows a
+# quarter of a short window and looks stranded on a tall one.  It is sized as
+# a fraction of the window instead, clamped so the header plus one row always
+# fit and it never dominates.
+_HISTORY_MIN     = 88
+_HISTORY_MAX     = 240
+_HISTORY_FRACTION = 0.20
+
+# The editor + controls row never drops below this share of the split, however
+# tall the history strip below it is asked to be.
+_MAIN_ROW_MIN_FRACTION = 0.55
+
+# Sidebar density thresholds (window height, px).  Padding is given up first
+# and only then the explanatory hints — see OutputPanel.set_density.
+_DENSITY_COMPACT_BELOW = 760
+_DENSITY_MINIMAL_BELOW = 640
 
 
 def _make_app_icon() -> QIcon:
@@ -100,10 +133,12 @@ class MainWindow(QMainWindow):
         self._closing  = False   # guard against re-entrant closeEvent
         self._workers_stopped = False   # guard against double shutdown
         self._sidebar_user_sized = False  # True once the splitter is dragged
+        self._history_user_sized = False  # True once the history split is dragged
+        self._history_user_height = 0     # the height they dragged it to
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(_make_app_icon())
-        self.setMinimumSize(780, 520)
+        self.setMinimumSize(*_MIN_WINDOW_SIZE)
         self._restore_geometry()
 
         self._build_menu()
@@ -203,6 +238,7 @@ class MainWindow(QMainWindow):
         self._h_splitter.setStretchFactor(1, 0)
         self._h_splitter.splitterMoved.connect(self._on_sidebar_resized)
 
+        self._v_splitter.splitterMoved.connect(self._on_history_resized)
         self._v_splitter.addWidget(self._h_splitter)
 
         # History panel (wrapped for padding)
@@ -271,13 +307,21 @@ class MainWindow(QMainWindow):
 
     def _apply_responsive_layout(self) -> None:
         """
-        Keep the control sidebar proportional to the window.
+        Keep the layout proportional to the window in both axes.
 
-        At the 780 px minimum width a fixed 400 px sidebar swallows more than
+        Width — at the minimum width a fixed 400 px sidebar swallows more than
         half the window and squeezes the editor, so the sidebar is capped at
         ~40 % of the window.  Once the user drags the splitter their width is
         preserved and only clamped to that cap — otherwise the sidebar tracks
         the preferred width, growing back when the window is widened again.
+
+        Height — the sidebar's pinned footer is subtracted from the scrollable
+        controls above it, and the history strip is subtracted from both.  A
+        fixed history height plus a full-size footer left barely 160 px of
+        scroll viewport on a short window, which sliced the voice card in half
+        and pushed speed, export and the running-job list below the fold.  The
+        history strip is therefore sized as a fraction of the window and the
+        sidebar drops its optional hints once the window is short.
         """
         panel = getattr(self, "_output_panel", None)
         if panel is None:
@@ -287,6 +331,9 @@ class MainWindow(QMainWindow):
         target  = max(_RIGHT_PANEL_MIN, min(_RIGHT_PANEL_MAX, allowed))
         if panel.maximumWidth() != target:
             panel.setMaximumWidth(target)
+
+        panel.set_density(self._density_for_height(self.height()))
+        self._apply_responsive_history()
 
         sizes = self._h_splitter.sizes()
         if len(sizes) != 2 or sum(sizes) <= 0:
@@ -302,9 +349,61 @@ class MainWindow(QMainWindow):
         if [left, right] != sizes:
             self._h_splitter.setSizes([left, right])
 
+    @staticmethod
+    def _density_for_height(height: int) -> str:
+        if height < _DENSITY_MINIMAL_BELOW:
+            return OutputPanel.DENSITY_MINIMAL
+        if height < _DENSITY_COMPACT_BELOW:
+            return OutputPanel.DENSITY_COMPACT
+        return OutputPanel.DENSITY_COMFORTABLE
+
+    def _apply_responsive_history(self) -> None:
+        """Size the history strip as a fraction of the window height."""
+        # The sidebar is constructed before the history strip, so a resize
+        # delivered between the two would land here with no strip to size.
+        history = getattr(self, "_history_panel", None)
+        if history is None or not history.isVisible():
+            return
+
+        sizes = self._v_splitter.sizes()
+        if len(sizes) != 2 or sum(sizes) <= 0:
+            return
+
+        total = sum(sizes)
+
+        if self._history_user_sized:
+            # Respect the height the user dragged to.  Clamping it to the
+            # automatic target would mean the strip could never be dragged
+            # taller than its default, which is the whole point of the drag;
+            # reading it back from sizes() would let QSplitter's proportional
+            # redistribution walk it a little further on every resize.
+            bottom = max(_HISTORY_MIN, self._history_user_height)
+        else:
+            bottom = max(_HISTORY_MIN,
+                         min(_HISTORY_MAX, int(self.height() * _HISTORY_FRACTION)))
+
+        # The editor and controls are the main event: they keep the majority of
+        # the window whatever the strip below asks for.  This is also what
+        # claws back a height the user dragged to on a window that has since
+        # been made much shorter.
+        main_min = max(self._h_splitter.minimumSizeHint().height(),
+                       int(total * _MAIN_ROW_MIN_FRACTION))
+        top = max(main_min, total - bottom)
+        bottom = max(0, total - top)
+        if [top, bottom] != sizes:
+            self._v_splitter.setSizes([top, bottom])
+
     def _on_sidebar_resized(self, *_args) -> None:
         """The user dragged the horizontal splitter — stop auto-sizing."""
         self._sidebar_user_sized = True
+
+    def _on_history_resized(self, *_args) -> None:
+        """The user dragged the vertical splitter — stop auto-sizing."""
+        sizes = self._v_splitter.sizes()
+        if len(sizes) != 2 or sizes[1] <= 0:
+            return
+        self._history_user_sized  = True
+        self._history_user_height = sizes[1]
 
     # ------------------------------------------------------------------ #
     # Signals                                                              #
@@ -338,6 +437,10 @@ class MainWindow(QMainWindow):
         widget = self._v_splitter.widget(1)
         if widget:
             widget.setVisible(visible)
+        if visible:
+            # Re-derive the strip's share of the window; it was excluded from
+            # responsive sizing while hidden.
+            self._apply_responsive_history()
 
     # ------------------------------------------------------------------ #
     # Geometry persistence                                                 #

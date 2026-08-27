@@ -10,7 +10,15 @@ Each test here pins a defect that shipped in a previous release:
 * the CTA label lost its ampersand to Qt's mnemonic handling;
 * the sidebar was pinned to a fixed width regardless of window size;
 * the history panel height was persisted as 0 whenever the panel was hidden;
-* saved window geometry was restored without checking it lands on a screen.
+* saved window geometry was restored without checking it lands on a screen;
+* the sidebar's pinned footer grew without bound — a wrapping resume hint and
+  a wrapping CTA hint left ~160 px of scroll viewport on a short window, which
+  sliced the voice card in half and pushed speed, export and the running-job
+  list below the fold;
+* the history strip kept a fixed height, swallowing a quarter of a short
+  window;
+* the ACTIVE JOBS card sat below the fold while jobs ran, so the sidebar
+  looked idle during an export.
 """
 
 import os
@@ -22,6 +30,7 @@ from PySide6.QtWidgets import QScrollArea, QWidget
 
 from app.config.settings import AppSettings
 from app.models.voice import Voice
+from app.ui.main_window import _MAIN_ROW_MIN_FRACTION
 from app.utils.paths import AppPaths, resource_path
 
 
@@ -330,3 +339,393 @@ def test_settings_dialog_elides_long_paths(styled_app, app_paths, qtbot):
     full = str(app_paths.data_dir)
     assert label.toolTip() == full
     assert label.sizeHint().width() <= dialog.width()
+
+
+# ------------------------------------------------------------------ #
+# Responsive density                                                   #
+# ------------------------------------------------------------------ #
+
+# The sizes a real user actually lands on: the window minimum, small laptops,
+# common desktops, and the extremes in both axes.
+WINDOW_SIZES = [
+    (720, 480), (780, 520), (800, 560), (900, 620), (1000, 700),
+    (1100, 660), (1280, 800), (1440, 900), (1920, 1080), (2560, 1440),
+    (3840, 2160), (780, 1400), (2400, 600),
+]
+
+
+def _density_of(window, height):
+    from app.ui.main_window import MainWindow
+    return MainWindow._density_for_height(height)
+
+
+def test_density_steps_down_as_the_window_shortens(window, styled_app):
+    """
+    Padding is given up before content.  A short window drops control padding
+    first (compact) and only then the explanatory hints (minimal), so the user
+    never loses the hints while there is still padding to reclaim.
+    """
+    from app.ui.panels.output_panel import OutputPanel
+
+    panel = window._output_panel
+    seen = {}
+    for height in (1000, 800, 700, 600, 540):
+        window.resize(1100, height)
+        styled_app.processEvents()
+        seen[height] = panel.density
+
+    assert seen[1000] == OutputPanel.DENSITY_COMFORTABLE
+    assert seen[800] == OutputPanel.DENSITY_COMFORTABLE
+    assert seen[700] == OutputPanel.DENSITY_COMPACT
+    assert seen[600] == OutputPanel.DENSITY_MINIMAL
+    assert seen[540] == OutputPanel.DENSITY_MINIMAL
+
+
+def test_density_is_a_pure_function_of_height(window, styled_app):
+    """Growing back to a size must restore exactly the density it had there —
+    otherwise the sidebar stays compacted after the window is re-maximised."""
+    panel = window._output_panel
+    window.resize(1100, 900)
+    styled_app.processEvents()
+    tall = panel.density
+
+    window.resize(1100, 520)
+    styled_app.processEvents()
+    window.resize(1100, 900)
+    styled_app.processEvents()
+
+    assert panel.density == tall
+
+
+def test_hints_collapse_only_at_minimal_density(window, styled_app):
+    panel = window._output_panel
+    window.resize(1100, 900)
+    styled_app.processEvents()
+    assert panel._generate_hint.isVisible()
+
+    window.resize(1100, 560)
+    styled_app.processEvents()
+    assert not panel._generate_hint.isVisible()
+
+    window.resize(1100, 900)
+    styled_app.processEvents()
+    assert panel._generate_hint.isVisible()
+
+
+def test_collapsed_hint_text_survives_on_the_tooltip(window, styled_app):
+    """Hiding a hint must not destroy the information it carried."""
+    panel = window._output_panel
+    window.resize(1100, 560)
+    styled_app.processEvents()
+
+    assert not panel._generate_hint.isVisible()
+    assert "Type or paste text" in panel._generate_hint.toolTip()
+
+
+def test_set_density_rejects_an_unknown_level(window):
+    with pytest.raises(ValueError):
+        window._output_panel.set_density("enormous")
+
+
+# ------------------------------------------------------------------ #
+# Sidebar scroll viewport                                              #
+# ------------------------------------------------------------------ #
+
+def _sidebar_viewport_height(window):
+    return window._output_panel._scroll.viewport().height()
+
+
+@pytest.mark.parametrize("width,height", WINDOW_SIZES)
+def test_sidebar_viewport_is_never_a_sliver(window, styled_app, width, height):
+    """
+    The pinned footer is subtracted from the scrollable controls above it.
+    When the footer was free to grow it left ~160 px of viewport, which is
+    less than three controls; the voice card was cut in half by the footer
+    edge.  Two full-density controls plus their card padding is the floor.
+    """
+    window.resize(width, height)
+    styled_app.processEvents()
+    assert _sidebar_viewport_height(window) >= 180
+
+
+@pytest.mark.parametrize("width,height", WINDOW_SIZES)
+def test_whole_voice_card_fits_above_the_fold(window, styled_app, width, height):
+    """The voice picker is the first thing a user touches; it must never be
+    sliced against the footer edge."""
+    window.resize(width, height)
+    styled_app.processEvents()
+
+    panel = window._output_panel
+    card = panel._voice_combo.parentWidget()
+    assert card.height() <= _sidebar_viewport_height(window), (
+        f"voice card ({card.height()} px) exceeds the sidebar viewport "
+        f"({_sidebar_viewport_height(window)} px) at {width}x{height}"
+    )
+
+
+@pytest.mark.parametrize("width,height", WINDOW_SIZES)
+def test_everything_in_the_sidebar_stays_reachable_by_scrolling(
+    window, styled_app, width, height
+):
+    """Content may sit below the fold, but the scroll range must reach it."""
+    window.resize(width, height)
+    styled_app.processEvents()
+
+    scroll = window._output_panel._scroll
+    overflow = scroll.widget().sizeHint().height() - scroll.viewport().height()
+    assert scroll.verticalScrollBar().maximum() >= min(0, overflow) or overflow <= 0
+    if overflow > 0:
+        assert scroll.verticalScrollBar().maximum() > 0
+
+
+# ------------------------------------------------------------------ #
+# Responsive history strip                                             #
+# ------------------------------------------------------------------ #
+
+def test_history_strip_scales_with_window_height(window, styled_app):
+    """A fixed strip swallowed a quarter of a short window and looked
+    stranded on a tall one."""
+    heights = {}
+    for height in (520, 660, 900, 1400):
+        window.resize(1100, height)
+        styled_app.processEvents()
+        heights[height] = window._v_splitter.sizes()[-1]
+
+    assert heights[520] < heights[900]
+    assert heights[900] <= heights[1400]
+    for height, strip in heights.items():
+        assert strip >= 88, f"history strip unusable at window height {height}"
+        assert strip <= height * 0.25, f"history strip dominates at {height}"
+
+
+def test_dragging_the_history_split_pins_it(window, styled_app):
+    window.resize(1100, 900)
+    styled_app.processEvents()
+
+    total = sum(window._v_splitter.sizes())
+    window._v_splitter.setSizes([total - 200, 200])   # simulate the drag…
+    window._on_history_resized()                      # …and the signal it emits
+    styled_app.processEvents()
+
+    window.resize(1100, 940)              # a resize must not undo the choice
+    styled_app.processEvents()
+    assert window._v_splitter.sizes()[-1] == pytest.approx(200, abs=8)
+
+
+def test_pinned_history_is_still_clamped_on_a_short_window(window, styled_app):
+    """A user-chosen height is honoured, but the editor and controls keep the
+    majority of the window once it is made much shorter."""
+    window.resize(1100, 1200)
+    styled_app.processEvents()
+    total = sum(window._v_splitter.sizes())
+    window._v_splitter.setSizes([total - 300, 300])
+    window._on_history_resized()
+    styled_app.processEvents()
+    assert window._v_splitter.sizes()[-1] == pytest.approx(300, abs=8)
+
+    window.resize(1100, 520)
+    styled_app.processEvents()
+    main_row, strip = window._v_splitter.sizes()
+    assert main_row > strip
+    assert main_row >= (main_row + strip) * _MAIN_ROW_MIN_FRACTION - 1
+
+
+# ------------------------------------------------------------------ #
+# Active jobs visibility                                               #
+# ------------------------------------------------------------------ #
+
+def _submit_fake_job(panel, index=0):
+    from app.workers.job_queue import JobItem
+
+    item = JobItem(
+        text="hello " * 50,
+        voice="en-US-AvaNeural",
+        voice_display="Ava · English (US)",
+        rate="+5%",
+        volume="+0%",
+        output_path=f"/tmp/chapter-{index}.mp3",
+        id=f"job{index}",
+    )
+    panel._on_job_submitted(item)
+    return item
+
+
+def test_first_job_scrolls_the_active_jobs_card_into_view(window, styled_app):
+    """
+    ACTIVE JOBS is the last card in the scrollable column, so on a short
+    window it lands below the fold and the sidebar looks idle while the
+    export runs.
+    """
+    window.resize(1100, 660)
+    styled_app.processEvents()
+    panel = window._output_panel
+
+    _submit_fake_job(panel)
+    panel._scroll_to_jobs()               # the deferred call, run synchronously
+    styled_app.processEvents()
+
+    visible = panel._jobs_card.visibleRegion().boundingRect()
+    assert visible.height() > 20, "ACTIVE JOBS card is not on screen"
+
+
+def test_a_long_job_filename_does_not_widen_the_sidebar(window, styled_app):
+    window.resize(1100, 800)
+    styled_app.processEvents()
+    panel = window._output_panel
+    before = panel.width()
+
+    from app.workers.job_queue import JobItem
+    panel._on_job_submitted(JobItem(
+        text="x", voice="en-US-AvaNeural", voice_display="Ava · English (US)",
+        rate="+5%", volume="+0%", id="longjob",
+        output_path="/tmp/" + "an-extremely-long-audiobook-chapter-filename" * 4 + ".mp3",
+    ))
+    styled_app.processEvents()
+
+    assert panel.width() == before
+
+
+# ------------------------------------------------------------------ #
+# Nothing is clipped, at any size                                      #
+# ------------------------------------------------------------------ #
+
+def _clipping_problems(root):
+    """Widgets whose text or geometry does not fit the space they are given.
+
+    Descendants of a scroll area are exempt: extending past the viewport is
+    what a scroll area is for.
+    """
+    from PySide6.QtGui import QFontMetrics
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QAbstractScrollArea, QLabel, QPushButton
+
+    problems = []
+    bounds = root.rect()
+    for w in root.findChildren(QWidget):
+        if not w.isVisible():
+            continue
+
+        if isinstance(w, QPushButton) and w.text():
+            hint = w.sizeHint()
+            if w.width() < hint.width() or w.height() < hint.height():
+                problems.append(
+                    f"clipped button {w.text()!r}: "
+                    f"{w.width()}x{w.height()} < {hint.width()}x{hint.height()}"
+                )
+        elif (
+            isinstance(w, QLabel)
+            and w.text()
+            and not w.wordWrap()
+            and type(w).__name__ != "_ElidingLabel"
+            and w.textFormat() != Qt.RichText
+        ):
+            need = QFontMetrics(w.font()).horizontalAdvance(w.text())
+            if w.width() < need:
+                problems.append(
+                    f"clipped label {w.text()[:30]!r}: {w.width()} < {need}"
+                )
+
+        rect = w.rect().translated(w.mapTo(root, QPoint(0, 0)))
+        if rect.isEmpty():
+            continue
+        parent, in_scroll = w.parentWidget(), False
+        while parent is not None:
+            if isinstance(parent, QAbstractScrollArea):
+                in_scroll = True
+                break
+            parent = parent.parentWidget()
+        if in_scroll:
+            continue
+        if (
+            rect.right() > bounds.right() + 1
+            or rect.bottom() > bounds.bottom() + 1
+            or rect.left() < -1
+            or rect.top() < -1
+        ):
+            problems.append(
+                f"{w.metaObject().className()}#{w.objectName()} escapes the "
+                f"window: {rect.x()},{rect.y()} {rect.width()}x{rect.height()}"
+            )
+    return problems
+
+
+@pytest.mark.parametrize("width,height", WINDOW_SIZES)
+def test_nothing_is_clipped_at_any_window_size(window, styled_app, width, height):
+    window.resize(width, height)
+    styled_app.processEvents()
+    assert _clipping_problems(window) == []
+
+
+@pytest.mark.parametrize("width,height", WINDOW_SIZES)
+def test_nothing_is_clipped_with_the_sidebar_at_its_fullest(
+    window, styled_app, width, height
+):
+    """Warning banner, resume prompt and three running jobs all at once —
+    every optional row in the sidebar visible simultaneously."""
+    panel = window._output_panel
+    panel._voice_warning_label.setText(
+        "This voice is tuned for English but the text looks like Japanese. "
+        "Generation may mispronounce large parts of the document."
+    )
+    panel._voice_warning.show()
+    panel._resume_job_btn.show()
+    panel._resume_job_hint.setText(
+        "1 resumable job(s) saved locally. Latest: a-long-audiobook-name.mp3 "
+        "— 412 chunk(s) preserved, resume at chunk 413."
+    )
+    panel._resume_job_hint.setVisible(
+        panel.density != panel.DENSITY_MINIMAL
+    )
+    for i in range(3):
+        _submit_fake_job(panel, i)
+
+    window.set_input_text("Some text to convert. " * 200)
+    window.resize(width, height)
+    styled_app.processEvents()
+
+    assert _clipping_problems(window) == []
+
+
+@pytest.mark.parametrize("width,height", WINDOW_SIZES)
+def test_the_editor_keeps_a_usable_width(window, styled_app, width, height):
+    window.resize(width, height)
+    styled_app.processEvents()
+    assert window._input_panel._editor.width() >= 280
+
+
+def test_repeated_resizes_do_not_drift(window, styled_app):
+    """The same window size must always produce the same layout, however it
+    was reached — otherwise the sidebar creeps on every resize."""
+    def snapshot():
+        return (
+            window._output_panel.width(),
+            window._input_panel.width(),
+            window._v_splitter.sizes(),
+            window._output_panel.density,
+            _sidebar_viewport_height(window),
+        )
+
+    window.resize(1100, 660)
+    styled_app.processEvents()
+    first = snapshot()
+
+    for size in [(1920, 1080), (780, 520), (2560, 1440), (900, 600)]:
+        window.resize(*size)
+        styled_app.processEvents()
+    window.resize(1100, 660)
+    styled_app.processEvents()
+
+    assert snapshot() == first
+
+
+def test_the_window_minimum_is_actually_renderable(window, styled_app):
+    """setMinimumSize is a promise: the layout must hold at that size."""
+    from app.ui.main_window import _MIN_WINDOW_SIZE
+
+    assert window.minimumSize().width() == _MIN_WINDOW_SIZE[0]
+    assert window.minimumSize().height() == _MIN_WINDOW_SIZE[1]
+
+    window.resize(*_MIN_WINDOW_SIZE)
+    styled_app.processEvents()
+    assert _clipping_problems(window) == []
+    assert window._output_panel._generate_btn.visibleRegion().boundingRect().height() > 20

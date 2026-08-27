@@ -894,3 +894,43 @@ QWidget#dialogButtonBar {
     background-color: #161618;
     border-top: 1px solid #2C2C30;
 }
+
+/* ============================================================
+   Compact sidebar — short windows
+   ------------------------------------------------------------
+   The sidebar is a fixed column of controls above a pinned CTA.
+   On a short window the scroll viewport between them collapses,
+   so the full-density controls (48 px tall once padding and
+   border are counted) leave room for barely two of them and the
+   voice card is sliced in half by the footer edge.
+
+   MainWindow.set_compact() flips the `compact` property below
+   _COMPACT_HEIGHT and re-polishes the panel, trading padding for
+   roughly two extra visible controls.  The CTA keeps a large
+   touch target — it is the one control that must stay easy to
+   hit — and only gives up its outer padding.
+   ============================================================ */
+
+QWidget#sidePanel[compact="true"] QLineEdit,
+QWidget#sidePanel[compact="true"] QComboBox {
+    min-height: 24px;
+    padding: 4px 10px;
+    font-size: 12px;
+}
+
+QWidget#sidePanel[compact="true"] QPushButton {
+    min-height: 24px;
+    padding: 4px 12px;
+}
+
+QWidget#sidePanel[compact="true"] QPushButton#previewButton {
+    min-height: 24px;
+    padding: 4px 12px;
+}
+
+QWidget#sidePanel[compact="true"] QPushButton#generateButton {
+    min-height: 38px;
+    padding: 6px 16px;
+    font-size: 14px;
+    border-radius: 10px;
+}
