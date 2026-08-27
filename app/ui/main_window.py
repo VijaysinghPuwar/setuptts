@@ -146,7 +146,7 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
         self._connect_signals()
 
-        self._sync_window_minimum()
+        self._sync_window_minimum(_INPUT_PANEL_MIN, _RIGHT_PANEL_MIN)
 
         self.status_bar.showMessage("Ready")
         logger.info("MainWindow shown")
@@ -213,7 +213,8 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        root_layout.addWidget(self._build_header())
+        self._header_bar = self._build_header()
+        root_layout.addWidget(self._header_bar)
 
         # ── Vertical splitter: [main row] ╱ [history] ─────────────── #
         self._v_splitter = QSplitter(Qt.Vertical)
@@ -374,25 +375,50 @@ class MainWindow(QMainWindow):
         if [left, right] != sizes:
             self._h_splitter.setSizes([left, right])
 
-        self._sync_window_minimum()
+        self._sync_window_minimum(editor_min, sidebar_min)
 
-    def _sync_window_minimum(self) -> None:
+    def _sync_window_minimum(self, editor_min: int, sidebar_min: int) -> None:
         """
         Keep the window's minimum at least as large as the layout needs.
 
         An explicit minimum overrides the layout's own minimumSizeHint, so the
         constant alone promises a size the layout cannot render once the system
         font is larger than we assumed — and a window allowed below what the
-        layout needs pushes the editor off the right-hand edge.  The panels'
-        minimums are themselves derived from their content, so this has to be
-        re-derived whenever they change, not only at construction.
+        two panels need pushes the sidebar off the right-hand edge.
+
+        The widths are passed in rather than read back from minimumSizeHint:
+        the panel minimums are themselves derived from their content during
+        layout, and a QSplitter does not propagate its children's minimums up
+        to the window in time to be useful here.
 
         Never goes below _MIN_WINDOW_SIZE, and is skipped when unchanged, so
         the resize it can trigger settles on the next pass.
         """
-        needed = self.minimumSizeHint()
-        floor_w = max(_MIN_WINDOW_SIZE[0], needed.width())
-        floor_h = max(_MIN_WINDOW_SIZE[1], needed.height())
+        # Chrome around the splitters.  Taken from the widgets themselves
+        # rather than by subtracting the splitter's width from the window's:
+        # during early layout the splitter has not been given its geometry
+        # yet, and that subtraction then reports a chrome of a hundred-odd
+        # pixels and latches an inflated minimum that nothing recomputes.
+        #
+        # Horizontally there is no chrome — the central widget spans the
+        # window and its layout has no margins.
+        chrome_h = (
+            self._header_bar.sizeHint().height()
+            + self.menuBar().sizeHint().height()
+            + self.statusBar().sizeHint().height()
+        )
+
+        floor_w = max(
+            _MIN_WINDOW_SIZE[0],
+            editor_min + sidebar_min + self._h_splitter.handleWidth(),
+        )
+        floor_h = max(
+            _MIN_WINDOW_SIZE[1],
+            self._output_panel.minimumSizeHint().height()
+            + self._history_panel.minimumSizeHint().height()
+            + self._v_splitter.handleWidth()
+            + chrome_h,
+        )
         if (self.minimumWidth(), self.minimumHeight()) != (floor_w, floor_h):
             self.setMinimumSize(floor_w, floor_h)
 

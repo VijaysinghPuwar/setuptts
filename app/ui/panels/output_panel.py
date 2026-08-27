@@ -1734,9 +1734,12 @@ class _AdaptiveLabelButton(QPushButton):
     def __init__(self, labels: list[str], parent: QWidget | None = None) -> None:
         super().__init__(labels[0], parent)
         self._labels = list(labels)
-        # Ignored, not Expanding: the button fills the width it is given but
-        # never reports a text-driven minimum that would widen the sidebar.
-        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        # Preferred, not Ignored: Ignored makes Qt discard minimumSizeHint too,
+        # so the sidebar never learned that even the shortest label needs more
+        # width than it was giving, and the button clipped instead of the
+        # sidebar widening.  The honest floor is reported by minimumSizeHint
+        # below — the shortest label — while sizeHint tracks the current one.
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
     def set_labels(self, labels: list[str]) -> None:
         """Replace the label set, then re-choose from it."""
@@ -1762,6 +1765,24 @@ class _AdaptiveLabelButton(QPushButton):
                 break
         if self.text() != chosen:
             self.setText(chosen)
+
+    def minimumSizeHint(self):  # type: ignore[override]
+        """
+        The width below which even the shortest label would be cut off.
+
+        Reporting this — rather than the current label's width — lets the
+        sidebar widen just enough to render the button, without the longest
+        label pinning the sidebar wide whenever there is text to spare.
+        """
+        hint = super().minimumSizeHint()
+        hint.setWidth(max(hint.width(), self._width_for(self._labels[-1])))
+        return hint
+
+    def _width_for(self, label: str) -> int:
+        metrics = QFontMetrics(self.font())
+        drawn   = self.text().replace("&&", "&")
+        chrome  = max(0, self.sizeHint().width() - metrics.horizontalAdvance(drawn))
+        return metrics.horizontalAdvance(label.replace("&&", "&")) + chrome
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)

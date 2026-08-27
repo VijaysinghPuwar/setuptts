@@ -863,10 +863,26 @@ def test_toolbars_grow_with_their_content_rather_than_clipping_it(
 
 
 @pytest.mark.parametrize("scaled_window", FONT_SCALES, indirect=True)
-def test_the_window_minimum_grows_with_the_font(scaled_window):
-    """An explicit minimum overrides the layout's own minimumSizeHint, so it
-    must not promise a size the layout cannot actually render."""
-    minimum = scaled_window.minimumSize()
-    hint = scaled_window.minimumSizeHint()
-    assert minimum.width() >= hint.width()
-    assert minimum.height() >= hint.height()
+def test_the_window_minimum_grows_with_the_font(scaled_window, qapp):
+    """
+    An explicit minimum overrides the layout's own minimumSizeHint, so it must
+    not promise a size the layout cannot actually render.
+
+    Asserted on that property directly rather than against minimumSizeHint:
+    a QSplitter does not propagate its children's minimums up to the window,
+    so the hint is not a usable proxy here — which is exactly the trap the
+    first version of this fell into.
+    """
+    window = scaled_window
+    # The floor is re-derived from the panels during layout, so shrinking to
+    # it can raise it; repeat until it settles.
+    for _ in range(4):
+        before = window.minimumSize()
+        window.resize(before)
+        qapp.processEvents()
+        if window.minimumSize() == before:
+            break
+
+    assert window.width() >= window.minimumWidth()
+    assert window.height() >= window.minimumHeight()
+    assert _clipping_problems(window) == []
