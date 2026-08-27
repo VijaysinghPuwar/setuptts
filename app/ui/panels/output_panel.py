@@ -239,9 +239,11 @@ class OutputPanel(QWidget):
             # without tracking which signals were wired up — so the warning is
             # suppressed rather than left to spam the log on every shutdown.
             with warnings.catch_warnings():
+                # PySide6 6.11 prefixes this with "libpyside: ", so match
+                # anywhere in the message rather than anchoring at the start.
                 warnings.filterwarnings(
                     "ignore",
-                    message="Failed to disconnect .*",
+                    message=".*Failed to disconnect.*",
                     category=RuntimeWarning,
                 )
                 for sig_name in ("loaded", "failed", "started_playing",

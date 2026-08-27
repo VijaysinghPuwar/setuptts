@@ -25,6 +25,11 @@ from app.models.voice import Voice
 from app.utils.paths import AppPaths, resource_path
 
 
+# These tests drive real widgets and need pytest-qt's qapp/qtbot fixtures.
+# Skip cleanly rather than erroring if it is unavailable, so a missing test
+# dependency degrades to "not run" instead of breaking the release build.
+pytest.importorskip("pytestqt", reason="pytest-qt is required for UI layout tests")
+
 pytestmark = pytest.mark.usefixtures("qapp")
 
 
