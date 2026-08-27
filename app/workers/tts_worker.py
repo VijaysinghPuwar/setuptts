@@ -22,6 +22,7 @@ import logging
 import math
 import re
 import sys
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -52,6 +53,11 @@ from app.workers.chunk_store import (
 logger = logging.getLogger(__name__)
 
 # ── Chunk sizing ──────────────────────────────────────────────────────────── #
+# Measured against the live service: 48 kbps mono MP3 works out to roughly
+# 350 bytes of audio per character of narration (~1,020 chars per minute).
+_BYTES_PER_CHAR_ESTIMATE = 350
+_DISK_SAFETY_FACTOR = 1.15
+
 _MEDIUM_JOB_THRESHOLD = 12_000
 _LONG_JOB_THRESHOLD = 45_000
 _XL_JOB_THRESHOLD = 90_000
@@ -963,6 +969,7 @@ class TTSWorker(QThread):
 
         # ── Set up chunk staging (checkpoint / resume) ─────────────────── #
         staging_root = AppPaths().staging_dir
+        self._check_free_space(staging_root, total_chars, Path(self._output_path))
         # Clean up orphaned staging dirs from previous sessions in the background.
         try:
             cleanup_stale_staging(staging_root, max_age_days=7)
@@ -1410,6 +1417,45 @@ class TTSWorker(QThread):
         )
         self.status_changed.emit("Done")
         self.progress.emit(100)
+
+    # ------------------------------------------------------------------ #
+    # Disk space pre-flight                                                #
+    # ------------------------------------------------------------------ #
+
+    def _check_free_space(self, staging_root: Path, total_chars: int, output_path: Path) -> None:
+        """
+        Refuse to start a job that cannot possibly fit on disk.
+
+        A 12-hour audiobook is roughly 260 MB of 48 kbps mono MP3, and chunks
+        are staged before being concatenated, so peak usage is about twice the
+        finished file. Discovering that ten hours in — as a raw ENOSPC from a
+        chunk write — wastes the entire render, so check up front instead.
+
+        Only a genuine shortfall raises; anything unexpected about the check
+        itself is logged and ignored rather than blocking a valid job.
+        """
+        try:
+            estimated_output = int(total_chars * _BYTES_PER_CHAR_ESTIMATE)
+            # staging copy + assembled file + a little headroom
+            required = int(estimated_output * 2 * _DISK_SAFETY_FACTOR)
+
+            for label, target in (("staging", staging_root), ("output", output_path.parent)):
+                if not target.exists():
+                    continue
+                free = shutil.disk_usage(target).free
+                if free < required:
+                    raise _PreflightError(
+                        self._voice,
+                        _AttemptFailure(
+                            "insufficient_disk",
+                            f"Estimated need {required / 1e9:.1f} GB, but the "
+                            f"{label} volume has only {free / 1e9:.1f} GB free.",
+                        ),
+                    )
+        except _PreflightError:
+            raise
+        except Exception:
+            logger.warning("Disk space pre-flight check failed", exc_info=True)
 
     async def _run_preflight(self, voices: list[dict]) -> None:
         sample = self._preflight_sample_text()
@@ -2263,6 +2309,14 @@ class TTSWorker(QThread):
                     f"Voice: {exc.voice}\n"
                     "Reload the voice list and choose another voice before generating."
                     f"{suggestion}"
+                )
+            if exc.cause.kind == "insufficient_disk":
+                return (
+                    "Not enough free disk space for this job.\n\n"
+                    f"{exc.cause}\n\n"
+                    "Audio is staged to disk chunk by chunk before the final MP3 "
+                    "is assembled, so a long job needs roughly twice the size of "
+                    "the finished file. Free up space and try again."
                 )
             if exc.cause.kind == "incompatible_voice":
                 return (
