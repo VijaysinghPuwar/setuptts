@@ -10,9 +10,18 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont, QColor, QPalette, QTextCursor
+from PySide6.QtGui import (
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QFontMetrics,
+    QColor,
+    QPalette,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QFileDialog,
+    QSizePolicy,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -69,6 +78,7 @@ class InputPanel(QWidget):
         top_bar = QWidget()
         top_bar.setObjectName("editorTopBar")
         top_bar.setMinimumHeight(36)
+        top_bar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         tbl = QHBoxLayout(top_bar)
         tbl.setContentsMargins(16, 0, 12, 0)
         tbl.setSpacing(8)
@@ -111,6 +121,8 @@ class InputPanel(QWidget):
         bottom_bar = QWidget()
         bottom_bar.setObjectName("editorBottomBar")
         bottom_bar.setMinimumHeight(24)
+        bottom_bar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._bottom_bar = bottom_bar
         bbl = QHBoxLayout(bottom_bar)
         bbl.setContentsMargins(16, 0, 16, 0)
         bbl.setSpacing(0)
@@ -135,12 +147,46 @@ class InputPanel(QWidget):
         self._import_btn.clicked.connect(self._open_file_dialog)
         self._clear_btn.clicked.connect(self.clear)
 
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._update_stats_bar()
+
     def _on_text_changed(self) -> None:
-        text = self._editor.toPlainText()
+        self._update_stats_bar()
+        self.text_changed.emit(self._editor.toPlainText())
+
+    def _update_stats_bar(self) -> None:
+        """
+        Fit the word count and the drop hint to the width actually available.
+
+        Qt clips a QLabel rather than eliding it, and the default UI font is
+        materially wider on Windows than on macOS, so a bar that comfortably
+        holds both on one platform cuts both in half on the other.  The count
+        drops to an abbreviated form when the long one will not fit, and the
+        drop hint — the more expendable of the two, and duplicated by the
+        editor's own placeholder — gives way before the count does.
+        """
+        text  = self._editor.toPlainText()
         words = len(text.split()) if text.strip() else 0
         chars = len(text)
-        self._count_label.setText(f"{words:,} words  ·  {chars:,} characters")
-        self.text_changed.emit(text)
+
+        # Bar width less the layout's 16 px margins either side.
+        available = max(0, self._bottom_bar.width() - 32)
+        metrics   = QFontMetrics(self._count_label.font())
+
+        long_form  = f"{words:,} words  ·  {chars:,} characters"
+        short_form = f"{words:,}w  ·  {chars:,}c"
+        count = long_form if metrics.horizontalAdvance(long_form) <= available \
+            else short_form
+        self._count_label.setText(count)
+        self._count_label.setToolTip(long_form)
+
+        hint_width = QFontMetrics(self._drop_hint.font()).horizontalAdvance(
+            self._drop_hint.text()
+        )
+        self._drop_hint.setVisible(
+            metrics.horizontalAdvance(count) + hint_width + 24 <= available
+        )
 
     def _on_drag_state(self, active: bool) -> None:
         """Dim the stats bar when a drop is in progress."""

@@ -14,6 +14,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QSizePolicy,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -69,6 +70,11 @@ class HistoryPanel(QWidget):
         header = QWidget()
         header.setObjectName("historyHeader")
         header.setMinimumHeight(36)
+        # Fixed, not the default Preferred: the table below is what should
+        # absorb the strip's spare height, while the header keeps exactly the
+        # height its own content needs — under a larger system font the
+        # default let it sit at its 36 px minimum and clip its button.
+        header.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 0, 12, 0)
         hl.setSpacing(8)
@@ -98,7 +104,12 @@ class HistoryPanel(QWidget):
         self._table.setShowGrid(False)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.setObjectName("historyTable")
-        root.addWidget(self._table)
+        # The table's own minimum height competes with the header's when the
+        # strip is squeezed, and Qt then shaves the header instead — clipping
+        # the Clear All button.  The table is the part that should give way:
+        # it scrolls, the header does not.
+        self._table.setMinimumHeight(0)
+        root.addWidget(self._table, 1)
 
         self._table.doubleClicked.connect(self._open_selected)
         self._table.customContextMenuRequested.connect(self._show_menu)

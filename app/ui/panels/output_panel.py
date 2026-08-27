@@ -531,9 +531,12 @@ class OutputPanel(QWidget):
         # Generate button — always available when text exists.
         # "&&" renders as a literal ampersand; a single "&" would be swallowed
         # as a keyboard mnemonic and show up as "Generate Export MP3".
-        self._generate_btn = QPushButton("Generate && Export MP3")
+        self._generate_btn = _AdaptiveLabelButton([
+            "Generate && Export MP3",
+            "Generate MP3",
+            "Generate",
+        ])
         self._generate_btn.setObjectName("generateButton")
-        self._generate_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._generate_btn.setEnabled(False)
         ly.addWidget(self._generate_btn)
 
@@ -549,7 +552,9 @@ class OutputPanel(QWidget):
         ly.addWidget(self._generate_hint)
 
         ly.addSpacing(6)
-        self._resume_job_btn = QPushButton("Resume Saved Job")
+        self._resume_job_btn = _AdaptiveLabelButton(
+            ["Resume Saved Job", "Resume Job", "Resume"]
+        )
         self._resume_job_btn.setObjectName("ghostButton")
         self._resume_job_btn.hide()
         ly.addWidget(self._resume_job_btn)
@@ -625,6 +630,9 @@ class OutputPanel(QWidget):
             for widget in [self, *self.findChildren(QWidget)]:
                 style.unpolish(widget)
                 style.polish(widget)
+            # The CTA font size changes with density, so its label has to be
+            # re-chosen against the new metrics.
+            self._generate_btn.refresh_label()
             self.updateGeometry()
 
     @property
@@ -1193,9 +1201,12 @@ class OutputPanel(QWidget):
         resume_chunk = latest.failed_at_chunk or (latest.completed_count + 1)
         latest_name = Path(latest.output_path).name
         count = len(self._resume_candidates)
-        self._resume_job_btn.setText(
-            "Resume Saved Job" if count == 1 else f"Resume Saved Job ({count})"
-        )
+        suffix = "" if count == 1 else f" ({count})"
+        self._resume_job_btn.set_labels([
+            f"Resume Saved Job{suffix}",
+            f"Resume Job{suffix}",
+            f"Resume{suffix}",
+        ])
         detail = (
             f"{count} resumable job(s) saved locally. Latest: {latest_name} — "
             f"{latest.completed_count} chunk(s) preserved, resume at chunk {resume_chunk}."
@@ -1705,6 +1716,53 @@ _LOCALE_MAP: dict[str, str] = {
 }
 
 
+class _AdaptiveLabelButton(QPushButton):
+    """
+    Push button that steps down to a shorter label rather than clipping.
+
+    Qt neither elides nor wraps a button label: a button narrower than its
+    text simply cuts the text off.  The sidebar is narrow by design and font
+    metrics differ sharply by platform — "Generate & Export MP3" needs about
+    330 px in Windows' Segoe UI against roughly 290 px of usable sidebar,
+    while the same string fits comfortably in macOS's SF Pro — so the button
+    carries labels from longest to shortest and shows the longest that fits.
+
+    Labels use Qt's "&&" escape for a literal ampersand; the mnemonic form is
+    what gets measured, since that is what is drawn.
+    """
+
+    #: Stylesheet padding either side, plus a little slack for the border.
+    _CHROME_WIDTH = 36
+
+    def __init__(self, labels: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(labels[0], parent)
+        self._labels = list(labels)
+        # Ignored, not Expanding: the button fills the width it is given but
+        # never reports a text-driven minimum that would widen the sidebar.
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+    def set_labels(self, labels: list[str]) -> None:
+        """Replace the label set, then re-choose from it."""
+        self._labels = list(labels)
+        self.refresh_label()
+
+    def refresh_label(self) -> None:
+        """Re-choose the label — call after anything that changes the font."""
+        metrics   = QFontMetrics(self.font())
+        available = self.width() - self._CHROME_WIDTH
+        chosen    = self._labels[-1]
+        for label in self._labels:
+            if metrics.horizontalAdvance(label.replace("&&", "&")) <= available:
+                chosen = label
+                break
+        if self.text() != chosen:
+            self.setText(chosen)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self.refresh_label()
+
+
 class _ElidingLabel(QLabel):
     """
     Single-line label that elides overflow instead of forcing its parent wider.
@@ -1751,6 +1809,12 @@ class _ElidingLabel(QLabel):
 def _card() -> QFrame:
     f = QFrame()
     f.setObjectName("card")
+    # Minimum, not the default Preferred: a QScrollArea sizes its inner widget
+    # to the viewport expanded to the widget's *minimum* hint, not its size
+    # hint.  With Preferred the cards absorbed the difference by shrinking
+    # below their content — clipping the Browse and Preview buttons by a few
+    # pixels — instead of the scroll area growing and offering a scrollbar.
+    f.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
     return f
 
 

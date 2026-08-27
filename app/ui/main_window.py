@@ -146,6 +146,15 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
         self._connect_signals()
 
+        # An explicit minimum overrides the layout's own minimumSizeHint, so
+        # the constant alone would promise a size the layout cannot render
+        # once the system font is larger than we assumed.  Take whichever is
+        # bigger; at normal font sizes the hint is well under the constant and
+        # this changes nothing.
+        hint = self.minimumSizeHint()
+        self.setMinimumSize(max(_MIN_WINDOW_SIZE[0], hint.width()),
+                            max(_MIN_WINDOW_SIZE[1], hint.height()))
+
         self.status_bar.showMessage("Ready")
         logger.info("MainWindow shown")
 
@@ -256,7 +265,15 @@ class MainWindow(QMainWindow):
     def _build_header(self) -> QWidget:
         bar = QWidget()
         bar.setObjectName("headerBar")
-        bar.setFixedHeight(40)
+        # A minimum, not a fixed height: a fixed 40 px clips the Settings
+        # button outright under a larger system font or accessibility text
+        # scaling, where the button alone wants more than that.
+        bar.setMinimumHeight(40)
+        # Fixed, not Maximum: Maximum treats the size hint as a ceiling and
+        # lets the bar shrink back to its 40 px minimum, which is the clipping
+        # this was meant to prevent.  Fixed pins the height to what the
+        # content actually needs, with 40 px as the floor.
+        bar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         hl = QHBoxLayout(bar)
         hl.setContentsMargins(18, 0, 14, 0)
         hl.setSpacing(10)
@@ -345,7 +362,16 @@ class MainWindow(QMainWindow):
         else:
             right = target
 
-        left = max(_INPUT_PANEL_MIN, sum(sizes) - right)
+        # Same reasoning as the history floor: the editor's own chrome (the
+        # TEXT INPUT / Open File / Clear bar) needs more than 320 px once the
+        # system font grows, and squeezing below that clips the toolbar.  The
+        # minimum is pushed onto the panel as well as used here, so the
+        # splitter itself refuses to go below it.
+        editor_min = max(_INPUT_PANEL_MIN,
+                         self._input_panel.minimumSizeHint().width())
+        if self._input_panel.minimumWidth() != editor_min:
+            self._input_panel.setMinimumWidth(editor_min)
+        left = max(editor_min, sum(sizes) - right)
         if [left, right] != sizes:
             self._h_splitter.setSizes([left, right])
 
@@ -370,6 +396,9 @@ class MainWindow(QMainWindow):
             return
 
         total = sum(sizes)
+        # Derived, not the bare constant: under a larger system font the strip
+        # needs more than 88 px just to draw its own header without clipping.
+        floor = max(_HISTORY_MIN, history.minimumSizeHint().height())
 
         if self._history_user_sized:
             # Respect the height the user dragged to.  Clamping it to the
@@ -377,9 +406,9 @@ class MainWindow(QMainWindow):
             # taller than its default, which is the whole point of the drag;
             # reading it back from sizes() would let QSplitter's proportional
             # redistribution walk it a little further on every resize.
-            bottom = max(_HISTORY_MIN, self._history_user_height)
+            bottom = max(floor, self._history_user_height)
         else:
-            bottom = max(_HISTORY_MIN,
+            bottom = max(floor,
                          min(_HISTORY_MAX, int(self.height() * _HISTORY_FRACTION)))
 
         # The editor and controls are the main event: they keep the majority of

@@ -18,7 +18,10 @@ Each test here pins a defect that shipped in a previous release:
 * the history strip kept a fixed height, swallowing a quarter of a short
   window;
 * the ACTIVE JOBS card sat below the fold while jobs ran, so the sidebar
-  looked idle during an export.
+  looked idle during an export;
+* the primary CTA and the editor's stats bar were clipped on Windows, whose
+  default UI font is materially wider than macOS's — layout that is checked
+  on one platform only is not checked at all.
 """
 
 import os
@@ -729,3 +732,136 @@ def test_the_window_minimum_is_actually_renderable(window, styled_app):
     styled_app.processEvents()
     assert _clipping_problems(window) == []
     assert window._output_panel._generate_btn.visibleRegion().boundingRect().height() > 20
+
+
+# ------------------------------------------------------------------ #
+# Wider fonts                                                          #
+# ------------------------------------------------------------------ #
+
+# Widget text width is driven by the stylesheet's px font-size, not by the
+# application point size, so scaling every declared size is what reproduces a
+# platform whose UI font is wider.  Windows' Segoe UI needed ~330 px for the
+# CTA where macOS's SF Pro needs ~250 — a factor of about 1.3 — and Windows
+# text scaling goes to 250 %, so the range below brackets both with room to
+# spare.  Without this the macOS CI job passed while the Windows job failed.
+FONT_SCALES = [1.0, 1.3, 1.6, 2.0, 2.5]
+
+
+def _scaled_stylesheet(scale):
+    import re
+
+    qss = resource_path("app/assets/styles/app.qss").read_text(encoding="utf-8")
+    return re.sub(
+        r"font-size:\s*([\d.]+)px",
+        lambda m: f"font-size: {max(1, round(float(m.group(1)) * scale))}px",
+        qss,
+    )
+
+
+@pytest.fixture
+def scaled_window(request, qapp, app_paths, qtbot):
+    """A window rendered under an inflated stylesheet font size."""
+    from app.ui.main_window import MainWindow
+
+    qapp.setStyleSheet(_scaled_stylesheet(request.param))
+    settings = AppSettings(app_paths)
+    settings.window_x = settings.window_y = None
+    win = MainWindow(settings=settings, paths=app_paths)
+    qtbot.addWidget(win)
+    win._output_panel._on_voices_loaded(
+        [
+            Voice(
+                short_name="en-US-AvaNeural",
+                friendly_name="Ava",
+                gender="Female",
+                locale="en-US",
+            )
+        ]
+    )
+    win.show()
+    qapp.processEvents()
+    yield win
+    win.ensure_workers_stopped()
+    qapp.setStyleSheet("")
+
+
+@pytest.mark.parametrize("scaled_window", FONT_SCALES, indirect=True)
+@pytest.mark.parametrize("width,height", [(720, 480), (1100, 660), (1920, 1080)])
+def test_nothing_is_clipped_under_a_wider_font(scaled_window, qapp, width, height):
+    scaled_window.resize(width, height)
+    qapp.processEvents()
+    assert _clipping_problems(scaled_window) == []
+
+
+@pytest.mark.parametrize("scaled_window", FONT_SCALES, indirect=True)
+def test_the_cta_steps_down_to_a_shorter_label_instead_of_clipping(
+    scaled_window, qapp
+):
+    """Qt neither elides nor wraps a button label — it just cuts it off."""
+    button = scaled_window._output_panel._generate_btn
+    scaled_window.resize(720, 480)
+    qapp.processEvents()
+
+    assert button.text() in button._labels
+    assert button.width() >= button.sizeHint().width()
+
+
+def test_the_cta_keeps_its_full_label_when_there_is_room(window, styled_app):
+    button = window._output_panel._generate_btn
+    window.resize(1600, 1000)
+    styled_app.processEvents()
+    assert button.text() == "Generate && Export MP3"
+
+
+@pytest.mark.parametrize("scaled_window", FONT_SCALES, indirect=True)
+def test_the_stats_bar_gives_up_the_drop_hint_before_the_word_count(
+    scaled_window, qapp
+):
+    """Both labels cannot always fit; the count is the one that matters."""
+    panel = scaled_window._input_panel
+    scaled_window.set_input_text("word " * 900)
+    scaled_window.resize(720, 480)
+    qapp.processEvents()
+
+    from PySide6.QtGui import QFontMetrics
+
+    count = panel._count_label
+    assert count.isVisible()
+    assert QFontMetrics(count.font()).horizontalAdvance(count.text()) <= count.width()
+    assert "900" in count.text()          # the number survives the abbreviation
+    assert count.toolTip().endswith("characters")
+
+
+def test_the_full_word_count_is_used_when_it_fits(window, styled_app):
+    window.set_input_text("word " * 10)
+    window.resize(1600, 1000)
+    styled_app.processEvents()
+    assert window._input_panel._count_label.text() == "10 words  ·  50 characters"
+    assert window._input_panel._drop_hint.isVisible()
+
+
+@pytest.mark.parametrize("scaled_window", FONT_SCALES, indirect=True)
+def test_toolbars_grow_with_their_content_rather_than_clipping_it(
+    scaled_window, qapp
+):
+    """These bars carried fixed or capped heights that a larger font overran."""
+    scaled_window.resize(1100, 660)
+    qapp.processEvents()
+
+    for bar in (
+        scaled_window.findChild(QWidget, "headerBar"),
+        scaled_window.findChild(QWidget, "editorTopBar"),
+        scaled_window.findChild(QWidget, "historyHeader"),
+    ):
+        assert bar is not None
+        assert bar.height() >= bar.sizeHint().height()
+
+
+@pytest.mark.parametrize("scaled_window", FONT_SCALES, indirect=True)
+def test_the_window_minimum_grows_with_the_font(scaled_window):
+    """An explicit minimum overrides the layout's own minimumSizeHint, so it
+    must not promise a size the layout cannot actually render."""
+    minimum = scaled_window.minimumSize()
+    hint = scaled_window.minimumSizeHint()
+    assert minimum.width() >= hint.width()
+    assert minimum.height() >= hint.height()
