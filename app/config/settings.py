@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -195,15 +196,36 @@ class AppSettings:
                         self._data[key] = loaded[key]
             except Exception:
                 logger.warning("Could not load settings; using defaults.", exc_info=True)
+                try:
+                    self._path.replace(self._path.with_name(self._path.name + ".corrupt"))
+                except OSError:
+                    pass
 
     def save(self) -> None:
+        """
+        Persist settings atomically.
+
+        settings.save() runs on every generate and again during shutdown.  A
+        plain write_text() truncates the file first, so a crash or power loss
+        mid-write leaves a half-written file that fails to parse on the next
+        launch and silently resets every preference.  Writing to a temp file
+        in the same directory and renaming makes the swap atomic.
+        """
+        payload = json.dumps(self._data, indent=2, ensure_ascii=False)
+        tmp_path = self._path.with_name(self._path.name + ".tmp")
         try:
-            self._path.write_text(
-                json.dumps(self._data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, self._path)
         except Exception:
             logger.error("Failed to save settings.", exc_info=True)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def reset(self) -> None:
         self._data = dict(_DEFAULTS)

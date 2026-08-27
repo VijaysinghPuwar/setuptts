@@ -67,10 +67,8 @@ class InputPanel(QWidget):
 
         # ── Top bar ─────────────────────────────────────────────────── #
         top_bar = QWidget()
-        top_bar.setFixedHeight(36)
-        top_bar.setStyleSheet(
-            "background-color: #161618; border-bottom: 1px solid #2C2C30;"
-        )
+        top_bar.setObjectName("editorTopBar")
+        top_bar.setMinimumHeight(36)
         tbl = QHBoxLayout(top_bar)
         tbl.setContentsMargins(16, 0, 12, 0)
         tbl.setSpacing(8)
@@ -86,16 +84,13 @@ class InputPanel(QWidget):
         tbl.addWidget(self._import_btn)
 
         sep = QFrame()
+        sep.setObjectName("toolbarSep")
         sep.setFrameShape(QFrame.VLine)
         sep.setFixedWidth(1)
-        sep.setStyleSheet("background: #2C2C30; border: none;")
         tbl.addWidget(sep)
 
         self._clear_btn = QPushButton("Clear")
-        self._clear_btn.setObjectName("ghostButton")
-        self._clear_btn.setStyleSheet(
-            "QPushButton { color: #5A5A60; } QPushButton:hover { color: #F2F2F4; }"
-        )
+        self._clear_btn.setObjectName("quietGhostButton")
         tbl.addWidget(self._clear_btn)
 
         root.addWidget(top_bar)
@@ -114,10 +109,8 @@ class InputPanel(QWidget):
 
         # ── Bottom stats bar ─────────────────────────────────────────── #
         bottom_bar = QWidget()
-        bottom_bar.setFixedHeight(24)
-        bottom_bar.setStyleSheet(
-            "background-color: #111113; border-top: 1px solid #1E1E22;"
-        )
+        bottom_bar.setObjectName("editorBottomBar")
+        bottom_bar.setMinimumHeight(24)
         bbl = QHBoxLayout(bottom_bar)
         bbl.setContentsMargins(16, 0, 16, 0)
         bbl.setSpacing(0)
@@ -128,8 +121,7 @@ class InputPanel(QWidget):
         bbl.addStretch()
 
         self._drop_hint = QLabel("or drag & drop a .txt file")
-        self._drop_hint.setObjectName("hintLabel")
-        self._drop_hint.setStyleSheet("color: #3A3A40; font-size: 11px;")
+        self._drop_hint.setObjectName("dropHint")
         bbl.addWidget(self._drop_hint)
 
         root.addWidget(bottom_bar)

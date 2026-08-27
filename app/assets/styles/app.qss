@@ -252,10 +252,11 @@ QPushButton#generateButton {
     color: #FFFFFF;
     border: none;
     border-radius: 12px;
-    padding: 16px;
+    padding: 10px 16px;
     font-size: 15px;
     font-weight: 700;
-    min-height: 52px;
+    min-height: 44px;
+    max-height: 64px;
     letter-spacing: 0.2px;
 }
 
@@ -434,7 +435,6 @@ QProgressBar {
     min-height: 8px;
     max-height: 8px;
     text-align: center;
-    font-size: 0px;
 }
 
 QProgressBar::chunk {
@@ -696,4 +696,201 @@ QScrollArea {
 
 QScrollArea > QWidget > QWidget {
     background: transparent;
+}
+
+
+/* ============================================================
+   Container surfaces
+   ------------------------------------------------------------
+   These live here rather than as inline setStyleSheet() calls.
+   A widget-level stylesheet takes precedence over the application
+   stylesheet for that widget *and every descendant*, which silently
+   strips backgrounds from all nested cards, inputs and buttons.
+   ============================================================ */
+
+/* ── Right sidebar scroll surface ─────────────────────────── */
+QScrollArea#sideScroll {
+    background: transparent;
+    border: none;
+}
+
+QWidget#sideScrollInner {
+    background: transparent;
+}
+
+/* ── Pinned action footer (holds the primary CTA) ─────────── */
+QWidget#actionFooter {
+    background-color: #111113;
+    border-top: 1px solid #2C2C30;
+}
+
+QLabel#resumeHint {
+    color: #C2944A;
+    font-size: 11px;
+    background: transparent;
+}
+
+/* ── Voice compatibility warning ──────────────────────────── */
+QFrame#voiceWarning {
+    background-color: rgba(255, 180, 0, 0.10);
+    border: 1px solid rgba(255, 180, 0, 0.32);
+    border-radius: 8px;
+}
+
+QLabel#voiceWarningText {
+    color: #F2C15B;
+    font-size: 11px;
+    background: transparent;
+}
+
+/* ── Active job row ───────────────────────────────────────── */
+QWidget#jobRow {
+    background: transparent;
+}
+
+/* ── Text editor chrome ───────────────────────────────────── */
+QWidget#editorTopBar {
+    background-color: #161618;
+    border-bottom: 1px solid #2C2C30;
+}
+
+QWidget#editorBottomBar {
+    background-color: #111113;
+    border-top: 1px solid #1E1E22;
+}
+
+QFrame#toolbarSep {
+    background-color: #2C2C30;
+    border: none;
+}
+
+QLabel#dropHint {
+    color: #3A3A40;
+    font-size: 11px;
+    background: transparent;
+}
+
+/* ── History panel ────────────────────────────────────────── */
+QWidget#historyHeader {
+    background-color: #111113;
+    border-top: 1px solid #2C2C30;
+}
+
+QTableWidget#historyTable {
+    background-color: #0D0D0F;
+    border: none;
+}
+
+QTableWidget#historyTable::item {
+    border-bottom: 1px solid #1A1A1E;
+}
+
+/* ── Ghost button variants ────────────────────────────────── */
+QPushButton#quietGhostButton {
+    background: transparent;
+    border: none;
+    color: #5A5A60;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-weight: 500;
+    min-height: 24px;
+}
+
+QPushButton#quietGhostButton:hover {
+    color: #F2F2F4;
+    background: transparent;
+}
+
+QPushButton#dangerGhostButton {
+    background: transparent;
+    border: none;
+    color: #FF453A;
+    font-size: 11px;
+    padding: 2px 6px;
+    min-height: 24px;
+}
+
+QPushButton#dangerGhostButton:hover {
+    color: #FF6B61;
+    background: transparent;
+}
+
+/* ── Dialogs (dark surfaces — keep text legible) ──────────── */
+QLabel#dialogSectionTitle {
+    font-size: 13px;
+    font-weight: 600;
+    color: #F2F2F4;
+    border-bottom: 1px solid #2C2C30;
+    padding-bottom: 6px;
+    background: transparent;
+}
+
+QLabel#aboutAppName {
+    font-size: 20px;
+    font-weight: 700;
+    color: #F2F2F4;
+    background: transparent;
+}
+
+QLabel#aboutVersion {
+    font-size: 13px;
+    color: #9A9A9F;
+    background: transparent;
+}
+
+QLabel#aboutDescription {
+    font-size: 13px;
+    color: #C8C8CC;
+    background: transparent;
+}
+
+QLabel#aboutFootnote {
+    font-size: 12px;
+    color: #5A5A60;
+    background: transparent;
+}
+
+QLabel#pathLabel {
+    color: #9A9A9F;
+    font-size: 12px;
+    background: transparent;
+}
+
+/* ── Checkboxes ───────────────────────────────────────────── */
+QCheckBox {
+    background: transparent;
+    color: #F2F2F4;
+    spacing: 8px;
+}
+
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 1px solid #3A3A3F;
+    background-color: #1E1E21;
+}
+
+QCheckBox::indicator:hover {
+    border-color: #0A84FF;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #0A84FF;
+    border-color: #0A84FF;
+}
+
+/* ── Scrollable dialog body ───────────────────────────────── */
+QScrollArea#dialogScroll {
+    background: transparent;
+    border: none;
+}
+
+QWidget#dialogScrollInner {
+    background: transparent;
+}
+
+QWidget#dialogButtonBar {
+    background-color: #161618;
+    border-top: 1px solid #2C2C30;
 }

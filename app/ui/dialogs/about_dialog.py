@@ -55,7 +55,7 @@ class AboutDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"About {APP_NAME}")
-        self.setFixedSize(380, 300)
+        self.setMinimumSize(400, 320)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self._build_ui()
 
@@ -76,11 +76,11 @@ class AboutDialog(QDialog):
         info = QVBoxLayout()
         info.setSpacing(4)
         name_lbl = QLabel(APP_NAME)
-        name_lbl.setStyleSheet("font-size: 20px; font-weight: 700; color: #1D1D1F;")
+        name_lbl.setObjectName("aboutAppName")
         info.addWidget(name_lbl)
 
         ver_lbl = QLabel(f"Version {APP_VERSION}")
-        ver_lbl.setStyleSheet("font-size: 13px; color: #86868B;")
+        ver_lbl.setObjectName("aboutVersion")
         info.addWidget(ver_lbl)
 
         top.addLayout(info)
@@ -90,14 +90,15 @@ class AboutDialog(QDialog):
         layout.addSpacing(20)
 
         desc = QLabel(APP_DESCRIPTION)
+        desc.setObjectName("aboutDescription")
         desc.setWordWrap(True)
-        desc.setStyleSheet("font-size: 13px; color: #3C3C43; line-height: 1.5;")
         layout.addWidget(desc)
 
         layout.addSpacing(12)
 
         built_with = QLabel("Built with PySide6 · Powered by Microsoft Edge TTS")
-        built_with.setStyleSheet("font-size: 12px; color: #86868B;")
+        built_with.setObjectName("aboutFootnote")
+        built_with.setWordWrap(True)
         layout.addWidget(built_with)
 
         layout.addStretch()

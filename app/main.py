@@ -103,6 +103,13 @@ def main() -> None:
     from app.ui.main_window import MainWindow
 
     window = MainWindow(settings=settings, paths=paths)
+
+    # Safety net: closeEvent handles the normal path, but any exit that does
+    # not route through it (Cmd+Q on some platforms, a session logout, an
+    # unhandled exception unwinding main) would otherwise destroy live
+    # QThreads and abort with "Python quit unexpectedly".
+    app.aboutToQuit.connect(window.ensure_workers_stopped)
+
     window.show()
 
     exit_code = app.exec()

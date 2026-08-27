@@ -22,32 +22,49 @@ No fake static percentage.
 
 Layout
 ------
-  ┌─ VOICE ─────────────────────────────────────────────────┐
-  │ [Search…_______] [All Languages▾] [All▾]               │
-  │ [Ava · Female · English US_____________________________▾]│
-  │ [▶ Preview Voice]                                       │
-  ├─ SPEED ─────────────────────────────────────────── +5% ─┤
-  │ Slower ●────────────────────────────────────── Faster   │
-  ├─ EXPORT ────────────────────────────────────────────────┤
-  │ File Name                                               │
-  │ [output.mp3__________________________________________]  │
-  │ Save To                                                 │
-  │ [/Users/.../Desktop________________________________][Brw]│
-  │ ─────────────────────────────────────────────────────── │
-  │ [           Generate & Export MP3                    ]  │
-  ├─ ACTIVE JOBS ──────────────────────────────── (hidden)  ┤
-  │ ▶ chapter1.mp3  Ava·EN  ▓▓▓▓▓░░░  45%  Generating  [✕]│
-  │ · chapter2.mp3  Guy·EN              Queued           [✕]│
+Everything above the divider scrolls; the primary CTA is pinned below it so
+it stays reachable at every window size, down to the 780x520 minimum.
+
+  ┌─ VOICE ─────────────────────────────────────────────────┐ ╮
+  │ [Search voices…_______________________________________] │ │
+  │ [All Languages____________▾] [All▾]                     │ │
+  │ [Ava · Female · English (US)__________________________▾]│ │
+  │ [▶ Preview Voice]                                       │ │
+  ├─ SPEED ─────────────────────────────────────────── +5% ─┤ │ scrolls
+  │ Slower ●────────────────────────────────────── Faster   │ │
+  ├─ EXPORT ────────────────────────────────────────────────┤ │
+  │ File Name                                               │ │
+  │ [output.mp3__________________________________________]  │ │
+  │ Save To                                                 │ │
+  │ [/Users/.../Desktop________________________________][Brw]│ │
+  ├─ ACTIVE JOBS ──────────────────────────────── (hidden)  ┤ │
+  │ ▶ chapter1.mp3                                    [✕]  │ │
+  │   Ava · English (US)                             45%    │ │
+  │   ▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │ │
+  │   [REMOTE] streaming audio from server                  │ │
+  │   812 chars/s · ETA 1:20 · chunk 3/~7                   │ ╯
+  ├─────────────────────────────────────────────────────────┤
+  │ [           Generate & Export MP3                    ]  │   pinned
   └─────────────────────────────────────────────────────────┘
+
+Styling note
+------------
+Container widgets in this panel must not carry inline stylesheets.  A
+widget-level stylesheet overrides the application stylesheet for the widget
+*and every descendant*, which silently strips the background from all the
+cards, inputs and buttons nested inside.  Use an objectName plus a rule in
+app/assets/styles/app.qss instead.
 """
 
 import logging
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -215,14 +232,27 @@ class OutputPanel(QWidget):
             # Disconnect all signals first.  Any signals already queued in
             # the Qt event loop will become no-ops after disconnection, so
             # they cannot call back into widgets that are being destroyed.
-            for sig_name in ("loaded", "failed", "started_playing",
-                              "finished", "progress", "status_changed",
-                              "completed"):
-                sig = getattr(worker, sig_name, None)
-                if sig is not None:
+            #
+            # Disconnecting a signal that has no connections makes PySide6
+            # emit a RuntimeWarning (via warnings.warn, so try/except cannot
+            # catch it).  That is expected here — we disconnect defensively,
+            # without tracking which signals were wired up — so the warning is
+            # suppressed rather than left to spam the log on every shutdown.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Failed to disconnect .*",
+                    category=RuntimeWarning,
+                )
+                for sig_name in ("loaded", "failed", "started_playing",
+                                  "finished", "progress", "status_changed",
+                                  "completed"):
+                    sig = getattr(worker, sig_name, None)
+                    if sig is None:
+                        continue
                     try:
                         sig.disconnect()
-                    except Exception:
+                    except (RuntimeError, TypeError):
                         pass
 
             if hasattr(worker, "cancel"):
@@ -255,14 +285,21 @@ class OutputPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # NOTE: do *not* set an inline stylesheet on the scroll area or its
+        # inner widget.  A widget-level stylesheet takes precedence over the
+        # application stylesheet for the widget *and all of its descendants*,
+        # which silently strips every background in this panel (cards, inputs,
+        # and the green Generate CTA all fall back to the bare window colour).
+        # Transparency is expressed in app.qss via #sideScroll / #sideScrollInner.
         scroll = QScrollArea()
+        scroll.setObjectName("sideScroll")
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self._scroll = scroll
 
         inner = QWidget()
-        inner.setStyleSheet("background: transparent;")
+        inner.setObjectName("sideScrollInner")
         il = QVBoxLayout(inner)
         il.setContentsMargins(8, 8, 8, 8)
         il.setSpacing(6)
@@ -277,7 +314,11 @@ class OutputPanel(QWidget):
 
         il.addStretch()
         scroll.setWidget(inner)
-        root.addWidget(scroll)
+        root.addWidget(scroll, 1)
+
+        # The primary CTA lives *outside* the scroll area so it can never be
+        # pushed below the fold on a short window.
+        root.addWidget(self._build_action_footer())
 
     # ── Voice ─────────────────────────────────────────────────────────── #
 
@@ -296,22 +337,31 @@ class OutputPanel(QWidget):
         hdr.addWidget(self._voice_count_label)
         ly.addLayout(hdr)
 
-        # Search + filters on one row
-        sf = QHBoxLayout()
-        sf.setSpacing(5)
+        # Search gets its own full-width row; the filters share the next one.
+        # Packing all three onto one row let the language combo's sizeHint
+        # (driven by its longest locale name) squeeze search down to a stub.
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search voices…")
         self._search_edit.setClearButtonEnabled(True)
-        sf.addWidget(self._search_edit, 2)
+        self._search_edit.setMinimumWidth(120)
+        ly.addWidget(self._search_edit)
+
+        sf = QHBoxLayout()
+        sf.setSpacing(5)
 
         self._lang_combo = QComboBox()
         self._lang_combo.addItem("All Languages", userData="")
         self._lang_combo.setMaxVisibleItems(18)
-        sf.addWidget(self._lang_combo, 3)
+        # Do not let the widest locale name dictate the layout width.
+        self._lang_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._lang_combo.setMinimumContentsLength(10)
+        self._lang_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        sf.addWidget(self._lang_combo, 1)
 
         self._gender_combo = QComboBox()
         self._gender_combo.addItems(["All", "Female", "Male"])
-        self._gender_combo.setFixedWidth(76)
+        self._gender_combo.setMinimumWidth(76)
+        self._gender_combo.setMaximumWidth(96)
         sf.addWidget(self._gender_combo)
         ly.addLayout(sf)
 
@@ -320,21 +370,20 @@ class OutputPanel(QWidget):
         self._voice_combo.addItem("Loading voices…")
         self._voice_combo.setEnabled(False)
         self._voice_combo.setMaxVisibleItems(16)
-        self._voice_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._voice_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._voice_combo.setMinimumContentsLength(12)
+        self._voice_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         ly.addWidget(self._voice_combo)
 
         self._voice_warning = QFrame()
-        self._voice_warning.setStyleSheet(
-            "QFrame { background: rgba(255, 180, 0, 0.10); border: 1px solid rgba(255, 180, 0, 0.32); border-radius: 8px; }"
-            "QLabel { color: #F2C15B; background: transparent; }"
-        )
+        self._voice_warning.setObjectName("voiceWarning")
         warning_layout = QVBoxLayout(self._voice_warning)
         warning_layout.setContentsMargins(10, 8, 10, 8)
         warning_layout.setSpacing(6)
 
         self._voice_warning_label = QLabel("")
+        self._voice_warning_label.setObjectName("voiceWarningText")
         self._voice_warning_label.setWordWrap(True)
-        self._voice_warning_label.setStyleSheet("font-size: 11px; line-height: 1.25;")
         warning_layout.addWidget(self._voice_warning_label)
 
         self._use_recommended_voice_btn = QPushButton("Use Recommended Voice")
@@ -439,6 +488,7 @@ class OutputPanel(QWidget):
         self._folder_edit = QLineEdit()
         self._folder_edit.setPlaceholderText("Choose folder…")
         self._folder_edit.setReadOnly(True)
+        self._folder_edit.setMinimumWidth(120)
         self._folder_edit.setStyleSheet(
             "QLineEdit { color: #9A9A9F; } QLineEdit:focus { border-color: #2C2C30; }"
         )
@@ -446,16 +496,28 @@ class OutputPanel(QWidget):
         self._browse_btn = QPushButton("Browse")
         folder_row.addWidget(self._browse_btn)
         ly.addLayout(folder_row)
-        ly.addSpacing(12)
 
-        div = QFrame()
-        div.setFrameShape(QFrame.HLine)
-        div.setStyleSheet("background: #2C2C30; border: none; max-height: 1px;")
-        ly.addWidget(div)
-        ly.addSpacing(12)
+        return card
 
-        # Generate button — always available when text exists
-        self._generate_btn = QPushButton("  Generate & Export MP3")
+    # ── Pinned action footer (never scrolls away) ─────────────────────── #
+
+    def _build_action_footer(self) -> QWidget:
+        """
+        Primary CTA + resume controls, pinned to the bottom of the sidebar.
+
+        Kept outside the QScrollArea so that "Generate & Export MP3" stays
+        reachable at every window height, including the 780x520 minimum.
+        """
+        footer = QWidget()
+        footer.setObjectName("actionFooter")
+        ly = QVBoxLayout(footer)
+        ly.setContentsMargins(12, 10, 12, 10)
+        ly.setSpacing(0)
+
+        # Generate button — always available when text exists.
+        # "&&" renders as a literal ampersand; a single "&" would be swallowed
+        # as a keyboard mnemonic and show up as "Generate Export MP3".
+        self._generate_btn = QPushButton("Generate && Export MP3")
         self._generate_btn.setObjectName("generateButton")
         self._generate_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._generate_btn.setEnabled(False)
@@ -466,9 +528,7 @@ class OutputPanel(QWidget):
         self._generate_hint = QLabel("Type or paste text on the left to get started")
         self._generate_hint.setObjectName("hintLabel")
         self._generate_hint.setAlignment(Qt.AlignCenter)
-        self._generate_hint.setStyleSheet(
-            "color: #3A3A40; font-size: 11px; background: transparent;"
-        )
+        self._generate_hint.setWordWrap(True)
         ly.addWidget(self._generate_hint)
 
         ly.addSpacing(6)
@@ -478,15 +538,12 @@ class OutputPanel(QWidget):
         ly.addWidget(self._resume_job_btn)
 
         self._resume_job_hint = QLabel("")
-        self._resume_job_hint.setObjectName("hintLabel")
+        self._resume_job_hint.setObjectName("resumeHint")
         self._resume_job_hint.setWordWrap(True)
-        self._resume_job_hint.setStyleSheet(
-            "color: #C2944A; font-size: 11px; background: transparent;"
-        )
         self._resume_job_hint.hide()
         ly.addWidget(self._resume_job_hint)
 
-        return card
+        return footer
 
     # ── Active jobs list ──────────────────────────────────────────────── #
 
@@ -570,7 +627,7 @@ class OutputPanel(QWidget):
     def _apply_settings(self) -> None:
         self._rate_slider.setValue(self._settings.rate)
         folder = self._settings.output_dir or str(Path.home() / "Desktop")
-        self._folder_edit.setText(folder)
+        self._set_folder_text(folder)
         idx = self._gender_combo.findText(self._settings.gender_filter)
         if idx >= 0:
             self._gender_combo.setCurrentIndex(idx)
@@ -859,11 +916,17 @@ class OutputPanel(QWidget):
     # Folder browse                                                        #
     # ------------------------------------------------------------------ #
 
+    def _set_folder_text(self, folder: str) -> None:
+        """Show a folder path from its start, with the full path as a tooltip."""
+        self._folder_edit.setText(folder)
+        self._folder_edit.setToolTip(folder)
+        self._folder_edit.setCursorPosition(0)
+
     def _browse_folder(self) -> None:
         current = self._folder_edit.text() or str(Path.home() / "Desktop")
         folder = QFileDialog.getExistingDirectory(self, "Choose Save Location", current)
         if folder:
-            self._folder_edit.setText(folder)
+            self._set_folder_text(folder)
             self._settings.output_dir = folder
 
     # ------------------------------------------------------------------ #
@@ -1092,7 +1155,7 @@ class OutputPanel(QWidget):
         self._select_voice_by_short_name(voice)
         output_path = Path(candidate.output_path)
         self._filename_edit.setText(output_path.name)
-        self._folder_edit.setText(str(output_path.parent))
+        self._set_folder_text(str(output_path.parent))
         self._settings.output_dir = str(output_path.parent)
 
         parent_win = self.window()
@@ -1287,7 +1350,7 @@ class _JobRowWidget(QWidget):
         self._build(item)
 
     def _build(self, item: JobItem) -> None:
-        self.setStyleSheet("background: transparent;")
+        self.setObjectName("jobRow")
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 2, 0, 2)
         root.setSpacing(2)
@@ -1304,11 +1367,11 @@ class _JobRowWidget(QWidget):
         )
         top.addWidget(self._icon_lbl)
 
-        self._name_lbl = QLabel(item.filename)
+        self._name_lbl = _ElidingLabel(item.filename)
         self._name_lbl.setStyleSheet(
             "font-size: 12px; font-weight: 600; color: #F2F2F4; background: transparent;"
         )
-        self._name_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._name_lbl.setToolTip(item.output_path)
         top.addWidget(self._name_lbl, 1)
 
         self._cancel_btn = QPushButton("✕")
@@ -1330,20 +1393,12 @@ class _JobRowWidget(QWidget):
         bot.setSpacing(5)
         bot.setContentsMargins(18, 0, 0, 0)  # indent to align under filename
 
-        self._voice_lbl = QLabel(item.voice_display)
+        self._voice_lbl = _ElidingLabel(item.voice_display)
         self._voice_lbl.setStyleSheet(
             "font-size: 10px; color: #5A5A60; background: transparent;"
         )
-        self._voice_lbl.setFixedWidth(100)
-        bot.addWidget(self._voice_lbl)
-
-        self._progress_bar = QProgressBar()
-        self._progress_bar.setRange(0, 100)
-        self._progress_bar.setValue(0)
-        self._progress_bar.setTextVisible(False)
-        self._progress_bar.setFixedHeight(4)
-        self._progress_bar.hide()
-        bot.addWidget(self._progress_bar, 1)
+        self._voice_lbl.setToolTip(item.voice_display)
+        bot.addWidget(self._voice_lbl, 1)
 
         self._pct_lbl = QLabel("")
         self._pct_lbl.setStyleSheet(
@@ -1353,22 +1408,36 @@ class _JobRowWidget(QWidget):
         self._pct_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._pct_lbl.hide()
         bot.addWidget(self._pct_lbl)
+        root.addLayout(bot)
 
+        # ── Line 3: full-width progress bar ─────────────────────────── #
+        bar_row = QHBoxLayout()
+        bar_row.setContentsMargins(18, 1, 0, 1)
+        bar_row.setSpacing(0)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.setFixedHeight(4)
+        self._progress_bar.hide()
+        bar_row.addWidget(self._progress_bar)
+        root.addLayout(bar_row)
+
+        # ── Line 4: status text ─────────────────────────────────────── #
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(18, 0, 0, 0)
+        status_row.setSpacing(0)
         self._status_lbl = QLabel(item.status_text)
         self._status_lbl.setStyleSheet(
             "font-size: 10px; color: #5A5A60; background: transparent;"
         )
         self._status_lbl.setWordWrap(True)
-        bot.addWidget(self._status_lbl)
+        status_row.addWidget(self._status_lbl, 1)
+        root.addLayout(status_row)
 
-        root.addLayout(bot)
-
-        # ── Line 3: real-time speed ─────────────────────────────────── #
-        # Indented 123 px (18 left margin + 100 voice label + 5 spacing)
-        # so it sits directly below the progress bar.
-        # Hidden until the first speed measurement arrives.
+        # ── Line 5: real-time speed / ETA ───────────────────────────── #
         spd_row = QHBoxLayout()
-        spd_row.setContentsMargins(123, 0, 0, 0)
+        spd_row.setContentsMargins(18, 0, 0, 0)
         spd_row.setSpacing(0)
 
         self._speed_lbl = QLabel("")
@@ -1376,9 +1445,9 @@ class _JobRowWidget(QWidget):
             "font-size: 11px; font-weight: 700; color: #1DB954;"
             " background: transparent;"
         )
+        self._speed_lbl.setWordWrap(True)
         self._speed_lbl.hide()
-        spd_row.addWidget(self._speed_lbl)
-        spd_row.addStretch()
+        spd_row.addWidget(self._speed_lbl, 1)
         root.addLayout(spd_row)
 
     # ------------------------------------------------------------------ #
@@ -1526,6 +1595,39 @@ _LOCALE_MAP: dict[str, str] = {
     "zh-CN-shaanxi": "Chinese (Shaanxi)", "zh-HK": "Chinese (HK)",
     "zh-TW": "Chinese (Taiwan)", "zu-ZA": "Zulu",
 }
+
+
+class _ElidingLabel(QLabel):
+    """
+    Single-line label that elides overflow instead of forcing its parent wider.
+
+    A plain QLabel reports its full text width as a minimum, so one long
+    filename can push the whole sidebar past its maximum width and clip.
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full_text = text
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(40)
+        self._apply_elide()
+
+    def setText(self, text: str) -> None:  # type: ignore[override]
+        self._full_text = text
+        self._apply_elide()
+
+    def full_text(self) -> str:
+        return self._full_text
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        metrics = QFontMetrics(self.font())
+        super().setText(
+            metrics.elidedText(self._full_text, Qt.ElideMiddle, max(30, self.width()))
+        )
 
 
 def _card() -> QFrame:

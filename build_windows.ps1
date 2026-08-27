@@ -9,7 +9,7 @@
 #   - pip install -r requirements.txt pyinstaller
 #
 # Output:
-#   releases\SetupTTS-Windows-1.5.2.zip   single self-contained EXE
+#   releases\SetupTTS-Windows-<version>.zip   single self-contained EXE
 #
 # This script builds the PORTABLE release using setuptts_portable.spec
 # (onefile mode).  The resulting EXE is fully self-contained — users
@@ -19,7 +19,7 @@
 # the onedir installer build via Inno Setup.
 # ─────────────────────────────────────────────────────────────────────────────
 param(
-    [string]$Version = "1.5.2"
+    [string]$Version = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,6 +28,17 @@ $PortSpec  = "setuptts_portable.spec"
 $DistDir   = "dist_portable"
 $Exe       = "$DistDir\$AppName.exe"
 $ZipDir    = "releases"
+# Single source of truth: app/__init__.py (keeps the zip name, the
+# EXE version and the About dialog from drifting apart).
+if (-not $Version) {
+    $versionLine = Select-String -Path "app\__init__.py" -Pattern '^APP_VERSION\s*=\s*"(.*)"'
+    if (-not $versionLine) {
+        Write-Error "Could not read APP_VERSION from app/__init__.py"
+        exit 1
+    }
+    $Version = $versionLine.Matches[0].Groups[1].Value
+}
+
 $ZipName   = "$AppName-Windows-$Version.zip"
 $ZipPath   = "$ZipDir\$ZipName"
 

@@ -6,7 +6,7 @@
 #   ./build_macos.sh
 #
 # Outputs:
-#   releases/SetupTTS-macOS-1.5.2.zip   — user-ready .app bundle in a zip
+#   releases/SetupTTS-macOS-<version>.zip   — user-ready .app bundle in a zip
 #
 # Requirements:
 #   - macOS with Python 3.11+ and a virtualenv / pip-installed environment
@@ -15,7 +15,13 @@
 set -euo pipefail
 
 APP_NAME="SetupTTS"
-VERSION="1.5.2"
+# Single source of truth: app/__init__.py (keeps the zip name, the
+# bundle version and the About dialog from drifting apart).
+VERSION="$(sed -n 's/^APP_VERSION *= *"\(.*\)"/\1/p' app/__init__.py)"
+if [ -z "$VERSION" ]; then
+  echo "ERROR: could not read APP_VERSION from app/__init__.py" >&2
+  exit 1
+fi
 SPEC="setuptts.spec"
 DIST_DIR="dist"
 APP_BUNDLE="${DIST_DIR}/${APP_NAME}.app"

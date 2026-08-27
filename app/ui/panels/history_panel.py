@@ -67,10 +67,8 @@ class HistoryPanel(QWidget):
 
         # ── Header ─────────────────────────────────────────────────── #
         header = QWidget()
-        header.setFixedHeight(36)
-        header.setStyleSheet(
-            "background-color: #111113; border-top: 1px solid #2C2C30;"
-        )
+        header.setObjectName("historyHeader")
+        header.setMinimumHeight(36)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 0, 12, 0)
         hl.setSpacing(8)
@@ -81,11 +79,7 @@ class HistoryPanel(QWidget):
         hl.addStretch()
 
         self._clear_btn = QPushButton("Clear All")
-        self._clear_btn.setObjectName("ghostButton")
-        self._clear_btn.setStyleSheet(
-            "QPushButton { color: #FF453A; font-size: 11px; padding: 2px 6px; }"
-            "QPushButton:hover { color: #FF6B61; }"
-        )
+        self._clear_btn.setObjectName("dangerGhostButton")
         hl.addWidget(self._clear_btn)
         root.addWidget(header)
 
@@ -103,11 +97,7 @@ class HistoryPanel(QWidget):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setShowGrid(False)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._table.setStyleSheet(
-            "QTableWidget { background: #0D0D0F; border: none; }"
-            "QTableWidget::item { border-bottom: 1px solid #1A1A1E; }"
-            "QHeaderView::section { background: #111113; }"
-        )
+        self._table.setObjectName("historyTable")
         root.addWidget(self._table)
 
         self._table.doubleClicked.connect(self._open_selected)

@@ -33,7 +33,7 @@ macOS's "quit unexpectedly" dialog.
 
 import logging
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap, QBrush
 from PySide6.QtWidgets import (
     QApplication,
@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 _RIGHT_PANEL_MIN = 310
 _RIGHT_PANEL_MAX = 400
 _RIGHT_PANEL_DEFAULT = 340
+_INPUT_PANEL_MIN = 320
 
 
 def _make_app_icon() -> QIcon:
@@ -97,6 +98,8 @@ class MainWindow(QMainWindow):
         self._paths    = paths
         self._history  = HistoryService(paths.db_path)
         self._closing  = False   # guard against re-entrant closeEvent
+        self._workers_stopped = False   # guard against double shutdown
+        self._sidebar_user_sized = False  # True once the splitter is dragged
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(_make_app_icon())
@@ -186,6 +189,7 @@ class MainWindow(QMainWindow):
         self._h_splitter.setChildrenCollapsible(False)
 
         self._input_panel = InputPanel()
+        self._input_panel.setMinimumWidth(_INPUT_PANEL_MIN)
         self._output_panel = OutputPanel(
             settings=self._settings,
             history=self._history,
@@ -197,6 +201,7 @@ class MainWindow(QMainWindow):
         self._h_splitter.addWidget(self._output_panel)
         self._h_splitter.setStretchFactor(0, 1)
         self._h_splitter.setStretchFactor(1, 0)
+        self._h_splitter.splitterMoved.connect(self._on_sidebar_resized)
 
         self._v_splitter.addWidget(self._h_splitter)
 
@@ -257,6 +262,51 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
 
     # ------------------------------------------------------------------ #
+    # Responsive layout                                                    #
+    # ------------------------------------------------------------------ #
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._apply_responsive_layout()
+
+    def _apply_responsive_layout(self) -> None:
+        """
+        Keep the control sidebar proportional to the window.
+
+        At the 780 px minimum width a fixed 400 px sidebar swallows more than
+        half the window and squeezes the editor, so the sidebar is capped at
+        ~40 % of the window.  Once the user drags the splitter their width is
+        preserved and only clamped to that cap — otherwise the sidebar tracks
+        the preferred width, growing back when the window is widened again.
+        """
+        panel = getattr(self, "_output_panel", None)
+        if panel is None:
+            return
+
+        allowed = int(self.width() * 0.40)
+        target  = max(_RIGHT_PANEL_MIN, min(_RIGHT_PANEL_MAX, allowed))
+        if panel.maximumWidth() != target:
+            panel.setMaximumWidth(target)
+
+        sizes = self._h_splitter.sizes()
+        if len(sizes) != 2 or sum(sizes) <= 0:
+            return
+
+        if self._sidebar_user_sized:
+            # Respect the user's width, but never exceed the responsive cap.
+            right = max(_RIGHT_PANEL_MIN, min(target, sizes[1]))
+        else:
+            right = target
+
+        left = max(_INPUT_PANEL_MIN, sum(sizes) - right)
+        if [left, right] != sizes:
+            self._h_splitter.setSizes([left, right])
+
+    def _on_sidebar_resized(self, *_args) -> None:
+        """The user dragged the horizontal splitter — stop auto-sizing."""
+        self._sidebar_user_sized = True
+
+    # ------------------------------------------------------------------ #
     # Signals                                                              #
     # ------------------------------------------------------------------ #
 
@@ -294,21 +344,42 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _restore_geometry(self) -> None:
-        w = self._settings.window_width
-        h = self._settings.window_height
-        self.resize(w, h)
+        """
+        Restore the saved size/position, clamped to a screen that exists.
+
+        Without clamping, a window saved on a monitor that is no longer
+        attached (or one that was larger than the current display) reopens
+        partly or entirely off-screen, where the user cannot reach it.
+        """
+        min_size = self.minimumSize()
+        w = max(min_size.width(),  self._settings.window_width)
+        h = max(min_size.height(), self._settings.window_height)
 
         x, y = self._settings.window_x, self._settings.window_y
+
+        screen = None
         if x is not None and y is not None:
-            self.move(x, y)
-        else:
+            screen = QApplication.screenAt(QPoint(int(x), int(y)))
+        if screen is None:
             screen = QApplication.primaryScreen()
-            if screen:
-                geo = screen.availableGeometry()
-                self.move(
-                    geo.center().x() - w // 2,
-                    geo.center().y() - h // 2,
-                )
+
+        if screen is None:
+            self.resize(w, h)
+            return
+
+        avail = screen.availableGeometry()
+        w = min(w, avail.width())
+        h = min(h, avail.height())
+        self.resize(w, h)
+
+        if x is None or y is None:
+            self.move(avail.center().x() - w // 2, avail.center().y() - h // 2)
+            return
+
+        # Keep the window fully inside the target screen.
+        x = max(avail.left(), min(int(x), avail.right()  - w + 1))
+        y = max(avail.top(),  min(int(y), avail.bottom() - h + 1))
+        self.move(x, y)
 
     def _save_window_state(self) -> None:
         self._settings.window_width  = self.width()
@@ -316,13 +387,31 @@ class MainWindow(QMainWindow):
         self._settings.window_x      = self.x()
         self._settings.window_y      = self.y()
 
+        # sizes()[-1] is 0 whenever the history panel is hidden; persisting
+        # that would make the panel unusable (0 px tall) after a restart.
         sizes = self._v_splitter.sizes()
-        if len(sizes) > 1:
+        if len(sizes) > 1 and sizes[-1] > 0:
             self._settings.history_panel_height = sizes[-1]
 
     # ------------------------------------------------------------------ #
     # Shutdown lifecycle  ← THE FIX                                       #
     # ------------------------------------------------------------------ #
+
+    def ensure_workers_stopped(self) -> None:
+        """
+        Idempotent worker shutdown, safe to call from QApplication.aboutToQuit.
+
+        closeEvent already does this on the normal path; this guards the exit
+        paths that bypass it, where a still-running QThread would be destroyed
+        and abort the process.
+        """
+        if self._workers_stopped:
+            return
+        self._workers_stopped = True
+        try:
+            self._output_panel.shutdown()
+        except Exception:
+            logger.warning("Worker shutdown raised during exit", exc_info=True)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """
@@ -370,7 +459,7 @@ class MainWindow(QMainWindow):
                 return
 
         # ── 2. Stop all workers ────────────────────────────────────── #
-        self._output_panel.shutdown()
+        self.ensure_workers_stopped()
 
         # ── 3. Save settings ───────────────────────────────────────── #
         self._save_window_state()

@@ -10,7 +10,7 @@
 ::   - pip install -r requirements.txt pyinstaller
 ::
 :: Output:
-::   releases\SetupTTS-Windows-1.5.2.zip  (single self-contained EXE)
+::   releases\SetupTTS-Windows-<version>.zip  (single self-contained EXE)
 ::
 :: Uses setuptts_portable.spec (onefile). Users extract the zip and
 :: double-click SetupTTS.exe — no folder structure required.
@@ -19,7 +19,18 @@
 setlocal enabledelayedexpansion
 
 set APP_NAME=SetupTTS
-set VERSION=1.5.2
+:: Single source of truth: app/__init__.py (keeps the zip name, the
+:: EXE version and the About dialog from drifting apart).
+set VERSION=
+for /f "tokens=2 delims==" %%V in ('findstr /b "APP_VERSION" app\__init__.py') do (
+    set VERSION=%%V
+)
+set VERSION=%VERSION: =%
+set VERSION=%VERSION:"=%
+if "%VERSION%"=="" (
+    echo ERROR: could not read APP_VERSION from app/__init__.py
+    exit /b 1
+)
 set PORT_SPEC=setuptts_portable.spec
 set DIST_DIR=dist_portable
 set EXE=%DIST_DIR%\%APP_NAME%.exe

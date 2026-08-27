@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QClipboard
+from PySide6.QtGui import QClipboard, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -49,7 +51,7 @@ class SettingsDialog(QDialog):
         self._settings = settings
         self._paths = paths or AppPaths()
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(520)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self._build_ui()
         self._load_values()
@@ -57,7 +59,24 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------ #
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
+        # The settings content scrolls, with the button row pinned below it.
+        # Word-wrapped labels report a height-for-width that a plain dialog
+        # layout underestimates, which previously clipped both the note under
+        # the checkbox and the Save/Cancel row. Scrolling also keeps the dialog
+        # usable on short screens and at large system font sizes.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("dialogScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        content.setObjectName("dialogScrollInner")
+        root = QVBoxLayout(content)
         root.setContentsMargins(28, 24, 28, 20)
         root.setSpacing(20)
 
@@ -91,10 +110,17 @@ class SettingsDialog(QDialog):
         audio_note.setObjectName("metaLabel")
         root.addWidget(audio_note)
 
-        self._auto_voice_checkbox = QCheckBox(
-            "Automatically switch to a recommended voice when the current voice looks incompatible"
-        )
+        self._auto_voice_checkbox = QCheckBox("Auto-switch to a recommended voice")
         root.addWidget(self._auto_voice_checkbox)
+
+        auto_voice_note = QLabel(
+            "When the selected voice looks incompatible with the text "
+            "(for example an English voice for Hindi script), switch to the "
+            "recommended voice automatically instead of asking."
+        )
+        auto_voice_note.setWordWrap(True)
+        auto_voice_note.setObjectName("metaLabel")
+        root.addWidget(auto_voice_note)
 
         # ── Data ───────────────────────────────────────────────────── #
         root.addWidget(self._section_title("Data"))
@@ -103,14 +129,10 @@ class SettingsDialog(QDialog):
         data_form.setSpacing(12)
         data_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        self._data_dir_label = QLabel()
-        self._data_dir_label.setObjectName("metaLabel")
-        self._data_dir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._data_dir_label = _PathLabel()
         data_form.addRow("App data folder:", self._data_dir_label)
 
-        self._log_dir_label = QLabel()
-        self._log_dir_label.setObjectName("metaLabel")
-        self._log_dir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._log_dir_label = _PathLabel()
         data_form.addRow("Log folder:", self._log_dir_label)
 
         root.addLayout(data_form)
@@ -139,14 +161,23 @@ class SettingsDialog(QDialog):
 
         log_btn_row.addStretch()
         root.addLayout(log_btn_row)
-
         root.addStretch()
 
-        # ── Buttons ────────────────────────────────────────────────── #
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+
+        # ── Buttons (pinned below the scroll area) ─────────────────── #
+        button_bar = QWidget()
+        button_bar.setObjectName("dialogButtonBar")
+        bl = QHBoxLayout(button_bar)
+        bl.setContentsMargins(28, 12, 28, 16)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        bl.addWidget(buttons)
+        outer.addWidget(button_bar)
+
+        self.resize(560, 620)
 
     # ------------------------------------------------------------------ #
 
@@ -155,8 +186,8 @@ class SettingsDialog(QDialog):
         self._auto_voice_checkbox.setChecked(
             self._settings.auto_switch_recommended_voice
         )
-        self._data_dir_label.setText(str(self._paths.data_dir))
-        self._log_dir_label.setText(str(self._paths.log_dir))
+        self._data_dir_label.set_path(str(self._paths.data_dir))
+        self._log_dir_label.set_path(str(self._paths.log_dir))
 
     def _browse_output_dir(self) -> None:
         current = self._output_dir_edit.text() or str(Path.home() / "Desktop")
@@ -244,8 +275,44 @@ class SettingsDialog(QDialog):
     @staticmethod
     def _section_title(text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setStyleSheet(
-            "font-size: 13px; font-weight: 600; color: #1D1D1F; "
-            "border-bottom: 1px solid #E5E5EA; padding-bottom: 6px;"
-        )
+        lbl.setObjectName("dialogSectionTitle")
         return lbl
+
+
+# ---------------------------------------------------------------------- #
+# Elide-aware path label                                                  #
+# ---------------------------------------------------------------------- #
+
+class _PathLabel(QLabel):
+    """
+    Single-line label that elides a long filesystem path in the middle.
+
+    A plain QLabel reports the full path as its minimum width, which blows
+    out the form layout and pushes the row labels out of the dialog.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("pathLabel")
+        self._full_path = ""
+        self.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(120)
+
+    def set_path(self, path: str) -> None:
+        self._full_path = path
+        self.setToolTip(path)
+        self._apply_elide()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        if not self._full_path:
+            self.setText("")
+            return
+        metrics = QFontMetrics(self.font())
+        self.setText(
+            metrics.elidedText(self._full_path, Qt.ElideMiddle, max(60, self.width()))
+        )
