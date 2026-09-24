@@ -105,12 +105,14 @@ class SettingsDialog(QDialog):
             "Your voice and speed are remembered automatically between sessions."
         ))
 
-        self._auto_voice_checkbox = QCheckBox("Switch to a matching voice automatically")
+        # Kept short: a checkbox label can't wrap, so its width is a hard
+        # minimum for the whole dialog (the long form overflowed on Windows).
+        self._auto_voice_checkbox = QCheckBox("Auto-match voice to text")
         root.addWidget(self._auto_voice_checkbox)
         root.addWidget(self._note(
-            "If the selected voice doesn't suit the text's language (for "
-            "example an English voice for Hindi text), use the recommended "
-            "voice instead of asking first."
+            "When the selected voice doesn't suit the text's language (for "
+            "example an English voice for Hindi text), switch to the "
+            "recommended voice instead of asking first."
         ))
 
         # ── Logs ───────────────────────────────────────────────────── #
@@ -123,27 +125,22 @@ class SettingsDialog(QDialog):
         self._log_file_label = _PathLabel()
         root.addWidget(self._log_file_label)
 
-        # Two rows, not three buttons abreast: under Windows' Segoe UI the
-        # single row needed ~565 px and clipped a 520 px dialog on the right.
-        log_btn_row = QHBoxLayout()
-        log_btn_row.setSpacing(8)
-
+        # One button per row: under Windows' wider font even two abreast
+        # came close to overflowing a 520 px dialog.
         open_folder_btn = QPushButton("Open Logs Folder")
         open_folder_btn.clicked.connect(self._open_logs_folder)
-        log_btn_row.addWidget(open_folder_btn)
-
         open_file_btn = QPushButton("Open Current Log")
         open_file_btn.clicked.connect(self._open_log_file)
-        log_btn_row.addWidget(open_file_btn)
-        log_btn_row.addStretch()
-        root.addLayout(log_btn_row)
-
-        copy_row = QHBoxLayout()
         self._copy_path_btn = QPushButton("Copy Log Path")
         self._copy_path_btn.clicked.connect(self._copy_log_path)
-        copy_row.addWidget(self._copy_path_btn)
-        copy_row.addStretch()
-        root.addLayout(copy_row)
+        column = QVBoxLayout()   # shared column → equal button widths
+        column.setSpacing(6)
+        for btn in (open_folder_btn, open_file_btn, self._copy_path_btn):
+            column.addWidget(btn)
+        row = QHBoxLayout()
+        row.addLayout(column)
+        row.addStretch()
+        root.addLayout(row)
 
         # ── About ──────────────────────────────────────────────────── #
         root.addWidget(self._section_title("About"))
