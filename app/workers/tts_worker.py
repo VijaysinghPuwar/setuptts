@@ -15,7 +15,9 @@ path is now more defensive:
 """
 
 import asyncio
+import dataclasses
 import hashlib
+import html
 from dataclasses import dataclass, field
 import io
 import logging
@@ -33,6 +35,7 @@ from edge_tts.communicate import escape, remove_incompatible_characters
 from PySide6.QtCore import QThread, Signal
 
 from app.services.tts_quality import (
+    TextProfile,
     VoiceCompatibilityAssessment,
     assess_voice_compatibility,
     build_text_profile,
@@ -444,10 +447,19 @@ class _ChunkCursor:
         max_chars: int,
         max_payload_bytes: int,
     ) -> tuple[str, int, int, int]:
-        """Return (chunk_text, payload_bytes, start_char, end_char)."""
-        chunk, start, end, payload = _take_chunk_at(
+        """Return (chunk_text, payload_bytes, start_char, end_char).
+
+        The range starts at the cursor, *not* at the first non-whitespace
+        character: whitespace between two chunks belongs to the later one.
+        Reporting the stripped start left a gap whenever a split landed
+        inside a whitespace run (e.g. a paragraph break straddling the
+        warm-up size), and the coverage check then refused to finalise —
+        on every resume, since the same text re-chunks the same way.
+        """
+        start = self.position
+        chunk, _, end, payload = _take_chunk_at(
             self.source_text,
-            self.position,
+            start,
             max_chars,
             max_payload_bytes,
         )
@@ -683,6 +695,111 @@ class _AttemptStats:
     started_at: float = 0.0
     first_audio_at: float | None = None
     last_event_at: float | None = None
+    # (offset_ticks, duration_ticks, text) for every boundary event, in order.
+    boundaries: list[tuple[int, int, str]] = field(default_factory=list)
+
+
+# The service streams audio-24khz-48kbitrate-mono-mp3: constant 48 kbit/s, so
+# a byte count converts exactly to seconds of audio.
+_MP3_BYTES_PER_SECOND = 48_000 // 8
+_TICKS_PER_SECOND = 10_000_000
+# Measured against the live service: complete audio ends 0.02–0.06 s past the
+# last boundary's end, while a boundary arrives up to ~5 s before its audio is
+# finished.  So audio stopping short of the last boundary means the stream was
+# cut, and this margin only absorbs frame rounding.
+_AUDIO_END_TOLERANCE_S = 0.35
+# Unspoken tail allowed before a chunk counts as cut off, in letters/digits
+# after normalisation.  Measured on complete streams from 36 voices across 9
+# languages (numbers, symbols, quotes, URLs, emoji): the boundary events
+# accounted for every letter of the text, every time.  The few letters of
+# slack only absorb a rewritten final token; anything larger is a sentence
+# that was never spoken.
+_UNSPOKEN_TAIL_LETTERS = 4
+
+
+def _speakable(text: str) -> str:
+    """Letters and digits only, case-folded — for comparing text loosely."""
+    return "".join(ch for ch in html.unescape(text).casefold() if ch.isalnum())
+
+
+def _stream_incomplete_reason(
+    text: str,
+    boundaries: list[tuple[int, int, str]],
+    audio_bytes: int,
+) -> str | None:
+    """
+    Why a stream that ended *without an error* is nevertheless incomplete.
+
+    edge_tts ends its stream quietly when the websocket closes before the
+    service's ``turn.end`` message, and only raises when no audio arrived at
+    all.  A connection dropped mid-chunk therefore used to yield partial
+    audio that was accepted as the whole chunk — a silent gap in the
+    audiobook that the coverage check (which trusts the recorded range)
+    could not see.
+
+    Two independent checks, each tolerant of the other's blind spot:
+
+    * audio length — the received audio must reach the end of the last
+      sentence the service announced (catches a cut *inside* a sentence);
+    * text reach — the announced sentences must reach the end of the chunk's
+      text (catches a cut *between* sentences, before the next one was
+      announced).
+
+    A stream with audio but no boundary events at all is incomplete: the
+    service announces each sentence a few seconds before its audio finishes,
+    so this is a connection cut in the first seconds of the chunk.  (Every
+    voice tested sends them; if the service ever stopped, the job would fail
+    visibly and resumably rather than produce silently truncated audio.)
+
+    Returns None when the chunk is complete, or when the boundary text cannot
+    be matched against the source at all (then only the audio-length check
+    applies).
+    """
+    if audio_bytes <= 0:
+        return None
+    if not boundaries:
+        if _speakable(text):
+            return (
+                f"received {audio_bytes / _MP3_BYTES_PER_SECOND:.1f} s of audio "
+                "but the service never confirmed any speech"
+            )
+        return None
+
+    audio_s = audio_bytes / _MP3_BYTES_PER_SECOND
+    speech_end_s = max(off + dur for off, dur, _ in boundaries) / _TICKS_PER_SECOND
+    if audio_s + _AUDIO_END_TOLERANCE_S < speech_end_s:
+        return (
+            f"received {audio_s:.1f} s of audio but the speech runs to "
+            f"{speech_end_s:.1f} s"
+        )
+
+    source = _speakable(text)
+    if not source:
+        return None
+    position = 0
+    matched = False
+    for _, _, boundary_text in boundaries:
+        spoken = _speakable(boundary_text)
+        if not spoken:
+            continue
+        idx = source.find(spoken, position)
+        if idx < 0 and len(spoken) > 12:
+            # Tolerate the service rewriting part of a sentence (numbers,
+            # symbols): anchor on the sentence's ending instead.
+            tail = spoken[-12:]
+            idx = source.find(tail, position)
+            spoken = tail
+        if idx < 0:
+            continue
+        position = idx + len(spoken)
+        matched = True
+    if not matched:
+        return None
+
+    unspoken = len(source) - position
+    if unspoken > _UNSPOKEN_TAIL_LETTERS:
+        return f"the audio stopped with about {unspoken} letters of this section unspoken"
+    return None
 
 
 @dataclass
@@ -753,6 +870,67 @@ class _PreflightError(RuntimeError):
         self.suggestion = suggestion
 
 
+def _disk_problem_text(exc: BaseException | None, *, output: bool = False) -> str:
+    """Plain explanation of a file-system error while saving audio."""
+    code = getattr(exc, "errno", None)
+    winerror = getattr(exc, "winerror", None)
+    if code == 28 or winerror in (39, 112):
+        return "The disk is full. Free up some space on this computer."
+    if winerror in (32, 33):
+        return (
+            "The file is open in another program (for example a media "
+            "player). Close it and try again."
+            if output else
+            "Another program (such as antivirus or a sync app) is using "
+            "SetupTTS's working files. Wait a moment and try again."
+        )
+    if isinstance(exc, PermissionError):
+        return (
+            "SetupTTS isn't allowed to save in the chosen folder, or the file "
+            "is open in another program. Close any program using the file, or "
+            "choose a different folder."
+            if output else
+            "SetupTTS isn't allowed to write its working files. Another "
+            "program may be blocking them."
+        )
+    if isinstance(exc, FileNotFoundError):
+        return (
+            "The save folder is no longer available — it may have been moved, "
+            "or it is on a drive that was disconnected."
+        )
+    return "A problem occurred while writing to the disk."
+
+
+def _estimate_total_chunks(
+    chunk_idx: int,
+    source_start: int,
+    source_end: int,
+    total_chars: int,
+) -> int:
+    """
+    Estimated chunk count for the whole job, for "chunk N of ~M" labels.
+
+    The chunk being cut right now is the best predictor of the ones to come:
+    its size already reflects the payload limit (which binds well before the
+    character ceiling) and the adaptive ramp.
+    """
+    current_len = max(source_end - source_start, 1)
+    remaining = max(total_chars - source_start, current_len)
+    return max(chunk_idx + 1, chunk_idx + math.ceil(remaining / current_len))
+
+
+class _DurationShortfall(RuntimeError):
+    """The assembled MP3 is far shorter than the text should produce."""
+
+    def __init__(self, measured: float, expected_min: float, expected_max: float) -> None:
+        super().__init__(
+            f"measured {measured:.0f}s vs expected {expected_min:.0f}-{expected_max:.0f}s"
+        )
+        self.measured = measured
+        self.expected_min = expected_min
+        self.expected_max = expected_max
+
+
 class _ChunkError(RuntimeError):
     """Raised when all recovery options for one logical chunk are exhausted."""
 
@@ -813,9 +991,40 @@ class TTSWorker(QThread):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task | None = None
         self._last_pct = 0
-        self._text_profile = build_text_profile(text)
+        # Length of the finished MP3 in seconds, measured during the final
+        # sanity check; read by the job queue for the history "Length" column.
+        self.audio_duration_seconds: float | None = None
+        # Built on first use, which is on the worker thread: profiling a whole
+        # book here ran on the GUI thread when the job queue created the
+        # worker, freezing the window for seconds on a slow machine.
+        self._profile: TextProfile | None = None
+        self._chunk_store: ChunkStore | None = None
+        self._output_written = False
         self._compatibility: VoiceCompatibilityAssessment | None = None
         self._health = _RollingHealthState()
+
+    @property
+    def _text_profile(self) -> TextProfile:
+        if self._profile is None:
+            self._profile = self._build_profile()
+        return self._profile
+
+    def _build_profile(self) -> TextProfile:
+        """
+        Profile the job's text.  A resume uses the staged source verbatim.
+
+        The staged source.txt is the *cleaned* text the saved chunks were cut
+        from.  Cleaning it a second time is not a no-op ("Stop ! ! !" →
+        "Stop!!!" → "Stop!!"), so the resumed text hashed differently, the
+        saved progress was judged not to match, and the job silently started
+        over from chunk 1.
+        """
+        profile = build_text_profile(self._text)
+        if self._resume_staging_dir is not None:
+            staged = ChunkStore.load_source_text(self._resume_staging_dir)
+            if staged and staged.strip():
+                profile = dataclasses.replace(profile, cleaned_text=staged)
+        return profile
 
     def cancel(self) -> None:
         """Cancel mid-stream. Interrupts the async Task cleanly."""
@@ -824,7 +1033,12 @@ class TTSWorker(QThread):
         loop = self._loop
         task = self._async_task
         if loop and not loop.is_closed() and task:
-            loop.call_soon_threadsafe(task.cancel)
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                # The loop closed between the check and the call (the worker
+                # was finishing); _cancelled is already set, which is enough.
+                pass
 
     def run(self) -> None:
         start = time.monotonic()
@@ -838,8 +1052,14 @@ class TTSWorker(QThread):
         try:
             self._loop.run_until_complete(self._run_with_task())
 
-            if self._cancelled:
+            if self._cancelled and not self._output_written:
                 return
+            if self._cancelled:
+                # Cancel arrived during final assembly, which runs to the end
+                # once started: the file is complete, so report it as such
+                # rather than as cancelled with a finished MP3 on disk.
+                logger.info("Cancel arrived after %s was complete — keeping it",
+                            self._output_path)
 
             elapsed = time.monotonic() - start
             logger.info(
@@ -859,6 +1079,11 @@ class TTSWorker(QThread):
                 self.failed.emit(self._user_message(exc))
 
         finally:
+            store = self._chunk_store
+            if store is not None:
+                # Every normal exit already released it; this covers an
+                # unexpected error, so the job shows up for resume again.
+                store.release()
             try:
                 self._loop.close()
             except Exception:
@@ -866,6 +1091,36 @@ class TTSWorker(QThread):
             self._loop = None
             self._async_task = None
             asyncio.set_event_loop(None)
+
+    async def _list_voices_with_retry(self, *, force_refresh: bool = False) -> list[dict]:
+        """
+        Fetch the voice catalog, riding out a brief network blip.
+
+        This is the first network call of every job (the cache lasts 15 min),
+        and a single failed DNS lookup here used to end the job at once with
+        the raw aiohttp error text.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            if self._cancelled:
+                raise asyncio.CancelledError()
+            if attempt:
+                self.stage_changed.emit(
+                    "waiting",
+                    f"Retry {attempt}/2 on the voice check — waiting for the connection",
+                )
+                await asyncio.sleep(_BACKOFF_BASE * (2 ** (attempt - 1)))
+            try:
+                return await list_voices(force_refresh=force_refresh)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Voice catalog request failed (attempt %d/3): %s",
+                               attempt + 1, exc)
+        assert last_exc is not None
+        failure = self._classify_attempt_failure(last_exc, _AttemptStats(), "the voice check")
+        raise _PreflightError(self._voice, failure) from last_exc
 
     async def _run_with_task(self) -> None:
         self._async_task = asyncio.current_task()
@@ -904,10 +1159,10 @@ class TTSWorker(QThread):
             "remote",
             f"Validating selected voice ({self._voice}) with Microsoft",
         )
-        voices = await list_voices()
+        voices = await self._list_voices_with_retry()
         selected_voice = _find_voice(voices, self._voice)
         if selected_voice is None:
-            voices = await list_voices(force_refresh=True)
+            voices = await self._list_voices_with_retry(force_refresh=True)
             selected_voice = _find_voice(voices, self._voice)
             if selected_voice is None:
                 raise _PreflightError(
@@ -970,9 +1225,14 @@ class TTSWorker(QThread):
         # ── Set up chunk staging (checkpoint / resume) ─────────────────── #
         staging_root = AppPaths().staging_dir
         self._check_free_space(staging_root, total_chars, Path(self._output_path))
-        # Clean up orphaned staging dirs from previous sessions in the background.
+        # Clean up orphaned staging dirs from previous sessions — never the one
+        # this job is about to resume.
         try:
-            cleanup_stale_staging(staging_root, max_age_days=7)
+            cleanup_stale_staging(
+                staging_root,
+                max_age_days=7,
+                keep=tuple(p for p in (self._resume_staging_dir,) if p is not None),
+            )
         except Exception:
             pass
 
@@ -988,10 +1248,18 @@ class TTSWorker(QThread):
                     chunk_store.manifest.chars_consumed,
                 )
             else:
+                # Start over under a *new* id so the old staging directory is
+                # left exactly as it was.  Reusing the id overwrote its
+                # manifest, destroying whatever progress it still held.
                 logger.warning(
                     "Could not resume from %s (mismatch or no valid data) — starting fresh",
                     self._resume_staging_dir,
                 )
+                self.stage_changed.emit(
+                    "local",
+                    "Saved progress couldn't be reused — starting from the beginning",
+                )
+                self._job_id = uuid.uuid4().hex
                 chunk_store = ChunkStore.create(
                     staging_root,
                     self._job_id,
@@ -1011,6 +1279,8 @@ class TTSWorker(QThread):
                 output_path=self._output_path,
                 text=stripped_text,
             )
+
+        self._chunk_store = chunk_store
 
         # ── Initialise cursor, possibly from a resume point ─────────────── #
         # The resume position is derived from the manifest's recorded chunk
@@ -1116,15 +1386,14 @@ class TTSWorker(QThread):
                 if not text_chunk:
                     break
 
-                estimated_total = self._estimate_remaining_chunks(
-                    total_chars,
-                    progress_state.processed_chars,
-                    max(adaptive_char_limit, chunk_plan.ramp_chars),
+                # Chunks done + what the rest of the text needs at the size
+                # chunks are actually being cut to.  (This used to report the
+                # *remaining* count clamped to the current index, so the label
+                # read "11/11", "16/16" … for most of a job, and a failure on
+                # chunk 150 of 210 was reported as "chunk 150/150".)
+                estimated_total = _estimate_total_chunks(
+                    chunk_idx, source_start, source_end, total_chars,
                 )
-                if estimated_total < chunk_idx + 1:
-                    estimated_total = chunk_idx + 1
-                # Account for chunks already completed in the estimate
-                estimated_total = max(estimated_total, chunk_idx + 1)
 
                 chunk_number = chunk_idx + 1
                 chunk_label = (
@@ -1152,16 +1421,34 @@ class TTSWorker(QThread):
                 # ── Write chunk to staging ──────────────────────────────── #
                 write_started_at = time.monotonic()
                 self.stage_changed.emit("local", f"Writing {chunk_label} to disk")
-                chunk_store.record_chunk(
-                    chunk_idx,
-                    start_char=source_start,
-                    end_char=source_end,
-                    text_hash=_short_text_hash(stripped_text[source_start:source_end]),
-                    audio_bytes=chunk_bytes,
-                    retries=outcome.attempts - 1,
-                    used_recovery=outcome.used_recovery,
-                    sub_ranges=outcome.sub_ranges,
-                )
+                try:
+                    chunk_store.record_chunk(
+                        chunk_idx,
+                        start_char=source_start,
+                        end_char=source_end,
+                        text_hash=_short_text_hash(stripped_text[source_start:source_end]),
+                        audio_bytes=chunk_bytes,
+                        retries=outcome.attempts - 1,
+                        used_recovery=outcome.used_recovery,
+                        sub_ranges=outcome.sub_ranges,
+                    )
+                    chunk_store.update_chars_consumed(source_end)
+                except OSError as exc:
+                    # Disk full, or a file locked by antivirus / a sync client.
+                    # Routed through _ChunkError so the chunks already saved are
+                    # preserved and the job is offered for resume — escaping as
+                    # a bare OSError left the manifest "running", offered no
+                    # Resume, and showed the raw errno text.
+                    logger.error("Could not save %s to staging: %s", chunk_label, exc)
+                    raise _ChunkError(
+                        chunk_number,
+                        estimated_total,
+                        _AttemptFailure(
+                            "staging_io",
+                            f"Could not save {chunk_label} to disk: {exc}",
+                            original=exc,
+                        ),
+                    ) from exc
                 # Move the word-boundary char counter forward to the end of the
                 # range we have actually committed to disk. Without this, a
                 # resume cursor would lag behind for chunks where the service
@@ -1169,7 +1456,6 @@ class TTSWorker(QThread):
                 if source_end > progress_state.processed_chars:
                     progress_state.processed_chars = source_end
                     self._emit_progress_from_chars(source_end, total_chars)
-                chunk_store.update_chars_consumed(source_end)
                 write_duration = time.monotonic() - write_started_at
 
                 self._emit_saved_stage(
@@ -1289,8 +1575,75 @@ class TTSWorker(QThread):
 
         # ── Assemble final file ──────────────────────────────────────────── #
         self.stage_changed.emit("local", "Assembling final audio file from all chunks…")
+        expected_min, expected_max = (
+            chunk_store.manifest.expected_duration_min_s or 0.0,
+            chunk_store.manifest.expected_duration_max_s or 0.0,
+        )
+        rejected_path = output_path.with_name(
+            f"{output_path.stem} (incomplete){output_path.suffix}"
+        )
+        measured: dict[str, float | None] = {"duration": None}
+
+        def _verify_duration(assembled: Path) -> None:
+            # Runs on the assembled temp file *before* it replaces the output,
+            # so a suspect result never overwrites an existing good file.
+            duration = mp3_duration_seconds(assembled)
+            measured["duration"] = duration
+            if duration is None:
+                # edge_tts only passes audio/mpeg payloads through, so this
+                # means the frame parser failed, not that the audio is bad.
+                logger.warning("Could not measure the duration of %s", assembled)
+                return
+            # Fail-closed when the measured duration is far below the most
+            # pessimistic estimate — the signature of silent truncation.
+            if expected_min > 0 and duration < expected_min * 0.55:
+                raise _DurationShortfall(duration, expected_min, expected_max)
+
         try:
-            chunk_store.finalize(output_path, mark_completed=False)
+            chunk_store.finalize(
+                output_path,
+                mark_completed=False,
+                verify=_verify_duration,
+                rejected_path=rejected_path,
+            )
+        except _DurationShortfall as exc:
+            logger.error(
+                "Duration sanity check failed for job %s: "
+                "measured=%.1fs expected_min=%.1fs expected_max=%.1fs",
+                self._job_id, exc.measured, exc.expected_min, exc.expected_max,
+            )
+            chunk_store.set_measured_duration(exc.measured)
+            chunk_store.mark_failed(chunk_idx, chunk_idx)
+            kept_copy = rejected_path.exists()
+            if kept_copy:
+                # Resuming would only reassemble the same chunks into the same
+                # short file, so don't offer it.  All of the generated audio is
+                # in the kept copy, which the message points the user to.
+                chunk_store.cleanup()
+            else:
+                self.job_resumable.emit(
+                    str(chunk_store.staging_dir),
+                    chunk_store.completed_count,
+                    chunk_idx,
+                    chunk_idx,
+                )
+            error = _ChunkError(
+                chunk_idx,
+                chunk_idx,
+                _AttemptFailure(
+                    "duration_truncated",
+                    (
+                        f"Final audio is unexpectedly short: "
+                        f"{exc.measured:.0f}s measured vs "
+                        f"{exc.expected_min:.0f}-{exc.expected_max:.0f}s expected."
+                    ),
+                    suggestion=rejected_path.name if rejected_path.exists() else None,
+                ),
+            )
+            if not kept_copy:
+                error.preserved_chunks = chunk_store.completed_count
+                error.staging_dir = chunk_store.staging_dir
+            raise error from exc
         except CoverageError as exc:
             logger.error(
                 "Assembly coverage check failed for job %s: %s",
@@ -1339,54 +1692,10 @@ class TTSWorker(QThread):
         if size <= 0:
             raise RuntimeError("The speech service completed without writing any audio.")
 
-        # ── Output duration sanity check ─────────────────────────────────── #
-        measured_duration = mp3_duration_seconds(output_path)
+        self._output_written = True
+        measured_duration = measured["duration"]
         chunk_store.set_measured_duration(measured_duration)
-
-        expected_min, expected_max = (
-            chunk_store.manifest.expected_duration_min_s or 0.0,
-            chunk_store.manifest.expected_duration_max_s or 0.0,
-        )
-        if measured_duration is not None and expected_min > 0:
-            # Fail-closed when the measured duration is significantly below the
-            # most pessimistic estimate — that pattern is consistent with the
-            # silent-truncation bug this work is meant to prevent.
-            shortfall_threshold = expected_min * 0.55
-            if measured_duration < shortfall_threshold:
-                logger.error(
-                    "Duration sanity check failed for job %s: "
-                    "measured=%.1fs expected_min=%.1fs expected_max=%.1fs",
-                    self._job_id,
-                    measured_duration,
-                    expected_min,
-                    expected_max,
-                )
-                # Preserve the assembled file so the user can inspect it, but
-                # report the job as resumable so progress is not lost.
-                chunk_store.mark_failed(chunk_idx, chunk_idx)
-                self.job_resumable.emit(
-                    str(chunk_store.staging_dir),
-                    chunk_store.completed_count,
-                    chunk_idx,
-                    chunk_idx,
-                )
-                error = _ChunkError(
-                    chunk_idx,
-                    chunk_idx,
-                    _AttemptFailure(
-                        "duration_truncated",
-                        (
-                            f"Final audio is unexpectedly short: "
-                            f"{measured_duration:.0f}s measured vs "
-                            f"{expected_min:.0f}-{expected_max:.0f}s expected. "
-                            "The output may be truncated — staged progress has "
-                            "been preserved for review/resume."
-                        ),
-                    ),
-                )
-                error.preserved_chunks = chunk_store.completed_count
-                error.staging_dir = chunk_store.staging_dir
-                raise error
+        self.audio_duration_seconds = measured_duration
 
         chunk_store.mark_completed()
         chunk_store.cleanup()
@@ -1504,7 +1813,10 @@ class TTSWorker(QThread):
             else _suggest_stable_long_form_voice(self._voice, voices)
         )
         if last_failure.kind in {"no_audio", "metadata_without_audio"}:
-            refreshed = await list_voices(force_refresh=True)
+            try:
+                refreshed = await self._list_voices_with_retry(force_refresh=True)
+            except _PreflightError:
+                refreshed = voices
             if _find_voice(refreshed, self._voice) is None:
                 suggestion = _suggest_alternative_voice(self._voice, refreshed)
                 last_failure = _AttemptFailure(
@@ -1870,6 +2182,11 @@ class TTSWorker(QThread):
             receive_timeout=receive_timeout,
         )
 
+        # Both depend only on the chunk text; computing them per stream event
+        # re-measured the payload a thousand-odd times per chunk.
+        first_audio_wait = self._first_audio_timeout_for(text, first_audio_timeout_s)
+        idle_wait = self._stream_idle_timeout_for(text)
+
         async def _consume_stream() -> None:
             stream = communicate.stream().__aiter__()
             deadline = stats.started_at + timeout_s
@@ -1883,9 +2200,9 @@ class TTSWorker(QThread):
                     raise asyncio.TimeoutError()
 
                 if stats.audio_bytes == 0:
-                    wait_timeout = min(deadline - now, self._first_audio_timeout_for(text, first_audio_timeout_s))
+                    wait_timeout = min(deadline - now, first_audio_wait)
                 else:
-                    wait_timeout = min(deadline - now, self._stream_idle_timeout_for(text))
+                    wait_timeout = min(deadline - now, idle_wait)
 
                 try:
                     event = await asyncio.wait_for(stream.__anext__(), timeout=max(wait_timeout, 1.0))
@@ -1909,6 +2226,13 @@ class TTSWorker(QThread):
 
                 if event["type"] in ("WordBoundary", "SentenceBoundary"):
                     stats.metadata_events += 1
+                    stats.boundaries.append(
+                        (
+                            int(event.get("offset", 0) or 0),
+                            int(event.get("duration", 0) or 0),
+                            str(event.get("text", "") or ""),
+                        )
+                    )
                     if progress_state is None:
                         continue
 
@@ -1944,6 +2268,16 @@ class TTSWorker(QThread):
             )
             raise _AttemptFailure(kind, detail)
 
+        incomplete = _stream_incomplete_reason(text, stats.boundaries, stats.audio_bytes)
+        if incomplete is not None:
+            # Retryable exactly like a stall after partial audio: the attempt's
+            # audio is discarded and the chunk is requested again.
+            self._rollback_failed_attempt(progress_state, total_chars)
+            logger.warning("%s ended early: %s", chunk_label, incomplete)
+            raise _AttemptFailure(
+                "timeout_after_audio",
+                f"The connection closed before {chunk_label} finished ({incomplete}).",
+            )
         return audio_buffer.getvalue(), stats.attempt_chars, stats
 
     def _rollback_failed_attempt(
@@ -2067,7 +2401,7 @@ class TTSWorker(QThread):
         if failure is None:
             return f"Retrying ({attempt}/{_MAX_ATTEMPTS - 1})…"
         if failure.kind in {"dns"}:
-            return f"DNS issue — retrying ({attempt}/{_MAX_ATTEMPTS - 1})…"
+            return f"Connection problem — retrying ({attempt}/{_MAX_ATTEMPTS - 1})…"
         if failure.kind.startswith("timeout"):
             return f"Speech request timed out — retrying ({attempt}/{_MAX_ATTEMPTS - 1})…"
         if failure.kind in {"no_audio", "metadata_without_audio"}:
@@ -2334,8 +2668,10 @@ class TTSWorker(QThread):
                 )
             if exc.cause.kind == "dns":
                 return (
-                    "Could not resolve speech.platform.bing.com during the startup check.\n\n"
-                    "Please check your internet connection or DNS settings and try again."
+                    "SetupTTS couldn't reach the Microsoft speech service.\n\n"
+                    "Please check your internet connection and try again."
+                    "\n\nTechnical details: could not resolve speech.platform.bing.com "
+                    "during the startup check."
                 )
             if exc.cause.kind.startswith("timeout"):
                 return (
@@ -2345,12 +2681,15 @@ class TTSWorker(QThread):
                 )
             if exc.cause.kind == "network":
                 return (
-                    "The network/service connection was unstable during the startup check.\n\n"
-                    "Please try again. If the problem continues, wait a minute and retry."
+                    "SetupTTS couldn't connect to the Microsoft speech service.\n\n"
+                    "Please check your internet connection and try again. If the "
+                    "problem continues, wait a minute and retry."
+                    f"\n\nTechnical details: {exc.cause}"
                 )
             return (
-                "The voice validation check failed before generation started.\n\n"
-                f"Details: {exc.cause}"
+                "SetupTTS couldn't start this job because the speech service "
+                "check failed. Please try again in a moment."
+                f"\n\nTechnical details: {exc.cause}"
             )
 
         if isinstance(exc, _ChunkError):
@@ -2375,9 +2714,12 @@ class TTSWorker(QThread):
                 )
             if cause.kind == "dns":
                 return (
-                    f"Could not resolve speech.platform.bing.com while generating {chunk_ctx}.\n\n"
-                    "Please check your internet connection or DNS settings and try again."
+                    f"SetupTTS lost its connection to the Microsoft speech service "
+                    f"while generating {chunk_ctx}.\n\n"
+                    "Please check your internet connection and try again."
                     f"{preserved_note}"
+                    f"\n\nTechnical details: could not resolve speech.platform.bing.com "
+                    f"for {chunk_ctx}."
                 )
             if cause.kind.startswith("timeout"):
                 return (
@@ -2407,51 +2749,64 @@ class TTSWorker(QThread):
                 )
             if cause.kind == "incomplete_coverage":
                 return (
-                    "Generation finished, but the recorded chunks do not cover "
-                    "the full source text.\n\n"
-                    f"{cause}\n\n"
-                    "SetupTTS refused to finalise a truncated file. "
-                    "Open Resume Saved Job to retry from the missing range."
+                    "Part of the text has no audio yet, so SetupTTS did not save "
+                    "an incomplete file.\n\n"
+                    "Click Resume to generate the missing part."
                     f"{preserved_note}"
+                    f"\n\nTechnical details: {cause}"
+                )
+            if cause.kind == "staging_io":
+                return (
+                    f"{_disk_problem_text(cause.original)}\n\n"
+                    "Everything generated so far has been kept — click Resume "
+                    "once the problem is fixed."
+                    f"\n\nTechnical details: {cause}"
                 )
             if cause.kind == "assembly_failed":
                 return (
-                    "SetupTTS could not assemble the final MP3.\n\n"
-                    f"{cause}\n\n"
-                    "The completed chunks were preserved so the job can be retried "
-                    "after the output location issue is fixed."
-                    f"{preserved_note}"
+                    "SetupTTS generated all of the audio but could not save the "
+                    "finished MP3 file.\n\n"
+                    f"{_disk_problem_text(cause.original, output=True)}\n\n"
+                    "The generated audio has been kept — click Resume to try "
+                    "saving it again."
+                    f"\n\nTechnical details: {cause}"
                 )
             if cause.kind == "duration_truncated":
+                kept = (
+                    f"The audio was saved separately as “{cause.suggestion}” "
+                    "so you can listen to it — if it sounds complete, you can "
+                    "keep and rename it."
+                    if cause.suggestion else
+                    "The generated sections have been kept."
+                )
                 return (
-                    "The final audio looks much shorter than expected.\n\n"
-                    f"{cause}\n\n"
-                    "SetupTTS preserved the staged chunks and the assembled "
-                    "MP3 so you can either resume the job or inspect it."
-                    f"{preserved_note}"
+                    "The finished audio is much shorter than this text should "
+                    "produce, so SetupTTS did not save it under your file name "
+                    "(an existing file with that name was left unchanged).\n\n"
+                    f"{kept}\n\nTo try again, start a new generation."
+                    f"\n\nTechnical details: {cause}"
                 )
             return (
-                f"Generation failed on {chunk_ctx} after recovery attempts.\n\n"
-                f"Details: {cause}{preserved_note}"
+                f"SetupTTS couldn't generate {chunk_ctx}, even after retrying."
+                f"{preserved_note}"
+                f"\n\nTechnical details: {cause}"
             )
 
+        if isinstance(exc, OSError) and not isinstance(exc, (TimeoutError, ConnectionError)):
+            # File-system trouble outside a chunk: creating the staging folder,
+            # checking free space, creating the output folder.
+            return (
+                f"{_disk_problem_text(exc, output=True)}"
+                f"\n\nTechnical details: {type(exc).__name__}: {exc}"
+            )
         msg = str(exc).lower()
-        if "permission" in msg or "access denied" in msg or "read-only" in msg:
+        if "timeout" in msg or "timed out" in msg:
             return (
-                "Cannot write to the selected output location.\n"
-                "Please choose a different folder."
-            )
-        if "no such file" in msg or "directory" in msg:
-            return (
-                "The output folder does not exist.\n"
-                "Please select a valid save location."
-            )
-        if "timeout" in msg:
-            return (
-                "The speech service timed out.\n\n"
-                "Please try again. If this keeps happening, the service may be under heavy load."
+                "The speech service took too long to respond.\n\n"
+                "Please try again. If this keeps happening, the service may be busy."
+                f"\n\nTechnical details: {type(exc).__name__}: {exc}"
             )
         return (
-            "An unexpected error occurred while generating audio.\n\n"
-            f"Details: {exc}"
+            "Something went wrong while generating the audio. Please try again."
+            f"\n\nTechnical details: {type(exc).__name__}: {exc}"
         )

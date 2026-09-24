@@ -25,11 +25,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
+import sys
+import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +186,30 @@ class ResumeCandidate:
     updated_at: float
 
 
+# Staging directories a worker in this process is actively writing.  The
+# resume listing runs on the GUI thread whenever a job starts, finishes or
+# fails, and it "repairs" any manifest still marked running — which, for a job
+# that *is* running, flipped it to interrupted underneath the worker and
+# offered it for resume while it was still being generated.
+_LIVE_DIRS: set[Path] = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def _set_live(staging_dir: Path, live: bool) -> None:
+    key = staging_dir.resolve()
+    with _LIVE_LOCK:
+        if live:
+            _LIVE_DIRS.add(key)
+        else:
+            _LIVE_DIRS.discard(key)
+
+
+def is_live(staging_dir: Path) -> bool:
+    """True while a worker in this process owns *staging_dir*."""
+    with _LIVE_LOCK:
+        return staging_dir.resolve() in _LIVE_DIRS
+
+
 class ChunkStore:
     """
     Manages the staging area for one TTS generation job.
@@ -238,6 +266,7 @@ class ChunkStore:
         store = cls(staging_dir, manifest, save_manifest=False)
         store.save_source_text(text)
         store._save_manifest()
+        _set_live(staging_dir, True)
         return store
 
     @classmethod
@@ -317,6 +346,7 @@ class ChunkStore:
         store = cls(staging_dir, manifest, save_manifest=False)
         if changed:
             store._save_manifest()
+        _set_live(staging_dir, True)
         return store
 
     @staticmethod
@@ -338,7 +368,7 @@ class ChunkStore:
 
         candidates: list[ResumeCandidate] = []
         for entry in staging_root.iterdir():
-            if not entry.is_dir():
+            if not entry.is_dir() or is_live(entry):
                 continue
 
             manifest = _load_manifest(entry)
@@ -620,7 +650,7 @@ class ChunkStore:
         self._manifest.status = "failed"
         self._manifest.failed_at_chunk = failed_at_chunk
         self._manifest.failed_at_chunk_total = total
-        self._save_manifest()
+        self._save_final_status()
         logger.info(
             "Job %s marked as failed at chunk %d/%s — %d chunk(s) preserved in %s",
             self._manifest.job_id,
@@ -641,15 +671,46 @@ class ChunkStore:
         if preserve_progress:
             self._manifest.failed_at_chunk = failed_at_chunk
             self._manifest.failed_at_chunk_total = total
-        self._save_manifest()
+        self._save_final_status()
 
-    def finalize(self, output_path: Path, *, mark_completed: bool = True) -> None:
+    def _save_final_status(self) -> None:
+        """
+        Record a terminal status, tolerating a disk that is still full.
+
+        These run inside the worker's failure handlers; an OSError here
+        replaced the real, resumable failure with a bare disk error.  If the
+        manifest can't be written, it stays "running" on disk, which the
+        resume listing treats as interrupted — the chunks already recorded
+        remain resumable either way.
+        """
+        try:
+            self._save_manifest()
+        except OSError:
+            logger.warning("Could not record the final status of %s", self._dir,
+                           exc_info=True)
+        finally:
+            _set_live(self._dir, False)
+
+    def finalize(
+        self,
+        output_path: Path,
+        *,
+        mark_completed: bool = True,
+        verify: "Callable[[Path], None] | None" = None,
+        rejected_path: Path | None = None,
+    ) -> None:
         """
         Concatenate all saved chunk files into *output_path* safely.
 
         Fails closed if the manifest's recorded chunks do not cover the entire
         source text, if any chunk file is missing or empty, or if the assembly
         output bytes do not match the sum of the chunk audio bytes.
+
+        *verify* is called with the fully assembled temporary file **before**
+        it replaces *output_path*; if it raises, *output_path* is left
+        untouched (an existing file there is not overwritten) and the
+        assembled audio is moved to *rejected_path* for inspection, or
+        deleted if none is given.
         """
         records = sorted(self._manifest.chunks, key=lambda c: c.index)
         if not records:
@@ -699,7 +760,19 @@ class ChunkStore:
                     f"but expected {expected_bytes} from {len(records_by_range)} chunks"
                 )
 
-            tmp_output.replace(output_path)
+            if verify is not None:
+                try:
+                    verify(tmp_output)
+                except Exception:
+                    if rejected_path is not None:
+                        try:
+                            tmp_output.replace(rejected_path)
+                        except OSError:
+                            logger.warning("Could not keep rejected output at %s",
+                                           rejected_path, exc_info=True)
+                    raise
+
+            _replace_with_retry(tmp_output, output_path)
         except Exception:
             try:
                 tmp_output.unlink(missing_ok=True)
@@ -720,9 +793,15 @@ class ChunkStore:
     def mark_completed(self) -> None:
         self._manifest.status = "completed"
         self._save_manifest()
+        _set_live(self._dir, False)
+
+    def release(self) -> None:
+        """Stop treating this directory as live (worker exiting abnormally)."""
+        _set_live(self._dir, False)
 
     def cleanup(self) -> None:
         """Remove the staging directory after successful completion."""
+        _set_live(self._dir, False)
         try:
             shutil.rmtree(self._dir, ignore_errors=True)
         except Exception as exc:
@@ -970,22 +1049,26 @@ def _ranges_exactly_cover(
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = path.with_suffix(f"{path.suffix}.tmp")
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        tmp.replace(path)
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
+    _atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    tmp = path.with_suffix(f"{path.suffix}.tmp")
+    """
+    Write-then-rename, flushed to disk before the rename.
+
+    The temp name is unique per call: the GUI thread (listing resume
+    candidates) and a worker can both rewrite a manifest, and a shared
+    ".tmp" name let one writer rename the other's half-written file.  The
+    fsync means a power cut cannot leave a chunk of the right size but
+    zeroed content — which resume validation (size-based) would accept.
+    """
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.tmp")
     try:
-        tmp.write_bytes(payload)
-        tmp.replace(path)
+        with open(tmp, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _replace_with_retry(tmp, path)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -997,23 +1080,75 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
-def cleanup_stale_staging(staging_root: Path, max_age_days: int = 7) -> None:
-    """
-    Remove stale staging directories older than *max_age_days*.
+#: Resumable progress is kept this long before it is swept.  A paused
+#: audiobook can hold hours of generated audio; a week was short enough to
+#: throw that away while the Resume button still offered it.
+RESUMABLE_MAX_AGE_DAYS = 60
 
-    This keeps abandoned checkpoint data from accumulating forever while still
-    leaving recent resumable jobs intact across app restarts.
+
+def _replace_with_retry(src: Path, dst: Path, attempts: int = 5) -> None:
+    """
+    os.replace that rides out a brief Windows file lock.
+
+    On Windows, antivirus scanners, search indexers and sync clients open new
+    files for a moment after they are written, and a rename during that window
+    fails with a sharing violation.  A few short retries turn that transient
+    failure into a non-event; a file genuinely open in a media player still
+    fails and is reported.
+    """
+    for attempt in range(attempts):
+        try:
+            src.replace(dst)
+            return
+        except PermissionError:
+            if sys.platform != "win32" or attempt == attempts - 1:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+
+
+def cleanup_stale_staging(
+    staging_root: Path,
+    max_age_days: int = 7,
+    *,
+    keep: tuple[Path, ...] = (),
+    resumable_max_age_days: int = RESUMABLE_MAX_AGE_DAYS,
+) -> None:
+    """
+    Remove abandoned staging directories.
+
+    Leftovers that cannot be resumed (completed, empty, corrupt) go after
+    *max_age_days*.  Directories the Resume button would offer are kept for
+    *resumable_max_age_days* — deleting them silently discards generated
+    audio the user can still see and expects to continue.  Paths in *keep*
+    (the job being started or resumed) are never touched.
     """
     if not staging_root.is_dir():
         return
 
-    cutoff = time.time() - max_age_days * 86_400
+    now = time.time()
+    keep_resolved = {k.resolve() for k in keep}
     for entry in staging_root.iterdir():
         if not entry.is_dir():
             continue
         try:
-            if entry.stat().st_mtime < cutoff:
-                shutil.rmtree(entry, ignore_errors=True)
-                logger.info("Removed stale staging dir: %s", entry)
+            if entry.resolve() in keep_resolved:
+                continue
+            age_days = (now - entry.stat().st_mtime) / 86_400
+            if age_days < max_age_days:
+                continue
+            if age_days < resumable_max_age_days and _looks_resumable(entry):
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            logger.info("Removed stale staging dir: %s", entry)
         except Exception as exc:
             logger.warning("Could not check/remove staging dir %s: %s", entry, exc)
+
+
+def _looks_resumable(staging_dir: Path) -> bool:
+    """Cheap check: an unfinished manifest with at least one chunk recorded."""
+    manifest = _load_manifest(staging_dir)
+    return bool(
+        manifest is not None
+        and manifest.status != "completed"
+        and manifest.chunks
+    )

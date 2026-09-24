@@ -6,8 +6,11 @@ Usage:
     pyinstaller setuptts.spec
 
 Outputs (platform-dependent):
-    macOS   → dist/SetupTTS.app    (zipped by build_macos.sh)
-    Windows → dist/SetupTTS.exe    (zipped by build_windows.bat)
+    macOS   → dist/SetupTTS.app         (DMG + zip made by CI / build_macos.sh)
+    Windows → dist/SetupTTS/ (onedir)   (packaged by the Inno Setup installer;
+              the portable single EXE comes from setuptts_portable.spec)
+
+The version comes from app/__init__.py — nothing here needs editing on a bump.
 """
 
 import sys
@@ -15,6 +18,47 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 ROOT = Path(SPECPATH)
+
+# ── Version: single source of truth is app/__init__.py ──────────────── #
+import re as _re
+APP_VERSION = _re.search(
+    r'^APP_VERSION\s*=\s*"([^"]+)"',
+    (ROOT / "app" / "__init__.py").read_text(encoding="utf-8"),
+    _re.M,
+).group(1)
+
+
+def _windows_version_file() -> str:
+    """
+    Write a VERSIONINFO resource so Explorer's Properties ▸ Details shows the
+    version — otherwise every SetupTTS.exe looks identical, and an old copy
+    launched from a stale shortcut can't be told apart.
+    """
+    parts = [int(p) for p in _re.findall(r"\d+", APP_VERSION)[:3]] + [0]
+    while len(parts) < 4:
+        parts.append(0)
+    t = tuple(parts[:4])
+    text = f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={t}, prodvers={t}, mask=0x3f, flags=0x0,
+                    OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', 'SetupTTS'),
+      StringStruct('FileDescription', 'SetupTTS'),
+      StringStruct('FileVersion', '{APP_VERSION}'),
+      StringStruct('InternalName', 'SetupTTS'),
+      StringStruct('OriginalFilename', 'SetupTTS.exe'),
+      StringStruct('ProductName', 'SetupTTS'),
+      StringStruct('ProductVersion', '{APP_VERSION}')])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+"""
+    path = ROOT / "build" / "file_version_info.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
 
 # ── Collect data files ─────────────────────────────────────────────── #
 edge_tts_datas = collect_data_files("edge_tts")
@@ -159,16 +203,16 @@ if sys.platform != "win32":
         name="SetupTTS.app",
         icon=str(_icns) if _icns.exists() else None,
         bundle_identifier="com.setuptts.setuptts",
-        version="1.5.8",
+        version=APP_VERSION,
         info_plist={
             "CFBundleName":              "SetupTTS",
             "CFBundleDisplayName":       "SetupTTS",
-            "CFBundleVersion":           "1.5.8",
-            "CFBundleShortVersionString":"1.5.8",
+            "CFBundleVersion":           APP_VERSION,
+            "CFBundleShortVersionString":APP_VERSION,
             "NSHighResolutionCapable":   True,
             "NSRequiresAquaSystemAppearance": False,
-            "LSMinimumSystemVersion":    "12.0",
-            "NSHumanReadableCopyright":  "© 2025 SetupTTS",
+            "LSMinimumSystemVersion":    "15.0",   # PySide6 6.10+ (shiboken) needs macOS 15 — CI verifies against the bundled binaries
+            "NSHumanReadableCopyright":  "© 2025–2026 SetupTTS",
         },
     )
 
@@ -193,7 +237,7 @@ else:
         codesign_identity=None,
         entitlements_file=None,
         icon=str(_ico) if _ico.exists() else None,
-        version_file=None,
+        version=_windows_version_file(),
     )
     coll = COLLECT(
         exe,

@@ -7,16 +7,15 @@ Drag-and-drop a .txt/.md file onto the editor to import it.
 """
 
 import logging
+import unicodedata
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QFont,
     QFontMetrics,
-    QColor,
-    QPalette,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -33,6 +32,69 @@ from PySide6.QtWidgets import (
 
 logger = logging.getLogger(__name__)
 
+# Text files larger than this are almost certainly not prose (a log, a binary
+# renamed .txt).  ~12+ hours of narration is well under it.
+_MAX_IMPORT_BYTES = 50 * 1024 * 1024
+
+# Editor changes are coalesced before the heavy work (word count, text
+# profiling for the voice check) runs.  Both scan the whole document, which on
+# a 150k-character audiobook made every keystroke lag on a slow machine.
+_TEXT_SETTLE_MS = 250
+
+
+def decode_text_file(data: bytes) -> str | None:
+    """
+    Decode an imported text file the way the user's editor saved it.
+
+    Windows Notepad saves UTF-16 ("Unicode") and, in older versions, the ANSI
+    code page; decoding those as UTF-8 with replacement turned whole books
+    into garbage.  A BOM is authoritative.  Without one, NUL bytes decide:
+    real text never contains them, so NULs mean UTF-16 — the half of each
+    byte pair they sit in tells little- from big-endian — or, scattered
+    evenly, a binary file (returns None).  Otherwise strict UTF-8, then the
+    common Windows code page as the last resort.
+    """
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:].decode("utf-8", errors="replace")
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+
+    sample = data[:8192]
+    if b"\x00" in sample:
+        odd_zeros = sample[1::2].count(0)
+        even_zeros = sample[0::2].count(0)
+        total = odd_zeros + even_zeros
+        encoding = None
+        if odd_zeros >= 0.9 * total:
+            encoding = "utf-16-le"
+        elif even_zeros >= 0.9 * total:
+            encoding = "utf-16-be"
+        if encoding is None:
+            return None   # NULs in both halves: not a text file
+        text = data.decode(encoding, errors="replace")
+        return text if _looks_like_text(text) else None
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode("cp1252")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="replace")
+
+
+def _looks_like_text(text: str) -> bool:
+    """Few control / private-use / unassigned characters — true of prose in any script."""
+    sample = text[:4096]
+    if not sample:
+        return True
+    odd = sum(
+        1 for ch in sample
+        if ch not in "\t\n\r\f" and unicodedata.category(ch) in ("Cc", "Co", "Cn", "Cs")
+    )
+    return odd <= len(sample) * 0.02
+
 
 class InputPanel(QWidget):
     """
@@ -44,9 +106,17 @@ class InputPanel(QWidget):
     """
 
     text_changed = Signal(str)
+    #: Fires immediately on every edit with whether there is any text at all —
+    #: cheap, so the Generate button never lags behind the editor.
+    has_text_changed = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(_TEXT_SETTLE_MS)
+        self._settle_timer.timeout.connect(self._emit_settled_text)
+        self._had_text = False
         self._build_ui()
         self._connect_signals()
 
@@ -61,9 +131,26 @@ class InputPanel(QWidget):
         self._editor.setPlainText(text)
         self._editor.moveCursor(QTextCursor.MoveOperation.Start)
         self._editor.verticalScrollBar().setValue(0)
+        # A programmatic load is a single change — no need to wait for typing
+        # to settle before the rest of the UI catches up.
+        self.flush()
+
+    def flush(self) -> None:
+        """Deliver any pending text change now (e.g. right before Generate)."""
+        if self._settle_timer.isActive():
+            self._settle_timer.stop()
+            self._emit_settled_text()
+
+    def open_file(self) -> None:
+        """Show the Open File dialog (File ▸ Open…, Ctrl+O)."""
+        self._open_file_dialog()
 
     def clear(self) -> None:
-        self._editor.clear()
+        # Select-all + delete rather than QTextEdit.clear(): clear() wipes the
+        # undo stack, so an accidental click on Clear lost the whole book.
+        cursor = self._editor.textCursor()
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.removeSelectedText()
 
     # ------------------------------------------------------------------ #
     # UI                                                                   #
@@ -88,9 +175,9 @@ class InputPanel(QWidget):
         tbl.addWidget(title)
         tbl.addStretch()
 
-        self._import_btn = QPushButton("Open File")
+        self._import_btn = QPushButton("Open File…")
         self._import_btn.setObjectName("ghostButton")
-        self._import_btn.setToolTip("Import a text file (.txt or .md)")
+        self._import_btn.setToolTip("Import a text file (.txt or .md)  —  Ctrl+O")
         tbl.addWidget(self._import_btn)
 
         sep = QFrame()
@@ -99,8 +186,10 @@ class InputPanel(QWidget):
         sep.setFixedWidth(1)
         tbl.addWidget(sep)
 
-        self._clear_btn = QPushButton("Clear")
+        self._clear_btn = QPushButton("Clear Text")
         self._clear_btn.setObjectName("quietGhostButton")
+        self._clear_btn.setToolTip("Remove all text from the editor (Undo with Ctrl+Z)")
+        self._clear_btn.setEnabled(False)
         tbl.addWidget(self._clear_btn)
 
         root.addWidget(top_bar)
@@ -108,8 +197,11 @@ class InputPanel(QWidget):
         # ── Editor ──────────────────────────────────────────────────── #
         self._editor = _DropAwareTextEdit(self)
         self._editor.setPlaceholderText(
-            "Paste text here, or use Open File above, or drag and drop a .txt file…"
+            "Paste or type your text here.\n\n"
+            "You can also click Open File… above, or drag a .txt file onto this area."
         )
+        self._editor.setAcceptRichText(False)
+        self._editor.setAccessibleName("Text to convert")
 
         f = QFont()
         f.setPointSize(13)
@@ -152,6 +244,14 @@ class InputPanel(QWidget):
         self._update_stats_bar()
 
     def _on_text_changed(self) -> None:
+        has_text = not self._editor.document().isEmpty()
+        if has_text != self._had_text:
+            self._had_text = has_text
+            self._clear_btn.setEnabled(has_text)
+            self.has_text_changed.emit(has_text)
+        self._settle_timer.start()
+
+    def _emit_settled_text(self) -> None:
         self._update_stats_bar()
         self.text_changed.emit(self._editor.toPlainText())
 
@@ -209,14 +309,39 @@ class InputPanel(QWidget):
 
     def _load_file(self, path: str) -> None:
         # ── 1. Read the file (I/O errors reported to user) ──────────── #
+        from PySide6.QtWidgets import QMessageBox
+        name = Path(path).name
         try:
-            text = Path(path).read_text(encoding="utf-8", errors="replace")
+            size = Path(path).stat().st_size
+            if size > _MAX_IMPORT_BYTES:
+                QMessageBox.warning(
+                    self, "File Too Large",
+                    f"“{name}” is {size / 1_048_576:.0f} MB, which is too large "
+                    "to be a text document.\n\nPlease choose a plain-text file "
+                    "(.txt or .md).",
+                )
+                return
+            data = Path(path).read_bytes()
         except Exception as exc:
             logger.error("Failed to read %s: %s", path, exc)
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self, "Could Not Open File",
-                f"The file could not be read.\n\n{exc}",
+                f"SetupTTS couldn't read “{name}”.\n\n"
+                "It may have been moved, or another program may be using it.",
+            )
+            return
+
+        text = decode_text_file(data)
+        if text is None:
+            QMessageBox.warning(
+                self, "Not a Text File",
+                f"“{name}” doesn't look like a plain-text file.\n\n"
+                "Word, PDF, and e-book files need to be saved as .txt first.",
+            )
+            return
+        if not text.strip():
+            QMessageBox.information(
+                self, "Empty File", f"“{name}” doesn't contain any text.",
             )
             return
 

@@ -54,7 +54,8 @@ class JobItem:
     progress:    int   = 0
     status_text: str   = "Queued"
     error:       str   = ""
-    duration:    float = 0.0
+    duration:    float = 0.0        # wall-clock generation time, seconds
+    audio_seconds: float | None = None   # length of the finished MP3
     worker:      object = field(default=None, repr=False)
     resumable:   bool = False
     preserved_chunks: int = 0
@@ -116,6 +117,10 @@ class JobQueue(QObject):
         # QThread while its OS thread is still executing.  Removed only
         # after the QThread.finished signal fires.
         self._active_workers: list[TTSWorker] = []
+        # Items cancelled while running, until their worker exits.  A cancel
+        # that lands during final assembly still produces a complete file, and
+        # the completion must be reported (history, status) rather than lost.
+        self._cancelled_running: dict[str, JobItem] = {}
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -168,6 +173,7 @@ class JobQueue(QObject):
             item, worker = self._running.pop(job_id)
             logger.info("Cancelling running job: %s", job_id)
             item.status = "cancelled"
+            self._cancelled_running[job_id] = item
             worker.cancel()
             # Keep a reference so the QThread is not GC-collected while
             # still running; prune any already-finished workers first.
@@ -245,6 +251,16 @@ class JobQueue(QObject):
             except Exception:
                 if item.output_path == output_path:
                     return True
+        # A cancelled worker can still be finishing its final save to this
+        # path; a new job on the same file must wait for it.
+        for worker in self._finishing:
+            if not worker.isRunning():
+                continue
+            try:
+                if str(Path(worker._output_path).resolve()) == norm:
+                    return True
+            except Exception:
+                pass
         return False
 
     @property
@@ -314,7 +330,7 @@ class JobQueue(QObject):
         # while still running" crashes — especially on Windows.
         self._active_workers.append(worker)
         worker.finished.connect(
-            lambda w=worker: self._on_worker_thread_finished(w)
+            lambda w=worker, j=jid: self._on_worker_thread_finished(w, j)
         )
 
         logger.info("Job started: id=%s voice=%s", jid, item.voice)
@@ -325,12 +341,15 @@ class JobQueue(QObject):
     # Worker callbacks                                                     #
     # ------------------------------------------------------------------ #
 
-    def _on_worker_thread_finished(self, worker: TTSWorker) -> None:
+    def _on_worker_thread_finished(self, worker: TTSWorker, job_id: str = "") -> None:
         """Remove from active list once the OS thread has fully exited."""
         try:
             self._active_workers.remove(worker)
         except ValueError:
             pass
+        # Keyed by the queue's id, not worker._job_id: the worker takes a new
+        # id when a resume has to start over.
+        self._cancelled_running.pop(job_id, None)
 
     def _on_stage_changed(self, job_id: str, kind: str, text: str) -> None:
         if job_id in self._running:
@@ -359,11 +378,15 @@ class JobQueue(QObject):
     def _on_worker_completed(
         self, job_id: str, output_path: str, duration: float
     ) -> None:
-        if job_id not in self._running:
+        if job_id in self._running:
+            item, worker = self._running.pop(job_id)
+        elif job_id in self._cancelled_running:
+            # Cancelled too late to stop the final save — the file is done.
+            item = self._cancelled_running.pop(job_id)
+            worker = item.worker
+        else:
             return
-        item, _ = self._running.pop(job_id)
-        if item.status == "cancelled":
-            return
+        item.audio_seconds = getattr(worker, "audio_duration_seconds", None)
         item.status      = "completed"
         item.status_text = "Completed"
         item.progress    = 100

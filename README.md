@@ -1,92 +1,91 @@
 # SetupTTS
 
-Convert any text to natural-sounding audio using Microsoft Neural voices.
+Turn text into natural-sounding MP3 audio with Microsoft's neural voices — anything from a paragraph to a 12-hour audiobook.
 
-No Python. No terminal. No setup. Just download and run.
+No Python. No terminal. Download, install and run.
 
 ---
 
 ## Download
 
-**→ [Go to Releases to download SetupTTS](../../releases/latest)**
+**→ [Download the latest release](../../releases/latest)**
 
 | Platform | File | Notes |
 |----------|------|-------|
-| macOS (Apple Silicon + Intel via Rosetta) | `SetupTTS-macOS.dmg` | Drag-to-Applications |
-| macOS (Apple Silicon + Intel via Rosetta) | `SetupTTS-macOS.zip` | Fallback zip |
-| Windows 10/11 (64-bit) | `SetupTTS-Windows-Installer.exe` | Guided installer |
-| Windows 10/11 (64-bit) | `SetupTTS-Windows-Portable.zip` | No install needed |
+| macOS 15 or later (Apple Silicon) | `SetupTTS-macOS.dmg` | Drag to Applications |
+| macOS 15 or later (Apple Silicon) | `SetupTTS-macOS.zip` | Alternative — unzip and open |
+| Windows 10/11 (64-bit) | `SetupTTS-Windows-Installer.exe` | Recommended |
+| Windows 10/11 (64-bit) | `SetupTTS-Windows-Portable.zip` | No installation |
+
+Intel Macs are not supported by the current build.
 
 ---
 
-## Installing on macOS
+## Installing
 
-**Option 1 — DMG (recommended)**
+### macOS
+1. Open `SetupTTS-macOS.dmg` and drag **SetupTTS** into **Applications**.
+2. Open SetupTTS from Applications.
+3. The app isn't notarized by Apple, so the first launch may be blocked. Open **System Settings ▸ Privacy & Security**, scroll down, and click **Open Anyway**. This is only needed once.
 
-1. Download `SetupTTS-macOS.dmg`
-2. Open it — drag **SetupTTS** into the **Applications** folder
-3. Eject the DMG
-4. Open SetupTTS from your Applications folder
+### Windows
+1. Run `SetupTTS-Windows-Installer.exe`. If SmartScreen appears, click **More info ▸ Run anyway** (the installer isn't code-signed).
+2. Start SetupTTS from the Start Menu.
 
-**Option 2 — Zip**
+Installing a new version over an old one replaces it; settings, history and unfinished jobs are kept.
 
-1. Download `SetupTTS-macOS.zip` and unzip it
-2. Double-click **SetupTTS.app**
-
-> **First launch note:** macOS may show a security prompt because the app is not signed with an Apple certificate.
-> If it says "cannot be opened because the developer cannot be verified" — right-click the app → **Open** → **Open**. You only need to do this once.
-
----
-
-## Installing on Windows
-
-**Option 1 — Installer (recommended)**
-
-1. Download `SetupTTS-Windows-Installer.exe`
-2. Double-click it and follow the wizard (takes about 10 seconds)
-3. Launch SetupTTS from the **Start Menu** or your **desktop shortcut**
-
-**Option 2 — Portable (no install)**
-
-1. Download `SetupTTS-Windows-Portable.zip`
-2. Right-click → **Extract All** (extract to any folder — Desktop, USB drive, etc.)
-3. Double-click **SetupTTS.exe**
-
-> The portable build is a single self-contained EXE — no extra folder or files needed.
+**Portable version:** extract `SetupTTS-Windows-Portable.zip` and double-click `SetupTTS.exe`. When you update, delete the old `SetupTTS.exe` so you don't open an outdated copy by mistake — the version is shown in the window title.
 
 ---
 
 ## Using SetupTTS
 
-1. Type or paste your text into the editor
-2. Choose a voice and speed
-3. Click **Generate & Export MP3**
-4. Pick where to save the file
+1. **Add text** — paste or type it, click **Open File…**, or drag a `.txt` file onto the editor.
+2. **Choose a voice** — search by name or language, and click **Preview Voice** to hear it.
+3. **Set the speed** if you like (**Reset** returns to normal).
+4. **Choose the file name and folder** under **Export**.
+5. Click **Generate & Export MP3** (or press Ctrl/⌘+Enter).
 
-An internet connection is required — voices are streamed in real time from Microsoft's Neural TTS service (the same voices used in Microsoft Edge's "Read Aloud" feature).
+Progress appears under **Active Jobs**. Up to two jobs run at the same time; more wait their turn. Finished files appear in **Recent Conversions** — double-click one to play it.
 
 ---
 
 ## Features
 
-- 300+ voices across 70+ languages and regions
-- Word-by-word progress as audio generates
-- Voice search and language filter
-- Adjustable speed (0.5× to 2×)
-- Preview audio before saving
-- Export as MP3
-- Job history (recent generations saved locally)
-- Dark theme
+- 300+ voices in 70+ languages, with search, language and gender filters, and a preview.
+- Speed from half to double (−50% to +100%).
+- **Long-form audiobooks**: the text is generated in sections, each one saved to disk as it finishes, so a 12-hour job never has to fit in memory.
+- **No silent gaps**: every section is checked against the speech service's own timing; incomplete sections are requested again. Before a file is saved, SetupTTS verifies that every part of the text has audio and that the total length is plausible. If not, it doesn't save the file.
+- **Resume**: if a job stops (lost connection, full disk, app closed), the finished sections are kept. Click **Resume Unfinished Job** to continue where it left off, even after restarting the app.
+- **Safe saving**: an existing file is never overwritten without asking (**Keep Both** or **Replace**).
+- Retries for temporary network problems, with plain-language progress and error messages.
+- Job history with generation time and audio length.
+- Imports UTF-8, UTF-16 (Windows "Unicode") and ANSI text files.
 
 ---
 
-## Requirements
+## Requirements and limitations
 
-- macOS 12 Monterey or later
-- Windows 10 or 11 (64-bit)
-- Internet connection
+- **Internet connection required.** Speech is generated by Microsoft's online neural speech service (the voices behind Microsoft Edge's Read Aloud). Text preparation and saving happen on your computer.
+- Generation speed depends on the speech service. Long audiobooks take a while: roughly 20–40 minutes per 150,000 characters has been typical.
+- The service is provided by Microsoft without an official API agreement for this use; availability or behaviour can change without notice.
+- Output is MP3 (24 kHz, 48 kbit/s mono — the format the service provides).
+- macOS 15 or later on Apple Silicon; Windows 10 or 11, 64-bit.
 
 ---
+
+## Troubleshooting and logs
+
+Open **Settings** (Ctrl/⌘+,) ▸ **Logs & Troubleshooting**:
+- **Open Logs Folder** — shows the folder containing the log.
+- **Open Current Log** — opens `setuptts.log`.
+- **Copy Log Path** — copies the location, e.g. to attach the file to a bug report.
+
+Log locations:
+- macOS: `~/Library/Logs/SetupTTS/setuptts.log`
+- Windows: `%LOCALAPPDATA%\SetupTTSApp\SetupTTS\Logs\setuptts.log`
+
+Error messages include **Show Details…** with the technical reason, and **Open Logs Folder**.
 
 ---
 
@@ -117,6 +116,19 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Run the tests
+
+```bash
+pip install pytest pytest-qt
+QT_QPA_PLATFORM=offscreen pytest -q
+```
+
+### Check a packaged build
+
+```bash
+dist/SetupTTS.app/Contents/MacOS/SetupTTS --selftest result.json --network
+```
+
 ### Build release packages
 
 **macOS** (run on a Mac):
@@ -136,10 +148,12 @@ pip install pyinstaller
 ### Trigger automated release (both platforms via GitHub Actions)
 
 ```bash
-git tag v1.5.8 && git push origin v1.5.8
+# 1. Set APP_VERSION in app/__init__.py and pyproject.toml
+# 2. Add release_notes/vX.Y.Z.md
+git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-GitHub Actions builds both macOS and Windows packages and publishes them as a GitHub Release with four artifacts attached:
+GitHub Actions checks that the tag matches `APP_VERSION`, runs the test suite, builds both platforms, launches every packaged artifact with `--selftest --network` (bundled files, TLS, voice list, a short synthesis), and publishes a GitHub Release with four artifacts:
 - `SetupTTS-macOS.dmg`
 - `SetupTTS-macOS.zip`
 - `SetupTTS-Windows-Installer.exe`
@@ -159,7 +173,9 @@ GitHub Actions builds both macOS and Windows packages and publishes them as a Gi
 ```
 setuptts/
 ├── main.py                    ← PyInstaller entry point
-├── setuptts.spec              ← PyInstaller spec
+├── setuptts.spec              ← PyInstaller spec (macOS app / Windows onedir)
+├── setuptts_portable.spec     ← PyInstaller spec (Windows portable EXE)
+├── release_notes/             ← one file per release, used by CI
 ├── requirements.txt
 ├── build_macos.sh             ← macOS release build script
 ├── build_windows.ps1          ← Windows release build (PowerShell)
@@ -169,6 +185,7 @@ setuptts/
 ├── app/
 │   ├── __init__.py            ← APP_NAME, APP_VERSION
 │   ├── main.py                ← QApplication setup
+│   ├── selftest.py            ← packaged-build self test (--selftest)
 │   ├── config/settings.py
 │   ├── models/
 │   ├── services/

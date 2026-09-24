@@ -12,7 +12,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
@@ -38,12 +37,15 @@ class PreviewWorker(QThread):
     Signals
     -------
     started_playing()   Audio is playing; caller can show "stop" state.
-    finished()          Playback complete or worker stopped.
+    playback_finished() Playback complete or worker stopped.
     failed(str)         User-friendly error message.
     """
 
     started_playing = Signal()
-    finished = Signal()
+    # Not named `finished`: that would shadow QThread.finished, so both fired
+    # and the thread's own signal reset the UI a second time (clearing the
+    # "Preview unavailable" message the moment it was shown).
+    playback_finished = Signal()
     failed = Signal(str)
 
     def __init__(self, voice: str, rate: str) -> None:
@@ -90,7 +92,7 @@ class PreviewWorker(QThread):
 
         if self._stop_requested:
             self._cleanup()
-            self.finished.emit()   # always notify UI so buttons reset
+            self.playback_finished.emit()   # always notify UI so buttons reset
             return
 
         self.started_playing.emit()
@@ -102,7 +104,7 @@ class PreviewWorker(QThread):
                 self.failed.emit(f"Could not play preview: {exc}")
         finally:
             self._cleanup()
-            self.finished.emit()
+            self.playback_finished.emit()
 
     # ------------------------------------------------------------------ #
     # Platform-specific blocking playback                                  #

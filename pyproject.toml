@@ -1,15 +1,15 @@
 [build-system]
 requires = ["setuptools>=65", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "setuptts"
-version = "1.5.8"
+version = "1.6.0"
 description = "Professional text-to-audio desktop application"
 requires-python = ">=3.11"
 dependencies = [
-    "PySide6>=6.7.0",
-    "edge-tts>=6.1.0",
+    "PySide6>=6.11,<6.12",
+    "edge-tts>=7.2,<8",
     "platformdirs>=4.0.0",
 ]
 

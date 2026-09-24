@@ -4,14 +4,14 @@
 ;
 ;  CI invocation (from repo root, PowerShell):
 ;    & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-;        /DAppVersion=1.5.2 `
+;        /DAppVersion=1.6.0 `
 ;        /DSourceDir=C:\path\to\dist\SetupTTS `
 ;        /DOutputDir=C:\path\to\installer_out `
 ;        installers\windows.iss
 ;
 ;  Local invocation (from repo root):
 ;    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installers\windows.iss
-;    (uses defaults: AppVersion=1.5.2, SourceDir=..\dist\SetupTTS, OutputDir=out)
+;    AppVersion must be given: /DAppVersion=x.y.z (CI passes the tag's version).
 ;
 ;  Note: SourceDir must point to the onedir OUTPUT folder (dist\SetupTTS\),
 ;  not to dist\ itself. The onedir build avoids per-launch self-extraction.
@@ -19,7 +19,7 @@
 
 ; ── Overridable via ISCC /D command-line defines ─────────────────────────────
 #ifndef AppVersion
-  #define AppVersion "1.5.2"
+  #error AppVersion is required: ISCC /DAppVersion=x.y.z installers\windows.iss
 #endif
 
 #ifndef SourceDir
@@ -67,6 +67,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+[InstallDelete]
+; Upgrading over an older version: clear the previous runtime first, so files
+; a newer PyInstaller/Python no longer ships (an old python3xx.dll, a removed
+; Qt plugin) cannot linger and be loaded by the new build.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 ; PyInstaller onedir build — copy all files from the dist\SetupTTS\ folder.
 ; No self-extraction at launch; app starts immediately from installed files.
@@ -83,4 +89,4 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#StringChange(AppN
 [UninstallDelete]
 ; User data (settings, history) is left untouched on uninstall by default.
 ; Uncomment below to also remove user data on uninstall:
-; Type: filesandordirs; Name: "{localappdata}\SetupTTS"
+; Type: filesandordirs; Name: "{localappdata}\SetupTTSApp\SetupTTS"

@@ -34,24 +34,65 @@ _SAMPLE_RATES_V2 = (22050, 24000, 16000, 0)
 _SAMPLE_RATES_V25 = (11025, 12000, 8000, 0)
 
 
+_READ_BLOCK = 1 << 20   # 1 MiB
+
+
 def mp3_duration_seconds(path: Path) -> float | None:
-    """Return the duration of an MP3 file in seconds, or None on failure."""
+    """
+    Return the duration of an MP3 file in seconds, or None on failure.
+
+    Streams the file in blocks: a 12-hour audiobook is ~260 MB, and reading it
+    whole doubled the app's memory footprint at the very end of a long job.
+    """
     try:
-        data = path.read_bytes()
+        with open(path, "rb") as fh:
+            state = _ScanState()
+            buffer = fh.read(_READ_BLOCK)
+            pos = _skip_id3v2(buffer, 0)
+            while True:
+                more = fh.read(_READ_BLOCK)
+                pos = _scan_frames(buffer, pos, state, final=not more)
+                if not more:
+                    break
+                # Keep the unscanned tail (a partial frame) and continue.
+                buffer = buffer[pos:] + more
+                pos = 0
     except OSError:
         return None
-    return mp3_duration_from_bytes(data)
+    return state.duration()
 
 
 def mp3_duration_from_bytes(data: bytes) -> float | None:
     """Estimate MP3 duration from a raw byte buffer by walking frame headers."""
     if not data:
         return None
+    state = _ScanState()
+    _scan_frames(data, _skip_id3v2(data, 0), state, final=True)
+    return state.duration()
 
-    pos = _skip_id3v2(data, 0)
-    total_samples = 0
-    sample_rate_hint: int | None = None
-    frames_seen = 0
+
+class _ScanState:
+    __slots__ = ("total_samples", "sample_rate_hint", "frames_seen")
+
+    def __init__(self) -> None:
+        self.total_samples = 0
+        self.sample_rate_hint: int | None = None
+        self.frames_seen = 0
+
+    def duration(self) -> float | None:
+        if self.sample_rate_hint is None or self.frames_seen == 0:
+            return None
+        return self.total_samples / float(self.sample_rate_hint)
+
+
+def _scan_frames(data: bytes, pos: int, state: _ScanState, *, final: bool) -> int:
+    """
+    Walk frame headers from *pos*, accumulating into *state*.
+
+    Returns the position scanning stopped at.  When not *final*, stops before
+    a header or frame that runs past the end of *data* so the caller can
+    append the next block and resume there.
+    """
     length = len(data)
 
     while pos + 4 <= length:
@@ -97,14 +138,15 @@ def mp3_duration_from_bytes(data: bytes) -> float | None:
             pos += 1
             continue
 
-        total_samples += samples_per_frame
-        sample_rate_hint = sample_rate
-        frames_seen += 1
+        if not final and pos + frame_size > length:
+            break   # frame continues in the next block
+
+        state.total_samples += samples_per_frame
+        state.sample_rate_hint = sample_rate
+        state.frames_seen += 1
         pos += frame_size
 
-    if sample_rate_hint is None or frames_seen == 0:
-        return None
-    return total_samples / float(sample_rate_hint)
+    return pos
 
 
 def _skip_id3v2(data: bytes, pos: int) -> int:

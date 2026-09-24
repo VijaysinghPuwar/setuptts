@@ -5,7 +5,6 @@ This module is the only place that imports edge_tts directly.
 All callers use this service rather than touching edge_tts.
 """
 
-import asyncio
 import logging
 import time
 from pathlib import Path

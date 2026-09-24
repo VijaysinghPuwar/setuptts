@@ -422,7 +422,15 @@ def test_recovery_subdivision_ranges_exactly_cover_parent():
             assert all(ranges[i][1] == ranges[i + 1][0] for i in range(len(ranges) - 1))
 
 
-def test_duration_sanity_failure_preserves_progress_without_completed_manifest(tmp_path, monkeypatch):
+def test_duration_sanity_failure_never_replaces_the_existing_output(tmp_path, monkeypatch):
+    """
+    A too-short result is caught *before* it replaces the output file.
+
+    Previously the duration check ran after the rename, so a truncated MP3 had
+    already overwritten whatever was at the output path — including a good
+    audiobook from an earlier run.  Now the existing file is untouched and the
+    suspect audio is kept beside it for the user to inspect.
+    """
     monkeypatch.setenv("SETUPTTS_DATA_DIR", str(tmp_path / "appdata"))
     monkeypatch.setattr(tts_worker, "_chunk_plan_for", _small_plan)
     monkeypatch.setattr(tts_worker, "mp3_duration_seconds", lambda _path: 1.0)
@@ -439,6 +447,7 @@ def test_duration_sanity_failure_preserves_progress_without_completed_manifest(t
 
     text = ("alpha beta gamma delta epsilon zeta eta theta iota kappa " * 80).strip()
     output = tmp_path / "too-short.mp3"
+    output.write_bytes(b"previous good audiobook")
     worker = tts_worker.TTSWorker(
         text=text,
         voice="en-US-AvaNeural",
@@ -446,17 +455,25 @@ def test_duration_sanity_failure_preserves_progress_without_completed_manifest(t
         volume="+0%",
         output_path=str(output),
     )
+    resumable = []
+    worker.job_resumable.connect(lambda *args: resumable.append(args))
 
     with pytest.raises(tts_worker._ChunkError) as excinfo:
         asyncio.run(worker._stream_generate())
 
     err = excinfo.value
     assert err.cause.kind == "duration_truncated"
-    assert output.exists()
-    assert err.staging_dir is not None
-    manifest = json.loads((err.staging_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["status"] == "failed"
-    assert manifest["measured_duration_s"] == 1.0
+    assert output.read_bytes() == b"previous good audiobook"
+    kept = tmp_path / "too-short (incomplete).mp3"
+    assert kept.exists()
+    assert kept.read_bytes().decode("utf-8").startswith("alpha beta")
+    # All the audio is in the kept copy, and resuming would only rebuild the
+    # same short file — so no resume is offered and staging is cleared.
+    assert resumable == []
+    assert err.staging_dir is None
+    message = tts_worker.TTSWorker._user_message(err)
+    assert "too-short (incomplete).mp3" in message
+    assert "left unchanged" in message
 
 
 def test_estimate_duration_range_seconds_is_widely_bounded_but_realistic():

@@ -9,7 +9,6 @@ import logging
 import os
 import sys
 
-from PySide6.QtCore import QCoreApplication
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
@@ -22,11 +21,13 @@ logger = logging.getLogger(__name__)
 
 
 def _load_stylesheet(app: QApplication) -> None:
-    qss_path = resource_path("app/assets/styles/app.qss")
-    if qss_path.exists():
-        app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
+    from app.ui.style import stylesheet_text
+    qss = stylesheet_text()
+    if qss:
+        app.setStyleSheet(qss)
     else:
-        logger.warning("Stylesheet not found at %s", qss_path)
+        logger.warning("Stylesheet not found at %s",
+                       resource_path("app/assets/styles/app.qss"))
 
 
 def _set_platform_font(app: QApplication) -> None:
@@ -67,6 +68,12 @@ def main() -> None:
     except Exception:
         pass  # certifi not installed — network ops may fail on some builds
 
+    # Packaged-build check used by CI (see app/selftest.py).  Runs before the
+    # single-instance guard so it works while the app is open.
+    if "--selftest" in sys.argv:
+        from app.selftest import run as run_selftest
+        sys.exit(run_selftest(sys.argv))
+
     # Required before QApplication on some platforms
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
@@ -84,6 +91,16 @@ def main() -> None:
 
     # Initialise paths + logging before anything else
     paths = AppPaths()
+
+    # One copy per user: a second launch hands over to the running window.
+    # Checked before logging is set up so the second copy never touches the
+    # shared log file.
+    from app.utils.single_instance import SingleInstance
+    instance = SingleInstance(paths.data_dir)
+    if not instance.acquire():
+        instance.notify_running_instance()
+        sys.exit(0)
+
     setup_logging(paths.log_dir)
     logger.info("Starting %s %s", APP_NAME, APP_VERSION)
 
@@ -109,6 +126,8 @@ def main() -> None:
     # unhandled exception unwinding main) would otherwise destroy live
     # QThreads and abort with "Python quit unexpectedly".
     app.aboutToQuit.connect(window.ensure_workers_stopped)
+    app.aboutToQuit.connect(instance.release)
+    instance.activation_requested.connect(window.bring_to_front)
 
     window.show()
 

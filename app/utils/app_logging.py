@@ -5,6 +5,29 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+#: Current log file name.  Builds before 1.6.0 wrote "voicecraft.log" (a
+#: leftover from the project's old name); that file is renamed on first run.
+LOG_FILENAME = "setuptts.log"
+_LEGACY_LOG_FILENAMES = ("voicecraft.log",)
+
+
+def log_file_path(log_dir: Path) -> Path:
+    return log_dir / LOG_FILENAME
+
+
+def _migrate_legacy_log(log_dir: Path) -> None:
+    target = log_dir / LOG_FILENAME
+    if target.exists():
+        return
+    for legacy in _LEGACY_LOG_FILENAMES:
+        old = log_dir / legacy
+        if old.exists():
+            try:
+                old.replace(target)
+            except OSError:
+                pass   # e.g. still open in an old copy of the app — harmless
+            return
+
 
 def setup_logging(log_dir: Path, level: int = logging.DEBUG) -> None:
     """
@@ -15,7 +38,8 @@ def setup_logging(log_dir: Path, level: int = logging.DEBUG) -> None:
     - Never exposes raw tracebacks to the GUI; the UI catches errors itself.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "voicecraft.log"
+    _migrate_legacy_log(log_dir)
+    log_file = log_file_path(log_dir)
 
     root = logging.getLogger()
     root.setLevel(level)
@@ -35,10 +59,12 @@ def setup_logging(log_dir: Path, level: int = logging.DEBUG) -> None:
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
 
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(logging.WARNING)
-    stderr_handler.setFormatter(fmt)
-    root.addHandler(stderr_handler)
+    # A windowed (no-console) Windows build has no stderr at all.
+    if sys.stderr is not None:
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setLevel(logging.WARNING)
+        stderr_handler.setFormatter(fmt)
+        root.addHandler(stderr_handler)
 
     logging.getLogger("edge_tts").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)

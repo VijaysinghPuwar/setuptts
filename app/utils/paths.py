@@ -1,6 +1,8 @@
 """Platform-aware path resolution for app data, logs, cache, and bundled resources."""
 
+import logging
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -26,8 +28,8 @@ class AppPaths:
     """
     All application data directories, resolved correctly per platform.
 
-    macOS : ~/Library/Application Support/SetupTTS/
-    Windows: %APPDATA%\\SetupTTS\\
+    macOS  : ~/Library/Application Support/SetupTTS/   (logs: ~/Library/Logs/SetupTTS/)
+    Windows: %LOCALAPPDATA%\\SetupTTSApp\\SetupTTS\\     (logs: …\\Logs\\)
     Linux  : ~/.local/share/SetupTTS/
     """
 
@@ -82,3 +84,31 @@ class AppPaths:
     @property
     def icon_path(self) -> Path:
         return resource_path("app/assets/icons/app.png")
+
+
+def open_in_file_manager(path: str | Path, *, reveal: bool = False) -> bool:
+    """
+    Open *path* with the system's default handler (a folder opens in Finder or
+    Explorer, a file in its default app).  With ``reveal=True`` a file is
+    shown selected in its folder instead.  Returns False if it doesn't exist
+    or could not be opened, so the caller can tell the user.
+    """
+    path = Path(path)
+    if not path.exists():
+        return False
+    try:
+        if sys.platform == "darwin":
+            args = ["open", "-R", str(path)] if reveal and path.is_file() else ["open", str(path)]
+            subprocess.Popen(args)
+        elif sys.platform == "win32":
+            if reveal and path.is_file():
+                subprocess.Popen(["explorer", f"/select,{path}"])
+            else:
+                os.startfile(str(path))  # type: ignore[attr-defined]
+        else:
+            target = path.parent if reveal and path.is_file() else path
+            subprocess.Popen(["xdg-open", str(target)])
+        return True
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Could not open %s: %s", path, exc)
+        return False

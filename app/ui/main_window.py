@@ -45,10 +45,9 @@ macOS's "quit unexpectedly" dialog.
 import logging
 
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap, QBrush
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -66,7 +65,7 @@ from app.services.history_service import HistoryService
 from app.ui.panels.history_panel import HistoryPanel
 from app.ui.panels.input_panel import InputPanel
 from app.ui.panels.output_panel import OutputPanel
-from app.utils.paths import AppPaths, resource_path
+from app.utils.paths import AppPaths, open_in_file_manager, resource_path
 from app import APP_NAME, APP_VERSION
 
 logger = logging.getLogger(__name__)
@@ -136,7 +135,9 @@ class MainWindow(QMainWindow):
         self._history_user_sized = False  # True once the history split is dragged
         self._history_user_height = 0     # the height they dragged it to
 
-        self.setWindowTitle(APP_NAME)
+        # The version is in the title so it is obvious which build is running:
+        # an old portable copy launched from a stale shortcut looks identical.
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.setWindowIcon(_make_app_icon())
         self.setMinimumSize(*_MIN_WINDOW_SIZE)
         self._restore_geometry()
@@ -156,10 +157,21 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def get_input_text(self) -> str:
+        # Text changes reach the sidebar after a short settle delay; make sure
+        # anything typed just before Generate is included in what it sees.
+        self._input_panel.flush()
         return self._input_panel.get_text()
 
     def set_input_text(self, text: str) -> None:
         self._input_panel.set_text(text)
+
+    def bring_to_front(self) -> None:
+        """Show this window when the user launches SetupTTS a second time."""
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     # ------------------------------------------------------------------ #
     # Menu                                                                 #
@@ -168,19 +180,35 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         mb = self.menuBar()
 
-        file_menu = mb.addMenu("File")
+        # "Ctrl" is Cmd on macOS; Qt maps it.
+        file_menu = mb.addMenu("&File")
         open_a = QAction("Open Text File…", self)
-        open_a.setShortcut("Ctrl+O")
-        open_a.triggered.connect(lambda: self._input_panel._open_file_dialog())
+        open_a.setShortcut(QKeySequence.StandardKey.Open)
+        open_a.triggered.connect(lambda: self._input_panel.open_file())
         file_menu.addAction(open_a)
+
+        generate_a = QAction("Generate MP3", self)
+        generate_a.setShortcuts([QKeySequence("Ctrl+Return"), QKeySequence("Ctrl+Enter")])
+        generate_a.triggered.connect(lambda: self._output_panel.trigger_generate())
+        file_menu.addAction(generate_a)
+
+        file_menu.addSeparator()
+        # PreferencesRole moves this into the application menu on macOS, where
+        # users look for it; on Windows it stays in File.
+        settings_a = QAction("Settings…", self)
+        settings_a.setShortcut(QKeySequence("Ctrl+,"))
+        settings_a.setMenuRole(QAction.MenuRole.PreferencesRole)
+        settings_a.triggered.connect(self._open_settings)
+        file_menu.addAction(settings_a)
 
         file_menu.addSeparator()
         quit_a = QAction("Quit", self)
-        quit_a.setShortcut("Ctrl+Q")
+        quit_a.setShortcut(QKeySequence("Ctrl+Q"))
+        quit_a.setMenuRole(QAction.MenuRole.QuitRole)
         quit_a.triggered.connect(self.close)
         file_menu.addAction(quit_a)
 
-        edit_menu = mb.addMenu("Edit")
+        edit_menu = mb.addMenu("&Edit")
         clear_a = QAction("Clear Text", self)
         clear_a.triggered.connect(lambda: self._input_panel.clear())
         edit_menu.addAction(clear_a)
@@ -192,14 +220,14 @@ class MainWindow(QMainWindow):
         self._toggle_history_action.triggered.connect(self._toggle_history)
         view_menu.addAction(self._toggle_history_action)
 
-        help_menu = mb.addMenu("Help")
-        settings_a = QAction("Settings…", self)
-        settings_a.setShortcut("Ctrl+,")
-        settings_a.triggered.connect(self._open_settings)
-        help_menu.addAction(settings_a)
+        help_menu = mb.addMenu("&Help")
+        logs_a = QAction("Open Logs Folder", self)
+        logs_a.triggered.connect(lambda: open_in_file_manager(self._paths.log_dir))
+        help_menu.addAction(logs_a)
 
         help_menu.addSeparator()
         about_a = QAction(f"About {APP_NAME}", self)
+        about_a.setMenuRole(QAction.MenuRole.AboutRole)
         about_a.triggered.connect(self._open_about)
         help_menu.addAction(about_a)
 
@@ -299,6 +327,7 @@ class MainWindow(QMainWindow):
 
         settings_btn = QPushButton("Settings")
         settings_btn.setObjectName("ghostButton")
+        settings_btn.setToolTip("Settings, logs and app information  —  Ctrl+,")
         settings_btn.clicked.connect(self._open_settings)
         hl.addWidget(settings_btn)
 
@@ -486,7 +515,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _connect_signals(self) -> None:
-        # Wire text changes → enable/disable generate button
+        # Wire text changes → enable/disable generate button.  The cheap
+        # has-text signal is immediate; the full text arrives once typing
+        # settles (it drives the voice-compatibility check).
+        self._input_panel.has_text_changed.connect(self._output_panel.on_has_text_changed)
         self._input_panel.text_changed.connect(self._output_panel.on_text_changed)
         # Job completed → update history panel
         self._output_panel.job_completed.connect(self._history_panel.add_job)
@@ -624,15 +656,20 @@ class MainWindow(QMainWindow):
             if n_pending:
                 parts.append(f"{n_pending} queued")
             detail = " and ".join(parts)
-            reply = QMessageBox.question(
-                self,
-                "Jobs in Progress",
-                f"Audio generation is active ({detail}).\n\n"
-                "Closing now will cancel all pending jobs. Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("Quit SetupTTS?")
+            box.setText(f"Audio is still being generated ({detail}).")
+            box.setInformativeText(
+                "If you quit now, the audio finished so far is kept and you can "
+                "continue later with Resume Unfinished Job."
             )
-            if reply == QMessageBox.No:
+            quit_btn = box.addButton("Quit", QMessageBox.ButtonRole.DestructiveRole)
+            keep_btn = box.addButton("Keep Generating", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(keep_btn)
+            box.setEscapeButton(keep_btn)
+            box.exec()
+            if box.clickedButton() is not quit_btn:
                 self._closing = False
                 event.ignore()
                 return

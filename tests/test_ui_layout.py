@@ -34,7 +34,7 @@ from PySide6.QtWidgets import QScrollArea, QWidget
 from app.config.settings import AppSettings
 from app.models.voice import Voice
 from app.ui.main_window import _MAIN_ROW_MIN_FRACTION
-from app.utils.paths import AppPaths, resource_path
+from app.utils.paths import AppPaths
 
 
 # These tests drive real widgets and need pytest-qt's qapp/qtbot fixtures.
@@ -59,8 +59,8 @@ def app_paths(tmp_path, monkeypatch):
 @pytest.fixture
 def styled_app(qapp):
     """Apply the real application stylesheet, as app.main does at startup."""
-    qss = resource_path("app/assets/styles/app.qss")
-    qapp.setStyleSheet(qss.read_text(encoding="utf-8"))
+    from app.ui.style import stylesheet_text
+    qapp.setStyleSheet(stylesheet_text())
     yield qapp
     qapp.setStyleSheet("")
 
@@ -759,7 +759,9 @@ FONT_SCALES = [1.0, 1.3, 1.6, 2.0, 2.5]
 def _scaled_stylesheet(scale):
     import re
 
-    qss = resource_path("app/assets/styles/app.qss").read_text(encoding="utf-8")
+    from app.ui.style import stylesheet_text
+
+    qss = stylesheet_text()
     return re.sub(
         r"font-size:\s*([\d.]+)px",
         lambda m: f"font-size: {max(1, round(float(m.group(1)) * scale))}px",

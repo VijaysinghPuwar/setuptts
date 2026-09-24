@@ -110,15 +110,31 @@ build_windows.bat
 
 Push a version tag to trigger automated builds for both platforms:
 
+Before tagging: set `APP_VERSION` in `app/__init__.py` (the spec, installer and
+workflow all read it from there), update `pyproject.toml`, and add
+`release_notes/vX.Y.Z.md`. Never move an existing public tag — bump instead.
+
 ```bash
-git tag v1.5.8
-git push origin v1.5.8
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 The workflow (`.github/workflows/build.yml`) will:
-1. Build on a real macOS runner (Apple Silicon) → produces `SetupTTS-macOS.dmg` + `SetupTTS-macOS.zip`
-2. Build on a real Windows runner → produces `SetupTTS-Windows-Installer.exe` + `SetupTTS-Windows-Portable.zip`
-3. Attach all four artifacts to a GitHub Release automatically
+1. Fail fast unless the tag equals `APP_VERSION` and the release notes exist
+2. Run the test suite on both platforms
+3. Build on a macOS runner (Apple Silicon) → `SetupTTS-macOS.dmg` + `SetupTTS-macOS.zip`,
+   check the bundle's minimum macOS version against every bundled binary, and
+   launch the app from the build, from the mounted DMG and from the unzipped zip
+   with `--selftest`
+4. Build on a Windows runner → `SetupTTS-Windows-Installer.exe` + `SetupTTS-Windows-Portable.zip`,
+   silently install and launch the installed app, check its EXE version info, and
+   launch the EXE extracted from the portable zip with `--selftest`
+5. Publish a GitHub Release (not draft, not prerelease, marked Latest) with the
+   notes from `release_notes/` and all four artifacts
+
+`--selftest <file.json> --network` checks bundled assets, imports, TLS certificates,
+the Qt SVG plugin, the voice list and a short verified synthesis, and writes the
+result to the JSON file (Windows builds have no console).
 
 All four release artifacts use clean, non-versioned filenames — the release title (`SetupTTS vX.Y.Z`) carries the version.
 

@@ -12,12 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 
 import pytest
 
 from app.workers import tts_worker
-from app.workers.chunk_store import ChunkStore
 
 
 def _small_plan(*_args, **_kwargs):

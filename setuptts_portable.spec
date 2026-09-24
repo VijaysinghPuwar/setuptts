@@ -40,6 +40,47 @@ if sys.platform != "win32":
 
 ROOT = Path(SPECPATH)
 
+# ── Version: single source of truth is app/__init__.py ──────────────── #
+import re as _re
+APP_VERSION = _re.search(
+    r'^APP_VERSION\s*=\s*"([^"]+)"',
+    (ROOT / "app" / "__init__.py").read_text(encoding="utf-8"),
+    _re.M,
+).group(1)
+
+
+def _windows_version_file() -> str:
+    """
+    Write a VERSIONINFO resource so Explorer's Properties ▸ Details shows the
+    version — otherwise every SetupTTS.exe looks identical, and an old copy
+    launched from a stale shortcut can't be told apart.
+    """
+    parts = [int(p) for p in _re.findall(r"\d+", APP_VERSION)[:3]] + [0]
+    while len(parts) < 4:
+        parts.append(0)
+    t = tuple(parts[:4])
+    text = f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={t}, prodvers={t}, mask=0x3f, flags=0x0,
+                    OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', 'SetupTTS'),
+      StringStruct('FileDescription', 'SetupTTS'),
+      StringStruct('FileVersion', '{APP_VERSION}'),
+      StringStruct('InternalName', 'SetupTTS'),
+      StringStruct('OriginalFilename', 'SetupTTS.exe'),
+      StringStruct('ProductName', 'SetupTTS'),
+      StringStruct('ProductVersion', '{APP_VERSION}')])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+"""
+    path = ROOT / "build" / "file_version_info.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
 # ── Collect data files ─────────────────────────────────────────────── #
 edge_tts_datas = collect_data_files("edge_tts")
 certifi_datas  = collect_data_files("certifi")
@@ -151,5 +192,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(_ico) if _ico.exists() else None,
-    version_file=None,
+    version=_windows_version_file(),
 )

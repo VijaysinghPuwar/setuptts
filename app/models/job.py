@@ -22,6 +22,7 @@ class Job:
     duration_seconds: float = 0.0
     status: JobStatus = JobStatus.COMPLETED
     error_message: str = ""
+    audio_seconds: float | None = None   # length of the finished MP3
 
     @property
     def output_filename(self) -> str:

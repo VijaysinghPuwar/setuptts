@@ -1,8 +1,11 @@
 name: Build Release
 
 # Triggers:
-#   - Push of a version tag:  git tag v1.5.2 && git push origin v1.5.2
-#   - Manual run from GitHub Actions UI (workflow_dispatch)
+#   - Push of a version tag:  git tag v1.6.0 && git push origin v1.6.0
+#     The tag must match APP_VERSION in app/__init__.py, and
+#     release_notes/v<version>.md must exist — both are checked below.
+#   - Manual run from GitHub Actions UI (workflow_dispatch) — builds and tests
+#     the artifacts without publishing a release.
 on:
   push:
     tags:
@@ -10,19 +13,24 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version label (e.g. 1.5.2)"
+        description: "Version label for the artifacts (e.g. 1.6.0-test)"
         required: false
         default: "dev"
 
+# A re-pushed tag must not race an earlier run of the same tag.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
-  # macOS build
+  # macOS build  (Apple Silicon / arm64 — macos-latest)
   # Produces: SetupTTS-macOS.dmg  (drag-to-Applications)
-  #           SetupTTS-macOS.zip  (fallback — extract and double-click)
+  #           SetupTTS-macOS.zip  (alternative — extract and open)
   # ────────────────────────────────────────────────────────────────────────────
   build-macos:
     name: macOS release
-    runs-on: macos-latest   # Apple Silicon (arm64); runs on Intel Macs via Rosetta 2
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
@@ -32,6 +40,26 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check tag matches APP_VERSION and release notes exist
+        if: github.event_name == 'push'
+        run: |
+          APP_VERSION="$(sed -n 's/^APP_VERSION *= *"\(.*\)"/\1/p' app/__init__.py)"
+          if [ "$APP_VERSION" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match APP_VERSION ${APP_VERSION}"
+            exit 1
+          fi
+          test -f "release_notes/v${APP_VERSION}.md" \
+            || { echo "::error::release_notes/v${APP_VERSION}.md is missing"; exit 1; }
 
       - name: Install Python dependencies
         run: |
@@ -46,31 +74,56 @@ jobs:
       - name: Install create-dmg
         run: brew install create-dmg
 
-      - name: Resolve version
-        id: ver
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Build with PyInstaller
         run: python -m PyInstaller setuptts.spec --noconfirm
 
       - name: Verify bundle assets
         run: |
           RES=dist/SetupTTS.app/Contents/Resources
-          test -f "$RES/app/assets/styles/app.qss" || (echo "ERROR: QSS missing"    && exit 1)
-          test -f "$RES/app/assets/icons/app.png"  || (echo "ERROR: icon missing"   && exit 1)
-          test -d "$RES/edge_tts"                  || (echo "ERROR: edge_tts missing" && exit 1)
-          echo "Bundle assets verified OK"
+          for f in app/assets/styles/app.qss app/assets/icons/app.png app/assets/icons/chevron-down.svg; do
+            test -f "$RES/$f" || { echo "::error::$f missing from bundle"; exit 1; }
+          done
+          test -d "$RES/edge_tts" || { echo "::error::edge_tts missing"; exit 1; }
           echo "Bundle size: $(du -sh dist/SetupTTS.app | cut -f1)"
+
+      - name: Verify declared minimum macOS covers every bundled binary
+        run: |
+          python3 - <<'EOF'
+          import plistlib, subprocess, pathlib, re
+          app = pathlib.Path("dist/SetupTTS.app")
+          declared = plistlib.loads((app / "Contents/Info.plist").read_bytes())["LSMinimumSystemVersion"]
+          worst, worst_file = (0,), None
+          for f in app.rglob("*"):
+              if not f.is_file() or f.is_symlink():
+                  continue
+              with open(f, "rb") as fh:
+                  if fh.read(4) not in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"):
+                      continue
+              out = subprocess.run(["otool", "-l", str(f)], capture_output=True, text=True).stdout
+              for m in re.finditer(r"minos (\d+(?:\.\d+)*)", out):
+                  v = tuple(int(x) for x in m.group(1).split("."))
+                  if v > worst:
+                      worst, worst_file = v, f
+          need = ".".join(map(str, worst))
+          print(f"Declared LSMinimumSystemVersion {declared}; highest bundled minos {need} ({worst_file})")
+          if tuple(int(x) for x in declared.split(".")) < worst:
+              raise SystemExit(f"::error::Info.plist says macOS {declared}, but {worst_file} needs {need}")
+          EOF
+
+      - name: Self-test the packaged app (version, assets, TLS, voices, synthesis)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          dist/SetupTTS.app/Contents/MacOS/SetupTTS --selftest selftest-app.json --network \
+            || { cat selftest-app.json; exit 1; }
+          cat selftest-app.json
+          python3 -c "import json,sys; d=json.load(open('selftest-app.json')); \
+            sys.exit(0 if d['version']=='${{ steps.ver.outputs.version }}' or '${{ github.event_name }}'!='push' else 'version mismatch')"
 
       - name: Create DMG (drag-to-Applications layout)
         run: |
-          # create-dmg exits 1 for unsigned apps (codesign warning) even when the
-          # DMG is written successfully — || true tolerates that expected exit code.
+          # create-dmg exits non-zero for unsigned apps (codesign warning) even
+          # when the DMG is written — the DMG is verified and tested below.
           create-dmg \
             --volname "SetupTTS" \
             --window-pos 200 120 \
@@ -81,23 +134,37 @@ jobs:
             --app-drop-link 425 190 \
             "SetupTTS-macOS.dmg" \
             "dist/SetupTTS.app" || true
-          # Assert the DMG actually exists — a real failure would also exit 1
-          test -f "SetupTTS-macOS.dmg" || (echo "ERROR: DMG was not created" && exit 1)
+          test -f "SetupTTS-macOS.dmg" || { echo "::error::DMG was not created"; exit 1; }
+          hdiutil verify "SetupTTS-macOS.dmg"
           echo "DMG size: $(du -sh SetupTTS-macOS.dmg | cut -f1)"
 
-      - name: Create zip (fallback)
+      - name: Self-test the app inside the DMG
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          MNT=$(mktemp -d)
+          hdiutil attach "SetupTTS-macOS.dmg" -nobrowse -readonly -mountpoint "$MNT"
+          "$MNT/SetupTTS.app/Contents/MacOS/SetupTTS" --selftest selftest-dmg.json \
+            || { cat selftest-dmg.json; hdiutil detach "$MNT"; exit 1; }
+          test -L "$MNT/Applications" || { echo "::error::Applications link missing"; exit 1; }
+          hdiutil detach "$MNT"
+          cat selftest-dmg.json
+
+      - name: Create zip
         run: |
           ditto -c -k --keepParent dist/SetupTTS.app "SetupTTS-macOS.zip"
           echo "Zip size: $(du -sh SetupTTS-macOS.zip | cut -f1)"
 
-      - name: Verify zip integrity
+      - name: Self-test the app extracted from the zip
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
-          TMPDIR=$(mktemp -d)
-          ditto -x -k "SetupTTS-macOS.zip" "$TMPDIR"
-          test -x "$TMPDIR/SetupTTS.app/Contents/MacOS/SetupTTS" \
-            || (echo "ERROR: binary not executable after extraction" && exit 1)
-          rm -rf "$TMPDIR"
-          echo "Zip verified OK"
+          TMP=$(mktemp -d)
+          ditto -x -k "SetupTTS-macOS.zip" "$TMP"
+          "$TMP/SetupTTS.app/Contents/MacOS/SetupTTS" --selftest selftest-zip.json \
+            || { cat selftest-zip.json; exit 1; }
+          cat selftest-zip.json
+          rm -rf "$TMP"
 
       - name: Upload macOS DMG
         uses: actions/upload-artifact@v4
@@ -129,6 +196,9 @@ jobs:
   #   not found.  onefile embeds everything inside the EXE so it runs from
   #   anywhere with no folder-structure requirement.
   #
+  # Every artifact is launched and self-tested: the onedir build, the app as
+  # installed by the real installer, and the EXE extracted from the zip.
+  #
   # Produces:
   #   SetupTTS-Windows-Installer.exe  (guided installer — recommended)
   #   SetupTTS-Windows-Portable.zip   (single EXE — extract and double-click)
@@ -146,6 +216,26 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check tag matches APP_VERSION
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          APP_VERSION="$(sed -n 's/^APP_VERSION *= *"\(.*\)"/\1/p' app/__init__.py)"
+          if [ "$APP_VERSION" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match APP_VERSION ${APP_VERSION}"
+            exit 1
+          fi
+
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
@@ -157,34 +247,50 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q
 
-      - name: Resolve version
-        id: ver
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build installer (onedir)
+      - name: Build installer payload (onedir)
         run: python -m PyInstaller setuptts.spec --noconfirm
 
       - name: Verify onedir build
         shell: pwsh
         run: |
-          if (!(Test-Path "dist\SetupTTS\SetupTTS.exe")) {
-            Write-Error "dist\SetupTTS\SetupTTS.exe not found"; exit 1
+          foreach ($f in @("dist\SetupTTS\SetupTTS.exe",
+                           "dist\SetupTTS\_internal\app\assets\styles\app.qss",
+                           "dist\SetupTTS\_internal\app\assets\icons\app.png",
+                           "dist\SetupTTS\_internal\app\assets\icons\chevron-down.svg")) {
+            if (!(Test-Path $f)) { Write-Error "$f not found"; exit 1 }
           }
-          $exeSize = [math]::Round((Get-Item "dist\SetupTTS\SetupTTS.exe").Length / 1MB, 1)
           $dirSize = [math]::Round((Get-ChildItem -Recurse "dist\SetupTTS" |
             Measure-Object -Property Length -Sum).Sum / 1MB, 1)
-          Write-Host "Installer build: SetupTTS.exe ${exeSize} MB  |  folder total ${dirSize} MB"
+          Write-Host "onedir build: ${dirSize} MB"
+
+      # The app is windowed (no console), so it writes results to a file; a
+      # small helper runs it, waits, and fails the step on a bad result.
+      - name: Write self-test helper
+        shell: pwsh
+        run: |
+          @'
+          param([string]$Exe, [string]$Out, [string]$Version, [switch]$Network)
+          $argList = @("--selftest", "`"$Out`"")
+          if ($Network) { $argList += "--network" }
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $p = Start-Process -FilePath $Exe -ArgumentList $argList -Wait -PassThru
+          if (!(Test-Path $Out)) { Write-Error "no self-test output from $Exe (exit $($p.ExitCode))"; exit 1 }
+          Get-Content $Out
+          $r = Get-Content $Out -Raw | ConvertFrom-Json
+          if (!$r.ok -or $p.ExitCode -ne 0) { Write-Error "self-test failed for $Exe"; exit 1 }
+          if ($Version -and $r.version -ne $Version) { Write-Error "version $($r.version) != $Version"; exit 1 }
+          '@ | Set-Content selftest.ps1
+
+      - name: Self-test onedir build (version, assets, TLS, voices, synthesis)
+        shell: pwsh
+        run: |
+          $ver = if ("${{ github.event_name }}" -eq "push") { "${{ steps.ver.outputs.version }}" } else { "" }
+          ./selftest.ps1 -Exe "dist\SetupTTS\SetupTTS.exe" -Out "$pwd\selftest-onedir.json" -Version $ver -Network
 
       - name: Build Inno Setup installer
         shell: pwsh
         run: |
-          $ver       = "${{ steps.ver.outputs.version }}"
+          $ver       = (Select-String -Path app\__init__.py -Pattern '^APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           $iscc      = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           $sourceDir = (Resolve-Path "dist\SetupTTS").Path
           $outputDir = (New-Item -ItemType Directory -Force -Path "installer_out").FullName
@@ -205,18 +311,25 @@ jobs:
           Write-Host "Installer: ${size} MB"
           Copy-Item $installer "SetupTTS-Windows-Installer.exe"
 
+      - name: Install silently and self-test the installed app
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\SetupTTS-Windows-Installer.exe" `
+                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER" `
+                 -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Write-Error "installer exit $($p.ExitCode)"; exit 1 }
+          $exe = Join-Path $env:LOCALAPPDATA "Programs\SetupTTS\SetupTTS.exe"
+          if (!(Test-Path $exe)) { Write-Error "installed app not found at $exe"; exit 1 }
+          $appVer = (Select-String -Path app\__init__.py -Pattern '^APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $fileVer = (Get-Item $exe).VersionInfo.ProductVersion
+          Write-Host "Installed EXE ProductVersion: $fileVer"
+          if ($fileVer -ne $appVer) { Write-Error "EXE version info $fileVer != $appVer"; exit 1 }
+          $ver = if ("${{ github.event_name }}" -eq "push") { "${{ steps.ver.outputs.version }}" } else { "" }
+          ./selftest.ps1 -Exe $exe -Out "$pwd\selftest-installed.json" -Version $ver -Network
+
       - name: Build portable (onefile)
         run: |
           python -m PyInstaller setuptts_portable.spec --noconfirm --distpath dist_portable
-
-      - name: Verify portable EXE
-        shell: pwsh
-        run: |
-          if (!(Test-Path "dist_portable\SetupTTS.exe")) {
-            Write-Error "dist_portable\SetupTTS.exe not found"; exit 1
-          }
-          $size = [math]::Round((Get-Item "dist_portable\SetupTTS.exe").Length / 1MB, 1)
-          Write-Host "Portable EXE: ${size} MB"
 
       - name: Create portable zip
         shell: pwsh
@@ -227,17 +340,15 @@ jobs:
           $size = [math]::Round((Get-Item "SetupTTS-Windows-Portable.zip").Length / 1MB, 1)
           Write-Host "Portable zip: ${size} MB"
 
-      - name: Verify portable zip
+      - name: Self-test the EXE extracted from the portable zip
         shell: pwsh
         run: |
-          $tmp = New-Item -ItemType Directory -Path "$env:TEMP\st_verify"
+          $tmp = New-Item -ItemType Directory -Force -Path "$env:TEMP\st_verify"
           Expand-Archive -Path "SetupTTS-Windows-Portable.zip" -DestinationPath $tmp.FullName
-          if (!(Test-Path "$($tmp.FullName)\SetupTTS.exe")) {
-            Write-Error "SetupTTS.exe missing after extraction"; exit 1
-          }
-          $size = [math]::Round((Get-Item "$($tmp.FullName)\SetupTTS.exe").Length / 1MB, 1)
-          Write-Host "Portable zip verified OK — SetupTTS.exe ${size} MB"
-          Remove-Item -Recurse -Force $tmp.FullName
+          $exe = "$($tmp.FullName)\SetupTTS.exe"
+          if (!(Test-Path $exe)) { Write-Error "SetupTTS.exe missing after extraction"; exit 1 }
+          $ver = if ("${{ github.event_name }}" -eq "push") { "${{ steps.ver.outputs.version }}" } else { "" }
+          ./selftest.ps1 -Exe $exe -Out "$pwd\selftest-portable.json" -Version $ver -Network
 
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
@@ -267,9 +378,15 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout (for release notes)
+        uses: actions/checkout@v4
+
       - name: Resolve version
         id: ver
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          test -f "release_notes/${GITHUB_REF_NAME}.md" \
+            || { echo "::error::release_notes/${GITHUB_REF_NAME}.md is missing"; exit 1; }
 
       - name: Download macOS DMG
         uses: actions/download-artifact@v4
@@ -299,100 +416,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: SetupTTS v${{ steps.ver.outputs.version }}
-          body: |
-            ## SetupTTS v${{ steps.ver.outputs.version }}
-
-            Convert any text to natural-sounding audio using Microsoft Neural voices.
-            No Python, no terminal, no setup required.
-
-            > **SetupTTS is a hybrid app:** text preparation and file writing happen locally; speech synthesis is performed by Microsoft's Neural TTS service (speech.platform.bing.com). Low CPU usage during generation is expected.
-
-            ---
-
-            ### What's new in v${{ steps.ver.outputs.version }}
-
-            #### Responsive layout — the window works at every size
-            - **The sidebar no longer collapses on a short window.** Its pinned footer could grow without bound, leaving barely 160 px of scrollable controls above it: the voice picker was sliced in half against the CTA, and speed, export and the running-job list all sat below the fold. The footer is now bounded and the viewport never drops below three controls.
-            - **Control density adapts to window height.** Padding is given up first, then the two explanatory hints (whose text moves to the tooltip of the control they explain) — so a short window loses chrome, never controls.
-            - **Recent Conversions scales with the window** instead of holding a fixed height that swallowed a quarter of a small window. Dragging the split pins your own height, clamped so the editor always keeps the majority.
-            - **Active jobs scroll into view** when an export starts, instead of the sidebar looking idle while it runs.
-            - **Smaller minimum window** — 720x480, down from 780x520, verified to render without clipping.
-            - **Long filenames, long resume prompts and voice warnings** now elide instead of widening or clipping the sidebar.
-            - Backed by 90 new layout regression tests covering 13 window sizes from 720x480 to 3840x2160, each with the sidebar at its fullest.
-
-            #### Long-form truncation hardening
-            - **Stricter coverage verification** — final assembly now rejects gaps, overlaps, duplicate manifest records, missing chunk files, byte-count mismatches, source text hash mismatches, and invalid recovery sub-ranges.
-            - **Safer resume after crashes or corruption** — SetupTTS only resumes from the first contiguous, verified source range and drops any later chunk records after a missing, corrupt, or non-contiguous range.
-            - **Recovery sub-range integrity checks** — smaller recovery chunks must exactly cover the failed parent range before the parent chunk can be recorded as complete.
-            - **Post-assembly fail-closed behavior** — jobs are only marked completed after final MP3 assembly and duration sanity checks pass; late coverage or duration failures preserve staged progress for retry/resume.
-
-            #### Existing long-job safeguards
-            - Long-job startup preflight still confirms Microsoft returns audio before a large export begins.
-            - Repeated no-audio and timeout failures still trigger smaller recovery chunks and safer adaptive chunk sizing.
-            - Voice/text mismatch preflight and clearer preserved-progress errors remain in place.
-
-            ---
-
-            ### Carried forward from v1.3.x
-            - Real-time generation speed display (`1,250 chars/s`) in active job rows.
-            - LOCAL / REMOTE / WAIT color-coded stage badges on each job.
-            - Per-chunk retry with exponential backoff (2 s → 4 s → 8 s → 16 s).
-            - "Took" column in Recent Conversions showing real generation time.
-            - Long-form audiobook support with independent per-chunk retry.
-
-            ---
-
-            ### Download
-
-            | Platform | File | Description |
-            |----------|------|-------------|
-            | **macOS** (Apple Silicon + Intel via Rosetta) | `SetupTTS-macOS.dmg` | Drag-to-Applications installer |
-            | **macOS** (Apple Silicon + Intel via Rosetta) | `SetupTTS-macOS.zip` | Fallback — extract and run |
-            | **Windows** 10/11 | `SetupTTS-Windows-Installer.exe` | Guided installer |
-            | **Windows** 10/11 | `SetupTTS-Windows-Portable.zip` | No install needed |
-
-            ---
-
-            ### macOS install
-
-            **Option 1 — DMG (recommended)**
-            1. Download `SetupTTS-macOS.dmg`
-            2. Open the DMG and drag **SetupTTS** to **Applications**
-            3. Eject the DMG
-            4. Open SetupTTS from Applications
-            5. **First launch only:** if macOS blocks the app, right-click → Open
-
-            **Option 2 — Zip**
-            1. Download and unzip `SetupTTS-macOS.zip`
-            2. Double-click **SetupTTS.app**
-            3. **First launch only:** right-click → Open if macOS blocks it
-
-            > The Gatekeeper prompt (right-click → Open) is only needed once on the very first launch. After that, the app opens normally.
-
-            ---
-
-            ### Windows install
-
-            **Option 1 — Installer (recommended)**
-            1. Download `SetupTTS-Windows-Installer.exe`
-            2. Double-click and follow the wizard (takes ~10 seconds)
-            3. Launch SetupTTS from the Start Menu or desktop shortcut
-
-            **Option 2 — Portable (no install)**
-            1. Download `SetupTTS-Windows-Portable.zip`
-            2. Extract it (right-click → Extract All)
-            3. Double-click **SetupTTS.exe**
-
-            ---
-
-            ### Requirements
-            - Internet connection required (voices stream from Microsoft's Neural TTS service)
-            - macOS 12 Monterey or later
-            - Windows 10 or 11 (64-bit)
+          body_path: release_notes/${{ github.ref_name }}.md
           files: |
             SetupTTS-macOS.dmg
             SetupTTS-macOS.zip
             SetupTTS-Windows-Installer.exe
             SetupTTS-Windows-Portable.zip
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false
+          make_latest: true

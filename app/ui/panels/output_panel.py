@@ -57,10 +57,11 @@ app/assets/styles/app.qss instead.
 """
 
 import logging
-import os
-import subprocess
-import sys
+import re
+import shutil
+import time
 import warnings
+from html import escape as html_escape
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
@@ -85,14 +86,20 @@ from PySide6.QtWidgets import (
 
 from app.config.settings import AppSettings
 from app.models.job import Job, JobStatus
-from app.models.voice import Voice
+from app.models.voice import Voice, persona_name
 from app.services.history_service import HistoryService
 from app.services.tts_quality import (
     VoiceCompatibilityAssessment,
     assess_voice_compatibility,
     build_text_profile,
 )
-from app.utils.paths import AppPaths
+from app.utils.errors import split_error
+from app.utils.output_paths import (
+    check_output_path,
+    next_free_path,
+    normalise_filename,
+)
+from app.utils.paths import AppPaths, open_in_file_manager
 from app.workers.job_queue import JobItem, JobQueue
 from app.workers.chunk_store import ResumeCandidate, ChunkStore
 from app.workers.preview_worker import PreviewWorker
@@ -192,11 +199,11 @@ class OutputPanel(QWidget):
         return self._settings.volume_string()
 
     def get_output_path(self) -> str:
-        folder = self._folder_edit.text().strip()
-        name   = self._filename_edit.text().strip() or "output.mp3"
-        if not name.lower().endswith(".mp3"):
-            name += ".mp3"
-        return str(Path(folder) / name) if folder else str(Path.home() / "Desktop" / name)
+        folder = self._output_folder()
+        return str(Path(folder) / normalise_filename(self._filename_edit.text()))
+
+    def _output_folder(self) -> str:
+        return self._folder_edit.text().strip() or str(Path.home() / "Desktop")
 
     # ---- Lifecycle / queue state (used by MainWindow) -----------------
 
@@ -250,8 +257,8 @@ class OutputPanel(QWidget):
                     category=RuntimeWarning,
                 )
                 for sig_name in ("loaded", "failed", "started_playing",
-                                  "finished", "progress", "status_changed",
-                                  "completed"):
+                                  "playback_finished", "progress",
+                                  "status_changed", "completed"):
                     sig = getattr(worker, sig_name, None)
                     if sig is None:
                         continue
@@ -442,12 +449,18 @@ class OutputPanel(QWidget):
         ly.setSpacing(3)
 
         hdr = QHBoxLayout()
+        hdr.setSpacing(6)
         hdr.addWidget(_section_label("SPEED"))
         hdr.addStretch()
+        # Only offered when there is something to reset — at 0 % it would be
+        # a button that does nothing.
+        self._rate_reset_btn = QPushButton("Reset")
+        self._rate_reset_btn.setObjectName("quietGhostButton")
+        self._rate_reset_btn.setToolTip("Back to normal speed (0%)")
+        self._rate_reset_btn.hide()
+        hdr.addWidget(self._rate_reset_btn)
         self._rate_value_label = QLabel("+5%")
-        self._rate_value_label.setStyleSheet(
-            "font-size: 12px; font-weight: 700; color: #1DB954; background: transparent;"
-        )
+        self._rate_value_label.setObjectName("rateValue")
         hdr.addWidget(self._rate_value_label)
         ly.addLayout(hdr)
 
@@ -456,6 +469,8 @@ class OutputPanel(QWidget):
         self._rate_slider.setValue(5)
         self._rate_slider.setSingleStep(5)
         self._rate_slider.setPageStep(10)
+        self._rate_slider.setAccessibleName("Speaking speed")
+        self._rate_slider.setToolTip("Speaking speed (−50% to +100%)")
         ly.addWidget(self._rate_slider)
 
         hints = QHBoxLayout()
@@ -538,6 +553,8 @@ class OutputPanel(QWidget):
         ])
         self._generate_btn.setObjectName("generateButton")
         self._generate_btn.setEnabled(False)
+        self._generate_btn.setToolTip("Create the MP3 file  —  Ctrl+Enter")
+        self._generate_btn.setAccessibleName("Generate and export MP3")
         ly.addWidget(self._generate_btn)
 
         # Hint shown when no text.  Elided rather than wrapped: a second line
@@ -678,6 +695,7 @@ class OutputPanel(QWidget):
 
         # Speed
         self._rate_slider.valueChanged.connect(self._on_rate_changed)
+        self._rate_reset_btn.clicked.connect(lambda: self._rate_slider.setValue(0))
 
         # Export form
         self._browse_btn.clicked.connect(self._browse_folder)
@@ -707,14 +725,22 @@ class OutputPanel(QWidget):
     # Called by MainWindow when input text changes                        #
     # ------------------------------------------------------------------ #
 
-    def on_text_changed(self, text: str) -> None:
-        self._current_text = text
-        has_text = bool(text.strip())
+    def on_has_text_changed(self, has_text: bool) -> None:
+        """Immediate enable/disable of Generate as the editor fills or empties."""
         self._generate_btn.setEnabled(has_text)
         self._generate_hint.setVisible(
             not has_text and self._density != self.DENSITY_MINIMAL
         )
+
+    def on_text_changed(self, text: str) -> None:
+        self._current_text = text
+        self.on_has_text_changed(bool(text.strip()))
         self._refresh_voice_guidance()
+
+    def trigger_generate(self) -> None:
+        """Keyboard shortcut entry point — same rules as clicking the button."""
+        if self._generate_btn.isEnabled():
+            self._on_generate()
 
     # ------------------------------------------------------------------ #
     # Settings                                                             #
@@ -722,7 +748,10 @@ class OutputPanel(QWidget):
 
     def _apply_settings(self) -> None:
         self._rate_slider.setValue(self._settings.rate)
-        folder = self._settings.output_dir or str(Path.home() / "Desktop")
+        # valueChanged does not fire when the saved rate equals the slider's
+        # initial value, so sync the label and Reset button explicitly.
+        self._on_rate_changed(self._rate_slider.value())
+        folder =self._settings.output_dir or str(Path.home() / "Desktop")
         self._set_folder_text(folder)
         idx = self._gender_combo.findText(self._settings.gender_filter)
         if idx >= 0:
@@ -763,7 +792,9 @@ class OutputPanel(QWidget):
         self._preview_btn.setEnabled(False)
         self._voice_count_label.setText("Connecting…")
 
-        self._voice_loader = VoiceLoaderWorker()
+        self._voice_loader = VoiceLoaderWorker(
+            cache_path=AppPaths().cache_dir / "voices.json"
+        )
         self._voice_loader.loaded.connect(self._on_voices_loaded)
         self._voice_loader.failed.connect(self._on_voices_failed)
         self._voice_loader.start()
@@ -791,15 +822,29 @@ class OutputPanel(QWidget):
         self._gender_combo.setEnabled(True)
         self._apply_filters()
 
+        loader = self._voice_loader
+        if loader is not None and getattr(loader, "from_cache", False):
+            # Offline: the picker works from the saved list, but generating
+            # needs the service — say so rather than fail at Generate.
+            self._voice_error_label.setText(
+                "Offline — showing your saved voice list. Generating audio "
+                "needs an internet connection."
+            )
+            self._voice_error_label.show()
+            self._retry_voices_btn.show()
+            self.status_message.emit("Speech service unreachable — using saved voice list")
+
     def _on_voices_failed(self, message: str) -> None:
         self._voice_combo.clear()
         self._voice_combo.addItem("Could not load voices")
         self._voice_count_label.setText("")
-        self._voice_error_label.setText(message)
+        err = split_error(message)
+        self._voice_error_label.setText(err.summary)
+        self._voice_error_label.setToolTip(err.details)
         self._voice_error_label.show()
         self._retry_voices_btn.show()
         self._hide_voice_guidance()
-        self.status_message.emit("Voice load failed — check internet")
+        self.status_message.emit("Couldn't load voices — check your internet connection")
 
     # ------------------------------------------------------------------ #
     # Filtering                                                            #
@@ -841,7 +886,7 @@ class OutputPanel(QWidget):
         self._voice_combo.clear()
 
         if not self._filtered_voices:
-            self._voice_combo.addItem("No voices match")
+            self._voice_combo.addItem("No voices match your search")
             self._voice_combo.setEnabled(False)
             self._preview_btn.setEnabled(False)
             self._voice_count_label.setText("0 voices")
@@ -850,7 +895,12 @@ class OutputPanel(QWidget):
 
         recent_in = [v for v in self._filtered_voices if v.short_name in recent]
         rest      = [v for v in self._filtered_voices if v.short_name not in recent]
-        restore   = 0
+        # Index of the saved voice if it survives the filter.  When it does
+        # not, fall back to the first real voice — never row 0 blindly: with
+        # recent voices shown, row 0 is the disabled "Recently Used" header,
+        # which left the picker showing a header while Generate silently used
+        # the saved voice that the filter had hidden.
+        restore   = -1
 
         if recent_in:
             self._voice_combo.addItem("── Recently Used ──")
@@ -871,9 +921,11 @@ class OutputPanel(QWidget):
             self._voice_combo.setItemData(
                 self._voice_combo.count() - 1, v.short_name, _ROLE_SHORT_NAME
             )
-            if v.short_name == saved_voice and restore == 0:
+            if v.short_name == saved_voice and restore < 0:
                 restore = self._voice_combo.count() - 1
 
+        if restore < 0:
+            restore = 1 if recent_in else 0
         self._voice_combo.setCurrentIndex(restore)
         self._voice_combo.setEnabled(True)
         self._voice_combo.blockSignals(False)
@@ -881,10 +933,12 @@ class OutputPanel(QWidget):
         total = len(self._filtered_voices)
         all_n = len(self._all_voices)
         self._voice_count_label.setText(
-            f"{total} voices" if total == all_n else f"{total} / {all_n}"
+            f"{total} voices" if total == all_n else f"{total} of {all_n} voices"
         )
         self._preview_btn.setEnabled(True)
-        self._refresh_voice_guidance()
+        # Signals were blocked while rebuilding, so record the selection that
+        # is now visible — that is the voice Generate will use.
+        self._on_voice_selection_changed()
 
     def _on_voice_selection_changed(self) -> None:
         selected = self.get_selected_voice()
@@ -924,7 +978,7 @@ class OutputPanel(QWidget):
         self._use_recommended_voice_btn.setVisible(bool(recommended_voice))
         if recommended_voice:
             self._use_recommended_voice_btn.setText(
-                f"Use {recommended_voice}"
+                f"Use {_voice_label(recommended_voice)}"
             )
         self._voice_warning.show()
 
@@ -961,12 +1015,12 @@ class OutputPanel(QWidget):
             None,
         )
         message = (
-            f"'{selected_voice}' is a multilingual model. For very long English narration jobs, "
-            "SetupTTS treats it as more failure-prone than a same-locale non-multilingual voice "
-            "and will use smaller chunks plus stronger recovery."
+            f"{persona_name(selected_voice)} is a multilingual voice. For long English "
+            "audiobooks it is less reliable than a standard voice, so SetupTTS will "
+            "work in smaller sections (slower, but safer)."
         )
         if recommended_voice:
-            message += f"\nRecommended voice: {recommended_voice}"
+            message += f"\nMore reliable for long jobs: {_voice_label(recommended_voice)}"
         return message, recommended_voice
 
     def _on_use_recommended_voice(self) -> None:
@@ -974,7 +1028,7 @@ class OutputPanel(QWidget):
         if not recommended_voice:
             return
         if self._select_voice_by_short_name(recommended_voice):
-            self.status_message.emit(f"Using recommended voice: {recommended_voice}")
+            self.status_message.emit(f"Using recommended voice: {_voice_label(recommended_voice)}")
 
     def _select_voice_by_short_name(self, short_name: str) -> bool:
         voice = next((item for item in self._all_voices if item.short_name == short_name), None)
@@ -1005,7 +1059,8 @@ class OutputPanel(QWidget):
     # ------------------------------------------------------------------ #
 
     def _on_rate_changed(self, value: int) -> None:
-        self._rate_value_label.setText(f"+{value}%" if value >= 0 else f"{value}%")
+        self._rate_value_label.setText(_format_rate(value))
+        self._rate_reset_btn.setVisible(value != 0)
         self._settings.rate = value
 
     # ------------------------------------------------------------------ #
@@ -1041,7 +1096,7 @@ class OutputPanel(QWidget):
         self._preview_worker.started_playing.connect(
             lambda: self._preview_status.setText("Playing…")
         )
-        self._preview_worker.finished.connect(self._on_preview_done)
+        self._preview_worker.playback_finished.connect(self._on_preview_done)
         self._preview_worker.failed.connect(self._on_preview_failed)
         self._preview_worker.start()
 
@@ -1128,6 +1183,12 @@ class OutputPanel(QWidget):
                 else:
                     return
 
+        # ── Destination checks — before anything is queued ─────────────── #
+        problem = check_output_path(self._output_folder(), self._filename_edit.text())
+        if problem is not None:
+            QMessageBox.warning(self, problem.title, problem.message)
+            return
+
         # ── Duplicate output-path guard ─────────────────────────────────── #
         if self._queue.has_active_output_path(output_path):
             QMessageBox.warning(
@@ -1141,11 +1202,15 @@ class OutputPanel(QWidget):
             )
             return
 
-        # Build compact voice display for the job row
-        parts        = voice.split("-")
-        persona      = parts[-1].replace("Neural", "").replace("Multilingual", "") if parts else voice
-        locale_key   = "-".join(parts[:2]) if len(parts) >= 2 else voice
-        voice_display = f"{persona} · {_locale_label(locale_key)}"
+        # ── Never silently replace a finished file ──────────────────────── #
+        # The default name is output.mp3 in the last-used folder, so without
+        # this each new job quietly overwrote the previous audiobook.
+        if Path(output_path).exists():
+            output_path = self._confirm_existing_output(output_path)
+            if not output_path:
+                return
+
+        voice_display = _job_voice_display(voice)
 
         # Persist settings
         self._settings.voice      = voice
@@ -1174,6 +1239,52 @@ class OutputPanel(QWidget):
                 "a different output file name.",
             )
 
+    def _confirm_existing_output(self, output_path: str) -> str:
+        """
+        Ask what to do about a file that already exists at *output_path*.
+
+        Returns the path to write to, or "" if the user cancelled.  "Keep
+        Both" picks the next free "name (N).mp3" that is neither on disk nor
+        claimed by a queued job.  The existing file is only replaced once the
+        new one is complete — the worker assembles into a temp file first.
+        """
+        existing = Path(output_path)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("File Already Exists")
+        box.setText(f"“{existing.name}” already exists in this folder.")
+        box.setInformativeText(
+            "Do you want to replace it, or save the new audio as a separate file?"
+        )
+        keep_btn = box.addButton("Keep Both", QMessageBox.ButtonRole.AcceptRole)
+        replace_btn = box.addButton("Replace", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(keep_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked == replace_btn:
+            return output_path
+        if clicked != keep_btn:
+            return ""
+
+        candidate = next_free_path(existing)
+        if self._queue.has_active_output_path(str(candidate)):
+            candidate = self._next_unclaimed(candidate)
+        self._filename_edit.setText(candidate.name)
+        return str(candidate)
+
+    def _next_unclaimed(self, taken: Path) -> Path:
+        """Next 'name (N).mp3' after *taken* that is free on disk and in the queue."""
+        match = re.search(r" \((\d+)\)$", taken.stem)
+        stem = taken.stem[: match.start()] if match else taken.stem
+        n = int(match.group(1)) + 1 if match else 2
+        while True:
+            candidate = taken.with_name(f"{stem} ({n}){taken.suffix}")
+            if not candidate.exists() and not self._queue.has_active_output_path(str(candidate)):
+                return candidate
+            n += 1
+
     def _restore_generate_btn(self) -> None:
         """Re-enable the Generate button after the debounce timer fires."""
         parent_win = self.window()
@@ -1198,18 +1309,17 @@ class OutputPanel(QWidget):
             return
 
         latest = self._resume_candidates[0]
-        resume_chunk = latest.failed_at_chunk or (latest.completed_count + 1)
-        latest_name = Path(latest.output_path).name
         count = len(self._resume_candidates)
         suffix = "" if count == 1 else f" ({count})"
         self._resume_job_btn.set_labels([
-            f"Resume Saved Job{suffix}",
+            f"Resume Unfinished Job{suffix}",
             f"Resume Job{suffix}",
             f"Resume{suffix}",
         ])
         detail = (
-            f"{count} resumable job(s) saved locally. Latest: {latest_name} — "
-            f"{latest.completed_count} chunk(s) preserved, resume at chunk {resume_chunk}."
+            f"Unfinished: {_candidate_label(latest)}"
+            if count == 1 else
+            f"{count} unfinished jobs — latest: {_candidate_label(latest)}"
         )
         self._resume_job_hint.setText(detail)
         # The hint elides to one line and collapses in compact mode, so the
@@ -1226,26 +1336,42 @@ class OutputPanel(QWidget):
             QMessageBox.information(
                 self,
                 "No Saved Job",
-                "No resumable SetupTTS job was found.",
+                "There is no unfinished job to resume.",
             )
-            return
-
-        if len(self._resume_candidates) == 1:
-            self._resume_candidate(self._resume_candidates[0])
             return
 
         menu = QMenu(self)
         for candidate in self._resume_candidates:
-            resume_chunk = candidate.failed_at_chunk or (candidate.completed_count + 1)
-            label = (
-                f"{Path(candidate.output_path).name} — "
-                f"resume at chunk {resume_chunk} ({candidate.completed_count} preserved)"
-            )
-            action = menu.addAction(label)
+            action = menu.addAction(f"Resume {_candidate_label(candidate)}")
+            action.setToolTip(candidate.text_preview)
             action.triggered.connect(
                 lambda _checked=False, c=candidate: self._resume_candidate(c)
             )
+        menu.addSeparator()
+        discard_menu = menu.addMenu("Discard Saved Progress")
+        for candidate in self._resume_candidates:
+            action = discard_menu.addAction(_candidate_label(candidate))
+            action.triggered.connect(
+                lambda _checked=False, c=candidate: self._discard_candidate(c)
+            )
         menu.exec(self._resume_job_btn.mapToGlobal(self._resume_job_btn.rect().bottomLeft()))
+
+    def _discard_candidate(self, candidate: ResumeCandidate) -> None:
+        name = Path(candidate.output_path).name
+        if QMessageBox.question(
+            self,
+            "Discard Saved Progress",
+            f"Delete the saved progress for “{name}”?\n\n"
+            "The audio generated so far for this job will be deleted and "
+            "can't be resumed. Finished MP3 files are not affected.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        shutil.rmtree(candidate.staging_dir, ignore_errors=True)
+        logger.info("Discarded saved job %s (%s)", candidate.job_id, candidate.staging_dir)
+        self.status_message.emit(f"Discarded saved progress for {name}")
+        self._refresh_resume_jobs()
 
     def _resume_candidate(self, candidate: ResumeCandidate) -> None:
         if self._queue.has_active_output_path(candidate.output_path):
@@ -1256,9 +1382,31 @@ class OutputPanel(QWidget):
             )
             return
 
+        output_path = Path(candidate.output_path)
+        problem = check_output_path(str(output_path.parent), output_path.name)
+        if problem is not None:
+            # The original destination is gone or not writable (an unplugged
+            # drive, a moved folder, blocked access) — without a way to pick a
+            # new one, the saved progress could never be finished.
+            QMessageBox.information(
+                self, problem.title,
+                f"{problem.message}\n\nChoose where to save the finished audio instead.",
+            )
+            chosen, _ = QFileDialog.getSaveFileName(
+                self, "Save Resumed Audio As",
+                str(Path(self._output_folder()) / output_path.name),
+                "MP3 Audio (*.mp3)",
+            )
+            if not chosen:
+                return
+            output_path = Path(chosen).with_suffix(".mp3")
+            problem = check_output_path(str(output_path.parent), output_path.name)
+            if problem is not None:
+                QMessageBox.warning(self, problem.title, problem.message)
+                return
+
         voice = candidate.voice
         self._select_voice_by_short_name(voice)
-        output_path = Path(candidate.output_path)
         self._filename_edit.setText(output_path.name)
         self._set_folder_text(str(output_path.parent))
         self._settings.output_dir = str(output_path.parent)
@@ -1270,10 +1418,7 @@ class OutputPanel(QWidget):
             except Exception:
                 logger.warning("Could not load resumable text into the editor", exc_info=True)
 
-        parts = voice.split("-")
-        persona = parts[-1].replace("Neural", "").replace("Multilingual", "") if parts else voice
-        locale_key = "-".join(parts[:2]) if len(parts) >= 2 else voice
-        voice_display = f"{persona} · {_locale_label(locale_key)}"
+        voice_display = _job_voice_display(voice)
 
         try:
             self._queue.submit(
@@ -1282,7 +1427,7 @@ class OutputPanel(QWidget):
                 voice_display=voice_display,
                 rate=candidate.rate,
                 volume=candidate.volume,
-                output_path=candidate.output_path,
+                output_path=str(output_path),
                 allow_voice_mismatch=False,
                 job_id=candidate.job_id,
                 resume_staging_dir=str(candidate.staging_dir),
@@ -1364,6 +1509,7 @@ class OutputPanel(QWidget):
             output_path=item.output_path,
             duration_seconds=item.duration,
             status=JobStatus.COMPLETED,
+            audio_seconds=item.audio_seconds,
         )
         try:
             job = self._history.add_job(job)
@@ -1389,18 +1535,31 @@ class OutputPanel(QWidget):
         self._failure_dialog_active = True
         item = self._failure_dialog_queue.pop(0)
 
+        err = split_error(item.error)
         prompt = QMessageBox(self)
-        prompt.setIcon(QMessageBox.Icon.Critical)
-        prompt.setWindowTitle("Generation Failed")
-        prompt.setText(item.error)
+        prompt.setIcon(QMessageBox.Icon.Warning)
+        prompt.setWindowTitle("Couldn't Finish the Audio")
+        prompt.setText(f"“{item.filename}” could not be completed.")
+        prompt.setInformativeText(err.summary)
+        if err.details:
+            # Raw exception text stays one click away (and in the log) instead
+            # of being the first thing a non-technical user reads.
+            prompt.setDetailedText(err.details)
         resume_btn = None
         if item.resumable and item.resume_staging_dir:
             resume_btn = prompt.addButton(
-                "Resume Failed Job",
+                "Resume",
                 QMessageBox.ButtonRole.AcceptRole,
             )
-        prompt.addButton(QMessageBox.StandardButton.Ok)
+            resume_btn.setToolTip("Continue from where it stopped — finished audio is kept")
+        logs_btn = prompt.addButton("Open Logs Folder", QMessageBox.ButtonRole.HelpRole)
+        close_btn = prompt.addButton(QMessageBox.StandardButton.Close)
+        prompt.setDefaultButton(resume_btn or close_btn)
+        prompt.setEscapeButton(close_btn)
         prompt.exec()
+
+        if prompt.clickedButton() == logs_btn:
+            _open_path(str(AppPaths().log_dir))
 
         if resume_btn is not None and prompt.clickedButton() == resume_btn:
             candidate = next(
@@ -1443,8 +1602,14 @@ class OutputPanel(QWidget):
             self._jobs_card.setVisible(False)
 
     def _update_jobs_header(self) -> None:
-        n = len(self._job_rows)
-        self._jobs_count_label.setText(f"{n}" if n else "")
+        running = self._queue.running_count
+        queued  = self._queue.pending_count
+        parts = []
+        if running:
+            parts.append(f"{running} running")
+        if queued:
+            parts.append(f"{queued} waiting")
+        self._jobs_count_label.setText(" · ".join(parts))
 
 
 # ══════════════════════════════════════════════════════════════════════ #
@@ -1453,140 +1618,145 @@ class OutputPanel(QWidget):
 
 class _JobRowWidget(QWidget):
     """
-    Compact two-line widget representing one job in the active jobs list.
+    One job in the ACTIVE JOBS list.
 
-    Line 1: [icon]  filename.mp3                     [Cancel ✕]
-    Line 2:         Voice · Locale  ▓▓▓░░░  45%  Status text
+      ● chapter-01.mp3                                   [Cancel]
+        Andrew · English (US)                                42%
+        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+        REMOTE  Generating audio
+        Chunk 82 of ~194 · 74 chars/s · about 21 min left
+
+    The stage line is plain language.  The worker's own stage text is written
+    for troubleshooting ("Sending chunk 3/~7 to Microsoft (8,960 chars / …)"),
+    so it is kept as the line's tooltip rather than shown directly.
     """
 
     cancel_requested = Signal(str)   # job_id
+
+    # ETA is withheld until the rate has had time to settle: the first chunks
+    # run at a small warm-up size, so an early estimate is badly wrong.
+    _ETA_MIN_CHUNK   = 3
+    _ETA_MIN_SECONDS = 45.0
+
+    # Stage-kind → (hex color, badge label)
+    # Neutral tags; amber is reserved for the one state that is a warning.
+    _STAGE_STYLE: dict[str, tuple[str, str]] = {
+        "local":   ("#8E8E93", "LOCAL"),    # work on your machine
+        "remote":  ("#8E8E93", "REMOTE"),   # waiting on Microsoft's servers
+        "waiting": ("#FF9F0A", "RETRY"),    # connection problem, retrying
+    }
 
     def __init__(self, item: JobItem, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._job_id    = item.id
         self._has_stage = False   # True once first stage_changed event arrives
         self._telemetry = None
+        self._started_at: float | None = None
+        self._cps = 0.0
         self._build(item)
 
     def _build(self, item: JobItem) -> None:
         self.setObjectName("jobRow")
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 2, 0, 2)
-        root.setSpacing(2)
+        root.setContentsMargins(0, 4, 0, 4)
+        root.setSpacing(3)
 
-        # ── Line 1 ─────────────────────────────────────────────────── #
+        # ── Line 1: state dot, file name, cancel ───────────────────── #
         top = QHBoxLayout()
-        top.setSpacing(4)
+        top.setSpacing(6)
         top.setContentsMargins(0, 0, 0, 0)
 
-        self._icon_lbl = QLabel("·")
-        self._icon_lbl.setFixedWidth(14)
-        self._icon_lbl.setStyleSheet(
-            "font-size: 11px; color: #5A5A60; background: transparent;"
-        )
+        self._icon_lbl = QLabel("●")
+        self._icon_lbl.setObjectName("jobDotQueued")
+        self._icon_lbl.setFixedWidth(12)
         top.addWidget(self._icon_lbl)
 
         self._name_lbl = _ElidingLabel(item.filename)
-        self._name_lbl.setStyleSheet(
-            "font-size: 12px; font-weight: 600; color: #F2F2F4; background: transparent;"
-        )
+        self._name_lbl.setObjectName("jobName")
         self._name_lbl.setToolTip(item.output_path)
         top.addWidget(self._name_lbl, 1)
 
-        self._cancel_btn = QPushButton("✕")
-        self._cancel_btn.setObjectName("ghostButton")
-        self._cancel_btn.setFixedSize(22, 22)
-        self._cancel_btn.setToolTip("Cancel this job")
-        self._cancel_btn.setStyleSheet(
-            "QPushButton { color: #5A5A60; font-size: 11px; padding: 0; }"
-            "QPushButton:hover { color: #FF453A; }"
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setObjectName("jobCancelButton")
+        self._cancel_btn.setToolTip(
+            "Stop this job. Audio made so far is kept, so you can resume later."
         )
-        self._cancel_btn.clicked.connect(
-            lambda: self.cancel_requested.emit(self._job_id)
-        )
+        self._cancel_btn.setAccessibleName(f"Cancel {item.filename}")
+        self._cancel_btn.clicked.connect(self._on_cancel_clicked)
         top.addWidget(self._cancel_btn)
         root.addLayout(top)
 
-        # ── Line 2 ─────────────────────────────────────────────────── #
-        bot = QHBoxLayout()
-        bot.setSpacing(5)
-        bot.setContentsMargins(18, 0, 0, 0)  # indent to align under filename
-
-        self._voice_lbl = _ElidingLabel(item.voice_display)
-        self._voice_lbl.setStyleSheet(
-            "font-size: 10px; color: #5A5A60; background: transparent;"
-        )
-        self._voice_lbl.setToolTip(item.voice_display)
-        bot.addWidget(self._voice_lbl, 1)
+        # ── Line 2: voice + percentage ─────────────────────────────── #
+        mid = QHBoxLayout()
+        mid.setSpacing(6)
+        mid.setContentsMargins(18, 0, 0, 0)
+        self._voice_lbl = _ElidingLabel(item.voice_display, mode=Qt.ElideRight)
+        self._voice_lbl.setObjectName("jobMeta")
+        self._voice_lbl.setToolTip(item.voice)
+        mid.addWidget(self._voice_lbl, 1)
 
         self._pct_lbl = QLabel("")
-        self._pct_lbl.setStyleSheet(
-            "font-size: 10px; font-weight: 700; color: #1DB954; "
-            "background: transparent; min-width: 28px;"
-        )
+        self._pct_lbl.setObjectName("jobPercent")
         self._pct_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._pct_lbl.hide()
-        bot.addWidget(self._pct_lbl)
-        root.addLayout(bot)
+        mid.addWidget(self._pct_lbl)
+        root.addLayout(mid)
 
-        # ── Line 3: full-width progress bar ─────────────────────────── #
+        # ── Line 3: progress bar ───────────────────────────────────── #
         bar_row = QHBoxLayout()
         bar_row.setContentsMargins(18, 1, 0, 1)
         bar_row.setSpacing(0)
         self._progress_bar = QProgressBar()
+        self._progress_bar.setObjectName("jobProgress")
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
         self._progress_bar.setTextVisible(False)
-        self._progress_bar.setFixedHeight(4)
+        self._progress_bar.setFixedHeight(6)
+        self._progress_bar.setAccessibleName(f"Progress of {item.filename}")
         self._progress_bar.hide()
         bar_row.addWidget(self._progress_bar)
         root.addLayout(bar_row)
 
-        # ── Line 4: status text ─────────────────────────────────────── #
-        status_row = QHBoxLayout()
-        status_row.setContentsMargins(18, 0, 0, 0)
-        status_row.setSpacing(0)
-        self._status_lbl = QLabel(item.status_text)
-        self._status_lbl.setStyleSheet(
-            "font-size: 10px; color: #5A5A60; background: transparent;"
-        )
+        # ── Line 4: stage ──────────────────────────────────────────── #
+        self._status_lbl = QLabel()
+        self._status_lbl.setObjectName("jobStage")
         self._status_lbl.setWordWrap(True)
-        status_row.addWidget(self._status_lbl, 1)
-        root.addLayout(status_row)
-
-        # ── Line 5: real-time speed / ETA ───────────────────────────── #
-        spd_row = QHBoxLayout()
-        spd_row.setContentsMargins(18, 0, 0, 0)
-        spd_row.setSpacing(0)
-
-        self._speed_lbl = QLabel("")
-        self._speed_lbl.setStyleSheet(
-            "font-size: 11px; font-weight: 700; color: #1DB954;"
-            " background: transparent;"
+        self._status_lbl.setContentsMargins(18, 0, 0, 0)
+        root.addWidget(self._status_lbl)
+        self._set_plain_status(
+            "Waiting to start — up to 2 jobs run at the same time"
+            if item.status == "queued" else item.status_text
         )
+
+        # ── Line 5: chunk / speed / ETA ────────────────────────────── #
+        self._speed_lbl = QLabel("")
+        self._speed_lbl.setObjectName("jobMetrics")
         self._speed_lbl.setWordWrap(True)
+        self._speed_lbl.setContentsMargins(18, 0, 0, 0)
         self._speed_lbl.hide()
-        spd_row.addWidget(self._speed_lbl, 1)
-        root.addLayout(spd_row)
+        root.addWidget(self._speed_lbl)
 
     # ------------------------------------------------------------------ #
 
-    # Stage-kind → (hex color, badge label)
-    _STAGE_STYLE: dict[str, tuple[str, str]] = {
-        "local":   ("#5A8A6A", "LOCAL"),    # muted green — work on your machine
-        "remote":  ("#4A8CC2", "REMOTE"),   # blue — network / Microsoft servers
-        "waiting": ("#C2944A", "WAIT"),     # amber — blocked on server/retry
-    }
+    def _on_cancel_clicked(self) -> None:
+        # One click is enough: a second click while the worker winds down
+        # would be a no-op anyway, and a disabled button says "heard you".
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("Stopping…")
+        self.cancel_requested.emit(self._job_id)
+
+    def _set_plain_status(self, text: str) -> None:
+        self._status_lbl.setTextFormat(Qt.PlainText)
+        self._status_lbl.setText(text)
 
     def set_running(self) -> None:
-        self._icon_lbl.setText("▶")
-        self._icon_lbl.setStyleSheet(
-            "font-size: 10px; color: #1DB954; background: transparent;"
-        )
+        self._started_at = time.monotonic()
+        self._icon_lbl.setObjectName("jobDotRunning")
+        self._icon_lbl.style().unpolish(self._icon_lbl)
+        self._icon_lbl.style().polish(self._icon_lbl)
         self._progress_bar.show()
         self._pct_lbl.show()
-        self._status_lbl.setTextFormat(Qt.PlainText)
-        self._status_lbl.setText("Connecting…")
+        self._set_plain_status("Connecting…")
 
     def update_progress(self, pct: int) -> None:
         self._progress_bar.setValue(pct)
@@ -1596,51 +1766,115 @@ class _JobRowWidget(QWidget):
         # Only update with plain text if no stage event has arrived yet.
         # Once stage events are flowing they carry richer information.
         if not self._has_stage:
-            self._status_lbl.setTextFormat(Qt.PlainText)
-            self._status_lbl.setText(text)
+            self._set_plain_status(text)
 
     def update_stage(self, kind: str, text: str) -> None:
-        """Show a color-coded LOCAL / REMOTE / WAIT badge + detail text."""
+        """Show a colour-coded LOCAL / REMOTE / RETRY badge + a plain stage."""
+        friendly = _friendly_stage(kind, text)
+        if friendly is None:
+            return   # informational note — keep the current stage on screen
         self._has_stage = True
         color, badge = self._STAGE_STYLE.get(kind, ("#7A7A80", kind.upper()))
         html = (
             f'<span style="color:{color};font-weight:bold;font-size:9px">'
-            f'[{badge}]</span>'
-            f'<span style="color:#7A7A80;font-size:10px"> {text}</span>'
+            f'{badge}</span>'
+            f'<span style="color:#A0A0A6"> &nbsp;{html_escape(friendly)}</span>'
         )
         self._status_lbl.setTextFormat(Qt.RichText)
         self._status_lbl.setText(html)
+        self._status_lbl.setToolTip(text)
 
     def update_speed(self, cps: float) -> None:
-        """Show real-time generation speed below the progress bar."""
+        """Speed arrives more often than telemetry; keep the latest for the metrics line."""
         if cps > 0:
-            self._speed_lbl.setText(f"{cps:,.0f} chars/s")
-            self._speed_lbl.show()
+            self._cps = cps
+            if self._telemetry is None:
+                self._speed_lbl.setText(f"{cps:,.0f} chars/s")
+                self._speed_lbl.show()
 
     def update_telemetry(self, telemetry: object) -> None:
         self._telemetry = telemetry
-        cps = getattr(telemetry, "rolling_chars_per_second", 0.0) or 0.0
+        cps = getattr(telemetry, "rolling_chars_per_second", 0.0) or self._cps
         current_chunk = getattr(telemetry, "current_chunk", 0) or 0
         estimated_total = getattr(telemetry, "estimated_total_chunks", None)
-        chunk_chars = getattr(telemetry, "chunk_chars", 0) or 0
         eta_seconds = getattr(telemetry, "eta_seconds", None)
 
         parts: list[str] = []
+        if current_chunk > 0:
+            if estimated_total and estimated_total > 1 and estimated_total >= current_chunk:
+                parts.append(f"Chunk {current_chunk} of ~{estimated_total}")
+            else:
+                parts.append(f"Chunk {current_chunk}")
         if cps > 0:
             parts.append(f"{cps:,.0f} chars/s")
-        if eta_seconds is not None and eta_seconds > 1:
-            parts.append(f"ETA {_format_eta(eta_seconds)}")
-        if current_chunk > 0:
-            if estimated_total and estimated_total >= current_chunk:
-                parts.append(f"chunk {current_chunk}/~{estimated_total}")
-            else:
-                parts.append(f"chunk {current_chunk}")
-        if chunk_chars > 0:
-            parts.append(f"{chunk_chars:,} chars")
+        if self._eta_is_reliable(current_chunk) and eta_seconds is not None and eta_seconds > 1:
+            parts.append(_format_eta_words(eta_seconds))
 
         if parts:
             self._speed_lbl.setText(" · ".join(parts))
             self._speed_lbl.show()
+
+    def _eta_is_reliable(self, current_chunk: int) -> bool:
+        if self._started_at is None or current_chunk < self._ETA_MIN_CHUNK:
+            return False
+        return time.monotonic() - self._started_at >= self._ETA_MIN_SECONDS
+
+
+# Worker stage text → what a listener needs to know.  Matched by prefix, in
+# order; the first match wins.  ``None`` means "informational, don't replace
+# the current stage".
+_STAGE_RULES: list[tuple[str, str | None]] = [
+    ("note:",                        None),
+    ("preparing adaptive",           "Planning the job"),
+    ("preparing",                    "Preparing text"),
+    ("cleaning",                     "Preparing text"),
+    ("validating",                   "Checking the voice"),
+    ("checking",                     "Checking the voice"),
+    ("resuming",                     "Resuming from saved progress"),
+    ("connecting",                   "Connecting to the speech service"),
+    ("sending",                      "Generating audio"),
+    ("receiving",                    "Receiving audio"),
+    ("streaming",                    "Receiving audio"),
+    ("retrying",                     "Recovering a difficult section"),
+    ("recovering",                   "Recovering a difficult section"),
+    ("saved progress",               "Saved progress couldn't be reused — starting over"),
+    ("writing",                      "Saving audio"),
+    ("saved",                        "Saving audio"),
+    ("assembling",                   "Finalizing the MP3 file"),
+    ("finalis",                      "Finalizing the MP3 file"),
+    ("finaliz",                      "Finalizing the MP3 file"),
+    ("verifying",                    "Checking the finished file"),
+    ("checking final",               "Checking the finished file"),
+]
+
+_RETRY_RE = re.compile(r"retry (\d+)/(\d+) on (chunk \d+)", re.IGNORECASE)
+
+
+def _friendly_stage(kind: str, text: str) -> str | None:
+    low = (text or "").strip().lower()
+    match = _RETRY_RE.search(low)
+    if match:
+        attempt, total, chunk = match.groups()
+        return f"Connection problem — retrying {chunk} ({attempt} of {total})"
+    for prefix, friendly in _STAGE_RULES:
+        if low.startswith(prefix):
+            return friendly
+    if kind == "waiting":
+        return "Waiting for the speech service"
+    if kind == "remote":
+        return "Generating audio"
+    return text.strip() or None
+
+
+def _format_eta_words(seconds: float) -> str:
+    """Coarse remaining-time text — second precision would be false precision."""
+    minutes = int(round(seconds / 60))
+    if minutes < 1:
+        return "less than a minute left"
+    if minutes < 60:
+        return f"about {minutes} min left"
+    hours, minutes = divmod(minutes, 60)
+    return f"about {hours} h {minutes:02d} min left"
 
 
 # ══════════════════════════════════════════════════════════════════════ #
@@ -1844,6 +2078,21 @@ def _card() -> QFrame:
     return f
 
 
+def _candidate_label(candidate: ResumeCandidate) -> str:
+    """“chapter-01.mp3” — 42% done"""
+    name = Path(candidate.output_path).name
+    total = max(candidate.total_chars, 1)
+    pct = int(100 * min(candidate.chars_consumed, total) / total)
+    return f"“{name}” — {pct}% done"
+
+
+def _format_rate(value: int) -> str:
+    """'+5%', '−10%', or 'Normal' at 0 — the label next to the speed slider."""
+    if value == 0:
+        return "Normal (0%)"
+    return f"+{value}%" if value > 0 else f"{value}%"
+
+
 def _format_eta(seconds: float) -> str:
     total = max(0, int(seconds))
     minutes, secs = divmod(total, 60)
@@ -1866,21 +2115,23 @@ def _field_label(text: str) -> QLabel:
 
 
 def _voice_display(v: Voice) -> str:
-    parts   = v.short_name.split("-")
-    persona = parts[-1].replace("Neural", "").replace("Multilingual", "")
-    return f"{persona}  ·  {v.gender}  ·  {_locale_label(v.locale)}"
+    return f"{v.persona}  ·  {v.gender}  ·  {_locale_label(v.locale)}"
+
+
+def _job_voice_display(short_name: str) -> str:
+    """Compact 'Andrew (Multilingual) · English (US)' label for a job row."""
+    parts  = short_name.split("-")
+    locale = "-".join(parts[:2]) if len(parts) >= 2 else short_name
+    return f"{persona_name(short_name)} · {_locale_label(locale)}"
+
+
+def _voice_label(short_name: str) -> str:
+    """Readable name for a voice in messages, e.g. 'Andrew (English (US))'."""
+    return _job_voice_display(short_name)
 
 
 def _open_path(path: str) -> None:
-    try:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        elif sys.platform == "win32":
-            os.startfile(path)  # type: ignore[attr-defined]
-        else:
-            subprocess.Popen(["xdg-open", path])
-    except Exception as exc:
-        logger.error("Failed to open %s: %s", path, exc)
+    open_in_file_manager(path)
 
 
 def _locale_label(locale: str) -> str:

@@ -1,7 +1,7 @@
 """About dialog."""
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPainter, QPixmap, QBrush, QPen, QFont
+from PySide6.QtGui import QColor, QPainter, QPixmap, QBrush, QPen
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,

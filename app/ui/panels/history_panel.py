@@ -6,16 +6,14 @@ Stays visually quiet so it doesn't compete with the main content.
 """
 
 import logging
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QMessageBox,
     QSizePolicy,
-    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -28,9 +26,15 @@ from PySide6.QtWidgets import (
 )
 
 from app.models.job import Job, JobStatus
+from app.models.voice import persona_name
 from app.services.history_service import HistoryService
+from app.utils.paths import open_in_file_manager
 
 logger = logging.getLogger(__name__)
+
+_COLUMNS = ["When", "Text Preview", "Voice", "Took", "Length", "File"]
+(_COL_WHEN, _COL_PREVIEW, _COL_VOICE,
+ _COL_TOOK, _COL_LENGTH, _COL_FILE) = range(len(_COLUMNS))
 
 
 class HistoryPanel(QWidget):
@@ -115,13 +119,21 @@ class HistoryPanel(QWidget):
 
         # ── Table ──────────────────────────────────────────────────── #
         self._table = QTableWidget()
-        self._table.setColumnCount(5)
-        self._table.setHorizontalHeaderLabels(["When", "Text Preview", "Voice", "Took", "File"])
-        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        self._table.setColumnWidth(0, 84)
-        self._table.setColumnWidth(2, 120)
-        self._table.setColumnWidth(3, 78)
+        self._table.setColumnCount(len(_COLUMNS))
+        self._table.setHorizontalHeaderLabels(_COLUMNS)
+        header_view = self._table.horizontalHeader()
+        # The short columns size to their content — fixed widths clipped
+        # "25m 47s" and "3:05:48" under the Windows font.  Preview and File
+        # share whatever is left.
+        for col in (_COL_WHEN, _COL_VOICE, _COL_TOOK, _COL_LENGTH):
+            header_view.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        header_view.setSectionResizeMode(_COL_PREVIEW, QHeaderView.Stretch)
+        header_view.setSectionResizeMode(_COL_FILE, QHeaderView.Stretch)
+        header_view.setMinimumSectionSize(56)
+        self._table.horizontalHeaderItem(_COL_TOOK).setToolTip("How long generation took")
+        self._table.horizontalHeaderItem(_COL_LENGTH).setToolTip("Length of the audio")
+        self._table.setToolTip("Double-click to play · right-click for more")
+        self._table.setAccessibleName("Recent conversions")
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -151,7 +163,7 @@ class HistoryPanel(QWidget):
             ph.setForeground(Qt.darkGray)
             ph.setFlags(ph.flags() & ~Qt.ItemIsSelectable)
             self._table.setItem(0, 0, ph)
-            self._table.setSpan(0, 0, 1, 5)
+            self._table.setSpan(0, 0, 1, len(_COLUMNS))
             self._table.setRowHeight(0, 36)
             return
 
@@ -159,18 +171,24 @@ class HistoryPanel(QWidget):
             row = self._table.rowCount()
             self._table.insertRow(row)
 
-            parts   = job.voice.split("-")
-            persona = parts[-1].replace("Neural", "") if parts else job.voice
-            took    = _fmt_took(job.duration_seconds, job.status)
+            when = _cell(job.created_at_display)
+            when.setToolTip(job.created_at.strftime("%Y-%m-%d %H:%M"))
+            preview = _cell(job.text_preview)
+            preview.setToolTip(job.text_preview)
+            voice = _cell(persona_name(job.voice))
+            voice.setToolTip(f"{job.voice}  ·  speed {job.rate}")
+            file_cell = _cell(job.output_filename)
+            file_cell.setToolTip(job.output_path)
 
-            self._table.setItem(row, 0, _cell(job.created_at_display))
-            self._table.setItem(row, 1, _cell(job.text_preview))
-            self._table.setItem(row, 2, _cell(persona))
-            self._table.setItem(row, 3, _cell(took))
-            self._table.setItem(row, 4, _cell(job.output_filename))
+            self._table.setItem(row, _COL_WHEN, when)
+            self._table.setItem(row, _COL_PREVIEW, preview)
+            self._table.setItem(row, _COL_VOICE, voice)
+            self._table.setItem(row, _COL_TOOK, _cell(_fmt_took(job.duration_seconds, job.status)))
+            self._table.setItem(row, _COL_LENGTH, _cell(_fmt_length(job.audio_seconds)))
+            self._table.setItem(row, _COL_FILE, file_cell)
 
             if job.status != JobStatus.COMPLETED:
-                for col in range(5):
+                for col in range(len(_COLUMNS)):
                     item = self._table.item(row, col)
                     if item:
                         item.setForeground(Qt.darkGray)
@@ -180,7 +198,19 @@ class HistoryPanel(QWidget):
     def _open_selected(self) -> None:
         row = self._table.currentRow()
         if 0 <= row < len(self._jobs):
-            _open_path(self._jobs[row].output_path)
+            self._open_job_file(self._jobs[row])
+
+    def _open_job_file(self, job: Job, *, reveal: bool = False) -> None:
+        target = Path(job.output_path)
+        if reveal and not target.exists() and target.parent.exists():
+            open_in_file_manager(target.parent)
+            return
+        if not open_in_file_manager(target, reveal=reveal):
+            QMessageBox.information(
+                self, "File Not Found",
+                f"“{target.name}” is no longer at\n\n{target.parent}\n\n"
+                "It may have been moved, renamed, or deleted.",
+            )
 
     def _show_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
@@ -188,16 +218,19 @@ class HistoryPanel(QWidget):
             return
         job = self._jobs[row]
         menu = QMenu(self)
-        open_a   = menu.addAction("Open File")
+        open_a   = menu.addAction("Play / Open File")
         folder_a = menu.addAction("Show in Folder")
+        copy_a   = menu.addAction("Copy File Path")
         menu.addSeparator()
         del_a    = menu.addAction("Remove from History")
 
         action = menu.exec(self._table.viewport().mapToGlobal(pos))
         if action == open_a:
-            _open_path(job.output_path)
+            self._open_job_file(job)
         elif action == folder_a:
-            _open_path(str(Path(job.output_path).parent))
+            self._open_job_file(job, reveal=True)
+        elif action == copy_a:
+            QApplication.clipboard().setText(job.output_path)
         elif action == del_a:
             if job.id is not None:
                 self._history.delete_job(job.id)
@@ -205,7 +238,8 @@ class HistoryPanel(QWidget):
             self._populate()
 
     def _clear_all(self) -> None:
-        from PySide6.QtWidgets import QMessageBox
+        if not self._jobs:
+            return
         if QMessageBox.question(
             self, "Clear History",
             "Remove all recent conversions?\n\nAudio files will not be deleted.",
@@ -242,19 +276,19 @@ def _fmt_took(secs: float, status: JobStatus) -> str:
     return f"{h}h {m:02d}m"
 
 
+def _fmt_length(secs: float | None) -> str:
+    """Audio length: 4:05 · 1:02:33 — or a dash for jobs recorded before 1.6."""
+    if not secs or secs <= 0:
+        return "—"
+    total = int(round(secs))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 def _cell(text: str) -> QTableWidgetItem:
     item = QTableWidgetItem(text)
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
     return item
 
 
-def _open_path(path: str) -> None:
-    try:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        elif sys.platform == "win32":
-            os.startfile(path)  # type: ignore[attr-defined]
-        else:
-            subprocess.Popen(["xdg-open", path])
-    except Exception as exc:
-        logger.error("Failed to open %s: %s", path, exc)

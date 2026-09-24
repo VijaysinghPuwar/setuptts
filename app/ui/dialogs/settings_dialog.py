@@ -1,20 +1,16 @@
 """Settings dialog."""
 
 import logging
-import os
-import subprocess
-import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QClipboard, QFontMetrics
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
-    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -27,8 +23,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import APP_NAME, APP_VERSION
 from app.config.settings import AppSettings
-from app.utils.paths import AppPaths
+from app.utils.app_logging import log_file_path
+from app.utils.paths import AppPaths, open_in_file_manager
 
 logger = logging.getLogger(__name__)
 
@@ -77,72 +75,53 @@ class SettingsDialog(QDialog):
         content = QWidget()
         content.setObjectName("dialogScrollInner")
         root = QVBoxLayout(content)
-        root.setContentsMargins(28, 24, 28, 20)
-        root.setSpacing(20)
+        root.setContentsMargins(28, 22, 28, 20)
+        root.setSpacing(8)
 
-        # ── Output Defaults ────────────────────────────────────────── #
-        root.addWidget(self._section_title("Output"))
+        # ── General ────────────────────────────────────────────────── #
+        root.addWidget(self._section_title("General"))
 
-        form = QFormLayout()
-        form.setSpacing(12)
-        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-
+        folder_label = QLabel("Default save folder")
+        folder_label.setObjectName("dialogFieldLabel")
+        root.addWidget(folder_label)
         dir_row = QHBoxLayout()
         dir_row.setSpacing(6)
         self._output_dir_edit = QLineEdit()
-        self._output_dir_edit.setPlaceholderText("Desktop")
+        self._output_dir_edit.setPlaceholderText(str(Path.home() / "Desktop"))
+        self._output_dir_edit.setAccessibleName("Default save folder")
         dir_row.addWidget(self._output_dir_edit, 1)
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse_output_dir)
         dir_row.addWidget(browse_btn)
-        form.addRow("Default output folder:", dir_row)
+        root.addLayout(dir_row)
+        root.addWidget(self._note(
+            "New audio files are saved here unless you pick another folder "
+            "in the Export section."
+        ))
 
-        root.addLayout(form)
+        # ── Voice ──────────────────────────────────────────────────── #
+        root.addWidget(self._section_title("Voice"))
+        root.addWidget(self._note(
+            "Your voice and speed are remembered automatically between sessions."
+        ))
 
-        # ── Audio Defaults ─────────────────────────────────────────── #
-        root.addWidget(self._section_title("Audio Defaults"))
-
-        audio_note = QLabel(
-            "Voice and speed defaults are remembered automatically "
-            "from your last session."
-        )
-        audio_note.setWordWrap(True)
-        audio_note.setObjectName("metaLabel")
-        root.addWidget(audio_note)
-
-        self._auto_voice_checkbox = QCheckBox("Auto-switch to a recommended voice")
+        self._auto_voice_checkbox = QCheckBox("Switch to a matching voice automatically")
         root.addWidget(self._auto_voice_checkbox)
-
-        auto_voice_note = QLabel(
-            "When the selected voice looks incompatible with the text "
-            "(for example an English voice for Hindi script), switch to the "
-            "recommended voice automatically instead of asking."
-        )
-        auto_voice_note.setWordWrap(True)
-        auto_voice_note.setObjectName("metaLabel")
-        root.addWidget(auto_voice_note)
-
-        # ── Data ───────────────────────────────────────────────────── #
-        root.addWidget(self._section_title("Data"))
-
-        data_form = QFormLayout()
-        data_form.setSpacing(12)
-        data_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-
-        self._data_dir_label = _PathLabel()
-        data_form.addRow("App data folder:", self._data_dir_label)
-
-        self._log_dir_label = _PathLabel()
-        data_form.addRow("Log folder:", self._log_dir_label)
-
-        root.addLayout(data_form)
+        root.addWidget(self._note(
+            "If the selected voice doesn't suit the text's language (for "
+            "example an English voice for Hindi text), use the recommended "
+            "voice instead of asking first."
+        ))
 
         # ── Logs ───────────────────────────────────────────────────── #
-        root.addWidget(self._section_title("Logs"))
+        root.addWidget(self._section_title("Logs & Troubleshooting"))
+        root.addWidget(self._note(
+            "If something goes wrong, the log file helps explain why. You can "
+            "attach it when reporting a problem."
+        ))
 
-        log_note = QLabel("Use these shortcuts for troubleshooting.")
-        log_note.setObjectName("metaLabel")
-        root.addWidget(log_note)
+        self._log_file_label = _PathLabel()
+        root.addWidget(self._log_file_label)
 
         log_btn_row = QHBoxLayout()
         log_btn_row.setSpacing(8)
@@ -151,16 +130,37 @@ class SettingsDialog(QDialog):
         open_folder_btn.clicked.connect(self._open_logs_folder)
         log_btn_row.addWidget(open_folder_btn)
 
-        open_file_btn = QPushButton("Open Log File")
+        open_file_btn = QPushButton("Open Current Log")
         open_file_btn.clicked.connect(self._open_log_file)
         log_btn_row.addWidget(open_file_btn)
 
-        copy_path_btn = QPushButton("Copy Log Path")
-        copy_path_btn.clicked.connect(self._copy_log_path)
-        log_btn_row.addWidget(copy_path_btn)
+        self._copy_path_btn = QPushButton("Copy Log Path")
+        self._copy_path_btn.clicked.connect(self._copy_log_path)
+        log_btn_row.addWidget(self._copy_path_btn)
 
         log_btn_row.addStretch()
         root.addLayout(log_btn_row)
+
+        # ── About ──────────────────────────────────────────────────── #
+        root.addWidget(self._section_title("About"))
+
+        version_lbl = QLabel(f"{APP_NAME} {APP_VERSION}")
+        version_lbl.setObjectName("dialogVersion")
+        version_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        root.addWidget(version_lbl)
+        root.addWidget(self._note(
+            "Speech is generated by Microsoft's online neural voices, so an "
+            "internet connection is required."
+        ))
+
+        data_row = QHBoxLayout()
+        data_row.setSpacing(8)
+        data_caption = QLabel("App data:")
+        data_caption.setObjectName("metaLabel")
+        data_row.addWidget(data_caption)
+        self._data_dir_label = _PathLabel()
+        data_row.addWidget(self._data_dir_label, 1)
+        root.addLayout(data_row)
         root.addStretch()
 
         scroll.setWidget(content)
@@ -187,7 +187,7 @@ class SettingsDialog(QDialog):
             self._settings.auto_switch_recommended_voice
         )
         self._data_dir_label.set_path(str(self._paths.data_dir))
-        self._log_dir_label.set_path(str(self._paths.log_dir))
+        self._log_file_label.set_path(str(self._log_file_path()))
 
     def _browse_output_dir(self) -> None:
         current = self._output_dir_edit.text() or str(Path.home() / "Desktop")
@@ -206,7 +206,7 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------ #
 
     def _log_file_path(self) -> Path:
-        return self._paths.log_dir / "voicecraft.log"
+        return log_file_path(self._paths.log_dir)
 
     def _open_logs_folder(self) -> None:
         log_dir = self._paths.log_dir
@@ -216,7 +216,7 @@ class SettingsDialog(QDialog):
                 f"The logs folder does not exist yet:\n\n{log_dir}"
             )
             return
-        self._reveal_in_explorer(log_dir, is_dir=True)
+        open_in_file_manager(log_dir)
 
     def _open_log_file(self) -> None:
         log_file = self._log_file_path()
@@ -227,48 +227,18 @@ class SettingsDialog(QDialog):
                 f"Expected location:\n{log_file}"
             )
             return
-        self._reveal_in_explorer(log_file, is_dir=False)
+        # Open it in the default text viewer; fall back to showing it in its
+        # folder if no app is associated with .log files.
+        if not open_in_file_manager(log_file):
+            open_in_file_manager(log_file, reveal=True)
 
     def _copy_log_path(self) -> None:
         log_file = self._log_file_path()
         QApplication.clipboard().setText(str(log_file))
         # Briefly rename button text as a visual confirmation
-        btn = self.sender()
-        if btn:
-            btn.setText("Copied!")
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(1500, lambda: btn.setText("Copy Log Path"))
-
-    @staticmethod
-    def _reveal_in_explorer(path: Path, is_dir: bool) -> None:
-        """
-        Open *path* in the platform file manager.
-
-        - macOS  : ``open -R <file>`` reveals the file in Finder;
-                   ``open <dir>``  opens the folder directly.
-        - Windows: ``explorer /select,<file>`` selects the file;
-                   ``explorer <dir>``          opens the folder.
-        - Linux  : ``xdg-open <dir>`` opens the parent folder.
-        """
-        try:
-            if sys.platform == "darwin":
-                if is_dir:
-                    subprocess.run(["open", str(path)], check=False)
-                else:
-                    subprocess.run(["open", "-R", str(path)], check=False)
-            elif sys.platform == "win32":
-                if is_dir:
-                    os.startfile(str(path))          # type: ignore[attr-defined]
-                else:
-                    subprocess.run(
-                        ["explorer", f"/select,{path}"], check=False
-                    )
-            else:
-                # Linux / other — open the parent folder
-                target = path if is_dir else path.parent
-                subprocess.run(["xdg-open", str(target)], check=False)
-        except Exception as exc:
-            logger.warning("Could not open path in file manager: %s", exc)
+        btn = self._copy_path_btn
+        btn.setText("Copied ✓")
+        QTimer.singleShot(1500, lambda: btn.setText("Copy Log Path"))
 
     # ------------------------------------------------------------------ #
 
@@ -276,6 +246,13 @@ class SettingsDialog(QDialog):
     def _section_title(text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setObjectName("dialogSectionTitle")
+        return lbl
+
+    @staticmethod
+    def _note(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setObjectName("metaLabel")
         return lbl
 
 

@@ -84,19 +84,19 @@ QLabel {
 QLabel#sectionLabel {
     font-size: 10px;
     font-weight: 700;
-    color: #5A5A60;
+    color: #8E8E93;
     letter-spacing: 1.2px;
     background: transparent;
 }
 
 QLabel#metaLabel {
-    color: #5A5A60;
+    color: #8E8E93;
     font-size: 12px;
     background: transparent;
 }
 
 QLabel#hintLabel {
-    color: #3A3A40;
+    color: #8E8E93;
     font-size: 13px;
     background: transparent;
 }
@@ -140,7 +140,7 @@ QLabel#outputPathLabel {
 }
 
 QLabel#wordCountLabel {
-    color: #5A5A60;
+    color: #8E8E93;
     font-size: 11px;
     background: transparent;
 }
@@ -249,7 +249,7 @@ QPushButton#previewButton:disabled {
 /* ── Generate button — THE primary CTA ───────────────────── */
 QPushButton#generateButton {
     background-color: #1DB954;
-    color: #FFFFFF;
+    color: #06140B;
     border: none;
     border-radius: 12px;
     padding: 10px 16px;
@@ -269,8 +269,8 @@ QPushButton#generateButton:pressed {
 }
 
 QPushButton#generateButton:disabled {
-    background-color: #0E2918;
-    color: #2A5A3A;
+    background-color: #12301D;
+    color: #4E7A5C;
 }
 
 /* ── Text Editor ──────────────────────────────────────────── */
@@ -351,13 +351,16 @@ QComboBox::drop-down {
 }
 
 QComboBox::down-arrow {
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid #5A5A60;
-    width: 0;
-    height: 0;
+    /* A CSS border triangle is not something Qt can draw — it rendered as a
+       flat grey bar.  @ASSETS@ is resolved at load time (app/ui/style.py). */
+    image: url(@ASSETS@/icons/chevron-down.svg);
+    width: 12px;
+    height: 12px;
     margin-right: 8px;
+}
+
+QComboBox::down-arrow:disabled {
+    image: url(@ASSETS@/icons/chevron-down-disabled.svg);
 }
 
 QComboBox QAbstractItemView {
@@ -765,7 +768,7 @@ QFrame#toolbarSep {
 }
 
 QLabel#dropHint {
-    color: #3A3A40;
+    color: #7A7A80;
     font-size: 11px;
     background: transparent;
 }
@@ -789,7 +792,7 @@ QTableWidget#historyTable::item {
 QPushButton#quietGhostButton {
     background: transparent;
     border: none;
-    color: #5A5A60;
+    color: #9A9A9F;
     padding: 4px 8px;
     font-size: 12px;
     font-weight: 500;
@@ -933,4 +936,143 @@ QWidget#sidePanel[compact="true"] QPushButton#generateButton {
     padding: 6px 16px;
     font-size: 14px;
     border-radius: 10px;
+}
+
+
+/* ── Keyboard focus ───────────────────────────────────────────
+   "* { outline: none }" above removes Qt's native focus rectangle, which left
+   keyboard users with no idea where Tab had taken them.  Every focusable
+   control gets a visible ring instead (mouse clicks on buttons don't take
+   focus on macOS, so this does not flash on normal use).            */
+QPushButton:focus {
+    border: 1px solid #0A84FF;
+}
+
+QPushButton#ghostButton:focus,
+QPushButton#quietGhostButton:focus,
+QPushButton#dangerGhostButton:focus,
+QPushButton#jobCancelButton:focus {
+    border: 1px solid #0A84FF;
+    border-radius: 5px;
+}
+
+QPushButton#generateButton:focus {
+    border: 2px solid #F2F2F4;
+}
+
+QCheckBox:focus {
+    color: #FFFFFF;
+    text-decoration: underline;
+}
+
+/* Ring on the handle only — a rule on "QSlider:focus" boxes the whole
+   widget in white. */
+QSlider::handle:horizontal:focus {
+    border: 2px solid #F2F2F4;
+}
+
+QTableWidget#historyTable:focus {
+    border: 1px solid #2C4F75;
+}
+
+/* ── Speed ──────────────────────────────────────────────────── */
+QLabel#rateValue {
+    font-size: 12px;
+    font-weight: 700;
+    color: #1DB954;
+    background: transparent;
+}
+
+/* ── Active job rows ───────────────────────────────────────── */
+QLabel#jobName {
+    font-size: 12px;
+    font-weight: 600;
+    color: #F2F2F4;
+    background: transparent;
+}
+
+QLabel#jobMeta {
+    font-size: 11px;
+    color: #8E8E93;
+    background: transparent;
+}
+
+QLabel#jobPercent {
+    font-size: 12px;
+    font-weight: 700;
+    color: #1DB954;
+    background: transparent;
+    min-width: 34px;
+}
+
+QLabel#jobStage {
+    font-size: 11px;
+    color: #A0A0A6;
+    background: transparent;
+}
+
+QLabel#jobMetrics {
+    font-size: 11px;
+    color: #8E8E93;
+    background: transparent;
+}
+
+QLabel#jobDotQueued {
+    font-size: 9px;
+    color: #8E8E93;
+    background: transparent;
+}
+
+QLabel#jobDotRunning {
+    font-size: 9px;
+    color: #1DB954;
+    background: transparent;
+}
+
+QProgressBar#jobProgress {
+    min-height: 6px;
+    max-height: 6px;
+    border-radius: 3px;
+}
+
+QProgressBar#jobProgress::chunk {
+    border-radius: 3px;
+}
+
+QPushButton#jobCancelButton {
+    background: transparent;
+    border: 1px solid #3A3A3F;
+    border-radius: 5px;
+    color: #A0A0A6;
+    font-size: 11px;
+    padding: 1px 8px;
+    min-height: 20px;
+}
+
+QPushButton#jobCancelButton:hover {
+    color: #FF453A;
+    border-color: #FF453A;
+}
+
+QPushButton#jobCancelButton:disabled {
+    color: #5A5A60;
+    border-color: #2C2C30;
+}
+
+/* ── Settings dialog ───────────────────────────────────────── */
+QLabel#dialogSectionTitle {
+    margin-top: 14px;
+}
+
+QLabel#dialogFieldLabel {
+    color: #C8C8CC;
+    font-size: 12px;
+    background: transparent;
+}
+
+QLabel#dialogVersion {
+    font-size: 14px;
+    font-weight: 600;
+    color: #F2F2F4;
+    background: transparent;
 }
