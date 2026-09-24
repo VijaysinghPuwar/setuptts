@@ -914,8 +914,23 @@ def test_settings_content_fits_the_dialog_under_wider_fonts(qapp, app_paths, qtb
         qapp.processEvents()
         scroll = dialog.findChild(QScrollArea)
         content = scroll.widget()
+        widest = []
+
+        def walk(layout):
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                w, sub = item.widget(), item.layout()
+                if w is not None:
+                    widest.append((item.minimumSize().width(), type(w).__name__,
+                                   getattr(w, "text", lambda: "")()[:40]))
+                if sub is not None:
+                    widest.append((sub.minimumSize().width(), "layout", ""))
+                    walk(sub)
+
+        walk(content.layout())
         assert content.minimumSizeHint().width() <= scroll.viewport().width(), (
-            content.minimumSizeHint().width(), scroll.viewport().width()
+            content.minimumSizeHint().width(), scroll.viewport().width(),
+            sorted(widest, reverse=True)[:6],
         )
     finally:
         qapp.setStyleSheet("")

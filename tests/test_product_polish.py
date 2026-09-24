@@ -423,15 +423,30 @@ def test_job_row_shows_plain_language_stage(qtbot):
 # ------------------------------------------------------------------ #
 
 def test_second_instance_is_refused_and_activates_the_first(qapp, tmp_path, qtbot):
+    """A second launch — a separate process, as in real use — hands over."""
+    import subprocess
+
     from app.utils.single_instance import SingleInstance
 
     first = SingleInstance(tmp_path)
     assert first.acquire()
+    script = (
+        "import sys; sys.path.insert(0, sys.argv[2])\n"
+        "from pathlib import Path\n"
+        "from PySide6.QtCore import QCoreApplication\n"
+        "app = QCoreApplication([])\n"
+        "from app.utils.single_instance import SingleInstance\n"
+        "s = SingleInstance(Path(sys.argv[1]))\n"
+        "sys.exit(3 if s.acquire() else (0 if s.notify_running_instance() else 4))\n"
+    )
+    root = str(Path(__file__).resolve().parents[1])
     try:
-        second = SingleInstance(tmp_path)
-        assert not second.acquire()
-        with qtbot.waitSignal(first.activation_requested, timeout=3000):
-            assert second.notify_running_instance()
+        with qtbot.waitSignal(first.activation_requested, timeout=10_000):
+            proc = subprocess.Popen([sys.executable, "-c", script, str(tmp_path), root])
+            # The first copy must keep processing events while the second one
+            # talks to it, exactly like the running app.
+            qtbot.waitUntil(lambda: proc.poll() is not None, timeout=10_000)
+        assert proc.returncode == 0, proc.returncode
     finally:
         first.release()
     third = SingleInstance(tmp_path)

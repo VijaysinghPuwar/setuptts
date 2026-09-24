@@ -66,7 +66,11 @@ class SingleInstance(QObject):
         socket.write(_ACTIVATE)
         socket.flush()
         socket.waitForBytesWritten(1000)
-        socket.disconnectFromServer()
+        # Let the running copy read the message and hang up first.  On
+        # Windows a named-pipe client that disconnects straight after writing
+        # can lose the data before the server has read it.
+        socket.waitForDisconnected(2000)
+        socket.abort()
         return True
 
     def release(self) -> None:
@@ -100,5 +104,5 @@ class SingleInstance(QObject):
         data = bytes(conn.readAll().data())
         if data.startswith(_ACTIVATE):
             conn.setProperty("setuptts_handled", True)
+            conn.disconnectFromServer()   # acknowledges: the client waits for this
             self.activation_requested.emit()
-            conn.abort()
