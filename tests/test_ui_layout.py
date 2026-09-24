@@ -892,3 +892,30 @@ def test_the_window_minimum_grows_with_the_font(scaled_window, qapp):
     assert window.width() >= window.minimumWidth()
     assert window.height() >= window.minimumHeight()
     assert _clipping_problems(window) == []
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.3])
+def test_settings_content_fits_the_dialog_under_wider_fonts(qapp, app_paths, qtbot, scale):
+    """
+    Nothing in Settings may demand more width than a 520 px dialog offers.
+
+    Under Windows' Segoe UI the three log buttons in one row needed ~565 px,
+    so the content overflowed and clipped on the right (seen only on the
+    Windows CI runner).  1.3x inflation stands in for the wider font here.
+    """
+    from app.ui.dialogs.settings_dialog import SettingsDialog
+
+    qapp.setStyleSheet(_scaled_stylesheet(scale))
+    try:
+        dialog = SettingsDialog(AppSettings(app_paths), app_paths)
+        qtbot.addWidget(dialog)
+        dialog.resize(520, 620)
+        dialog.show()
+        qapp.processEvents()
+        scroll = dialog.findChild(QScrollArea)
+        content = scroll.widget()
+        assert content.minimumSizeHint().width() <= scroll.viewport().width(), (
+            content.minimumSizeHint().width(), scroll.viewport().width()
+        )
+    finally:
+        qapp.setStyleSheet("")

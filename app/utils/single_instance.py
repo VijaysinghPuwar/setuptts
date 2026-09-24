@@ -88,8 +88,17 @@ class SingleInstance(QObject):
             if conn is None:
                 break
             conn.readyRead.connect(lambda c=conn: self._on_ready(c))
+            # On Windows (named pipes) the message has usually arrived before
+            # this handler runs; readyRead has then already fired and will
+            # not fire again, so read what is buffered right away.
+            if conn.bytesAvailable() > 0:
+                self._on_ready(conn)
 
     def _on_ready(self, conn: QLocalSocket) -> None:
-        if bytes(conn.readAll().data()).startswith(_ACTIVATE):
+        if conn.property("setuptts_handled"):
+            return
+        data = bytes(conn.readAll().data())
+        if data.startswith(_ACTIVATE):
+            conn.setProperty("setuptts_handled", True)
             self.activation_requested.emit()
-        conn.abort()
+            conn.abort()

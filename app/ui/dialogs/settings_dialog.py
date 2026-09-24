@@ -123,6 +123,8 @@ class SettingsDialog(QDialog):
         self._log_file_label = _PathLabel()
         root.addWidget(self._log_file_label)
 
+        # Two rows, not three buttons abreast: under Windows' Segoe UI the
+        # single row needed ~565 px and clipped a 520 px dialog on the right.
         log_btn_row = QHBoxLayout()
         log_btn_row.setSpacing(8)
 
@@ -133,13 +135,15 @@ class SettingsDialog(QDialog):
         open_file_btn = QPushButton("Open Current Log")
         open_file_btn.clicked.connect(self._open_log_file)
         log_btn_row.addWidget(open_file_btn)
-
-        self._copy_path_btn = QPushButton("Copy Log Path")
-        self._copy_path_btn.clicked.connect(self._copy_log_path)
-        log_btn_row.addWidget(self._copy_path_btn)
-
         log_btn_row.addStretch()
         root.addLayout(log_btn_row)
+
+        copy_row = QHBoxLayout()
+        self._copy_path_btn = QPushButton("Copy Log Path")
+        self._copy_path_btn.clicked.connect(self._copy_log_path)
+        copy_row.addWidget(self._copy_path_btn)
+        copy_row.addStretch()
+        root.addLayout(copy_row)
 
         # ── About ──────────────────────────────────────────────────── #
         root.addWidget(self._section_title("About"))
@@ -275,6 +279,13 @@ class _PathLabel(QLabel):
         self.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.setMinimumWidth(120)
+
+    def sizeHint(self):  # type: ignore[override]
+        # Elided text should never ask for more width than it is given —
+        # the full path is what the tooltip is for.
+        hint = super().sizeHint()
+        hint.setWidth(self.minimumWidth())
+        return hint
 
     def set_path(self, path: str) -> None:
         self._full_path = path
