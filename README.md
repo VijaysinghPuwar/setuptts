@@ -14,7 +14,7 @@
   <a href="../../actions/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/VijaysinghPuwar/setuptts/build.yml?label=build"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-555">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12-3776AB">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-318%20passing-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-331%20passing-2ea44f">
 </p>
 
 <p align="center">
@@ -125,23 +125,25 @@ flowchart TD
 | A chunk file or the manifest is damaged | Resume trusts only the verified contiguous prefix and regenerates the rest |
 | Final audio far shorter than the text implies | The file is not saved under your name; an existing file is left untouched and the suspect audio is kept as `name (incomplete).mp3` |
 | Output file already exists | Asks: **Keep Both** (`name (2).mp3`) or **Replace** |
+| Antivirus HTTPS scanning or a company network re-signs secure traffic | Trusts the system certificate store as well as its built-in list, so voices and audio still load |
+| PC connects through a proxy set in system settings | Sends voice-list and audio requests through that proxy |
 | Second copy of the app launched | Brings the running window to the front instead of sharing its files |
 
 ---
 
 ## Codebase at a glance
 
-Counted with `wc -l` over tracked files at v1.6.0 (includes comments and docstrings).
+Counted with `wc -l` over tracked files at v1.6.1 (includes comments and docstrings).
 
 | Area | Files | Lines | Contents |
 |---|---:|---:|---|
 | `app/workers` | 6 | 4,734 | generation pipeline, chunk store, job queue, voice loading, preview |
 | `app/ui` | 10 | 3,942 | main window, panels, dialogs, stylesheet loader |
-| `app/services` | 4 | 1,333 | speech-service client, text profiling and voice matching, history DB |
-| `app/utils`, `app/models`, `app/config` | 12 | 1,062 | paths, logging, errors, MP3 parsing, settings, single-instance lock |
-| `app/main.py`, `app/selftest.py` | 3 | 277 | startup, packaged-build self-test |
-| **Application total** | **35** | **11,348** | Python |
-| `tests` | 11 | 3,736 | 318 tests (pytest, pytest-qt) |
+| `app/services` | 4 | 1,402 | speech-service client, text profiling and voice matching, history DB |
+| `app/utils`, `app/models`, `app/config` | 12 | 1,063 | paths, logging, errors, MP3 parsing, settings, single-instance lock |
+| `app/main.py`, `app/selftest.py` | 3 | 289 | startup, packaged-build self-test |
+| **Application total** | **35** | **11,430** | Python |
+| `tests` | 12 | 3,857 | 331 tests (pytest, pytest-qt) |
 | Stylesheet | 1 | 1,078 | Qt stylesheet (dark theme) |
 | Build and CI | 7 | 1,243 | PyInstaller specs, Inno Setup installer, GitHub Actions, build scripts |
 
@@ -177,6 +179,8 @@ Progress appears under **Active Jobs**: stage, percentage, section count, speed 
 
 - macOS: `~/Library/Logs/SetupTTS/setuptts.log`
 - Windows: `%LOCALAPPDATA%\SetupTTSApp\SetupTTS\Logs\setuptts.log`
+
+**Voice list says “Could not load voices” (Windows).** Update to v1.6.1 or later: older versions ignored the Windows certificate store and the Windows proxy setting, so antivirus HTTPS scanning or a proxy blocked every voice. If it still happens, check the PC's date and time, and look for `SSL` or `CERTIFICATE` in the log.
 
 The version is shown in the window title and in Settings ▸ About.
 

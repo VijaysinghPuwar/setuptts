@@ -79,7 +79,8 @@ def friendly_error_text(raw: str | BaseException) -> str:
         return (
             "SetupTTS could not open a secure connection to the Microsoft "
             "speech service. Check that your computer's date and time are "
-            "correct, then try again."
+            "correct. If your antivirus scans secure web traffic (HTTPS "
+            "scanning), allow SetupTTS or turn that option off, then try again."
         )
     if "getaddrinfo" in low or "name or service not known" in low \
             or "nodename nor servname" in low or "could not resolve" in low \
