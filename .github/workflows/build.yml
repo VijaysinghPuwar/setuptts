@@ -1,7 +1,7 @@
 name: Build Release
 
 # Triggers:
-#   - Push of a version tag:  git tag v1.6.0 && git push origin v1.6.0
+#   - Push of a version tag:  git tag v1.6.1 && git push origin v1.6.1
 #     The tag must match APP_VERSION in app/__init__.py, and
 #     release_notes/v<version>.md must exist — both are checked below.
 #   - Manual run from GitHub Actions UI (workflow_dispatch) — builds and tests

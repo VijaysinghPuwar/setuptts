@@ -73,8 +73,20 @@ def run(argv: list[str]) -> int:
     def tls():
         import ssl
         import certifi
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        return f"{len(ctx.get_ca_certs()) or 'n/a'} CA certs via certifi"
+        import edge_tts.communicate
+        import edge_tts.voices
+        from app.services import tts_service
+        bundled = len(ssl.create_default_context(cafile=certifi.where()).get_ca_certs())
+        # The app's context must be the one edge_tts uses, or the system
+        # store is ignored again and antivirus/proxy setups lose every voice.
+        ours = edge_tts.voices._SSL_CTX
+        if ours is not edge_tts.communicate._SSL_CTX:
+            raise RuntimeError("edge_tts voices and synthesis use different TLS contexts")
+        total = len(ours.get_ca_certs())
+        if total < bundled:
+            raise RuntimeError(f"edge_tts trusts {total} CAs, fewer than certifi's {bundled}")
+        return (f"{bundled} CA certs via certifi, {total} with the system store; "
+                f"proxy {tts_service.system_proxy() or 'none'}")
 
     def imports():
         import aiohttp  # noqa: F401
