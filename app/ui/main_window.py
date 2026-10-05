@@ -531,7 +531,11 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self) -> None:
         from app.ui.dialogs.settings_dialog import SettingsDialog
-        SettingsDialog(self._settings, self._paths, self).exec()
+        if SettingsDialog(self._settings, self._paths, self).exec():
+            # The sidebar only read the save folder at startup, so a folder
+            # chosen in Settings was ignored and then overwritten by the
+            # sidebar's value on the next Generate.
+            self._output_panel.apply_default_folder()
 
     def _open_about(self) -> None:
         from app.ui.dialogs.about_dialog import AboutDialog

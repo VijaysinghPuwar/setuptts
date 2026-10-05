@@ -15,6 +15,8 @@ Usage
     queue.cancel_all()     # shutdown — call before app exit
 """
 
+import sys
+import os
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -233,34 +235,18 @@ class JobQueue(QObject):
         paths with different representations (e.g. trailing slash, symlinks)
         are treated as the same destination.
         """
-        try:
-            norm = str(Path(output_path).resolve())
-        except Exception:
-            norm = output_path
+        norm = _path_key(output_path)
         for item, _ in self._running.values():
-            try:
-                if str(Path(item.output_path).resolve()) == norm:
-                    return True
-            except Exception:
-                if item.output_path == output_path:
-                    return True
+            if _path_key(item.output_path) == norm:
+                return True
         for item in self._pending:
-            try:
-                if str(Path(item.output_path).resolve()) == norm:
-                    return True
-            except Exception:
-                if item.output_path == output_path:
-                    return True
+            if _path_key(item.output_path) == norm:
+                return True
         # A cancelled worker can still be finishing its final save to this
         # path; a new job on the same file must wait for it.
         for worker in self._finishing:
-            if not worker.isRunning():
-                continue
-            try:
-                if str(Path(worker._output_path).resolve()) == norm:
-                    return True
-            except Exception:
-                pass
+            if worker.isRunning() and _path_key(worker._output_path) == norm:
+                return True
         return False
 
     @property
@@ -430,3 +416,18 @@ class JobQueue(QObject):
         logger.error("Job failed: id=%s error=%s", job_id, error)
         self.job_failed.emit(item)
         self._try_start()
+
+
+def _path_key(path: str) -> str:
+    """Comparable form of a path.
+
+    resolve() fixes the case of folders that exist but not of a file that does
+    not exist yet, so "Book.mp3" and "book.mp3" — the same file on Windows and
+    on the default macOS file system — were both accepted as separate jobs.
+    """
+    try:
+        resolved = str(Path(path).resolve())
+    except Exception:  # noqa: BLE001
+        resolved = os.path.abspath(path)
+    key = os.path.normcase(resolved)
+    return key.lower() if sys.platform == "darwin" else key

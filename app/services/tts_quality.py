@@ -7,7 +7,13 @@ import re
 import unicodedata
 from typing import Any
 
-_ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
+# Invisible formatting noise.  ZWNJ/ZWJ (U+200C/D) are deliberately kept:
+# they change how Persian and Indic words are shaped and pronounced.  The
+# soft hyphen (U+00AD, common in EPUB and web text) is removed so that
+# "inter\u00adnational" reads as one word instead of "inter national".
+_ZERO_WIDTH_RE = re.compile(r"[\u00ad\u200b\u200e\u200f\u202a-\u202e\u2060\ufeff]")
+# Symbols ("So") that carry meaning and that the voices read aloud.
+_SPOKEN_SYMBOLS = frozenset("°©®™℃℉№℗")
 _ELLIPSIS_RE = re.compile(r"(?:\.{4,}|…+)")
 _REPEATED_PUNCT_RE = re.compile(r"([!?])\1{2,}")
 _MARKDOWN_BULLET_RE = re.compile(r"(?m)^[ \t]*[-*]\s+")
@@ -15,7 +21,7 @@ _UNICODE_BULLET_RE = re.compile(r"[•▪■●◦◆◇▶►▸▹➜➤➝]+"
 _NOISY_DECORATION_RE = re.compile(r"[※★☆✦✧✩✪✫✬✭✮✯❖❥♡♥♦♣♠]+")
 _EXTRA_DASH_RE = re.compile(r"[‐‑‒–—―]{2,}")
 _MULTISPACE_RE = re.compile(r"[ \t\f\v]+")
-_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,.;:!?])")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,.;:!?])(?!\w)")
 _SPACE_AFTER_OPEN_RE = re.compile(r"([(\[{])\s+")
 _SPACE_BEFORE_CLOSE_RE = re.compile(r"\s+([)\]}])")
 _TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
@@ -450,7 +456,7 @@ def normalize_text_for_tts(text: str) -> str:
 
     cleaned_chars: list[str] = []
     for char in text:
-        if char in {"\n", "\t"}:
+        if char in {"\n", "\t", "‌", "‍"}:   # ZWNJ/ZWJ: see _ZERO_WIDTH_RE
             cleaned_chars.append(char)
             continue
 
@@ -458,7 +464,7 @@ def normalize_text_for_tts(text: str) -> str:
         if category.startswith("C"):
             cleaned_chars.append(" ")
             continue
-        if category == "So":
+        if category == "So" and char not in _SPOKEN_SYMBOLS:
             cleaned_chars.append(" ")
             continue
         cleaned_chars.append(char)
@@ -560,6 +566,27 @@ def _normalize_bracketed_fragments(line: str) -> str:
         return ". ".join(cleaned_fragments)
 
     return _BRACKETED_SEGMENT_RE.sub(lambda match: _clean_fragment(match.group(1)), line)
+
+
+#: Above this length the UI's voice hint profiles a sample, not the whole text.
+_GUIDANCE_SAMPLE_CHARS = 120_000
+
+
+def build_guidance_profile(text: str) -> TextProfile:
+    """
+    Language/script guess for the live voice hint in the UI.
+
+    Profiling a whole book on the UI thread after every typing pause froze
+    the window for ~2 s per MB of text.  Language and script are just as
+    clear from a sample of the start, middle and end; the job itself still
+    profiles the full text on its worker thread.
+    """
+    if len(text) <= _GUIDANCE_SAMPLE_CHARS:
+        return build_text_profile(text)
+    part = _GUIDANCE_SAMPLE_CHARS // 3
+    middle = len(text) // 2
+    sample = "\n\n".join((text[:part], text[middle - part // 2: middle + part // 2], text[-part:]))
+    return build_text_profile(sample)
 
 
 def build_text_profile(text: str) -> TextProfile:

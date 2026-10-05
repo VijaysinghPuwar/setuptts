@@ -124,12 +124,30 @@ class HistoryService:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._create_or_migrate()
-        except sqlite3.DatabaseError:
+        except sqlite3.DatabaseError as exc:
+            if _is_busy(exc):
+                # Another process (e.g. an older SetupTTS still running) holds
+                # the write lock.  That is not corruption: setting the file
+                # aside here failed on Windows (file in use) and crashed
+                # startup, and on macOS it threw the user's history away.
+                logger.warning("History database is busy (%s) — opening read-only "
+                               "for this session", exc)
+                self._read_only = True
+                return
             # "file is not a database", "database disk image is malformed", …
             logger.warning("History database is unreadable — starting a new one",
                            exc_info=True)
-            self._set_aside_corrupt_db()
-            self._create_or_migrate()
+            if not self._set_aside_corrupt_db():
+                logger.error("Could not move the unreadable history database aside "
+                             "— history is disabled for this session")
+                self._read_only = True
+                return
+            try:
+                self._create_or_migrate()
+            except sqlite3.DatabaseError:
+                logger.exception("Could not create a new history database — "
+                                 "history is disabled for this session")
+                self._read_only = True
 
     def _create_or_migrate(self) -> None:
         with self._connect() as conn:
@@ -144,6 +162,12 @@ class HistoryService:
                 self._read_only = True
                 conn.execute("SELECT 1 FROM jobs LIMIT 1").fetchall()
                 return
+            if version == SCHEMA_VERSION:
+                # Up to date: stay read-only at startup.  Re-running the DDL
+                # and re-writing user_version needed the write lock on every
+                # launch, which failed whenever another copy had it.
+                conn.execute("SELECT 1 FROM jobs LIMIT 1").fetchall()
+                return
             conn.executescript(_DDL)
             columns = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
             for target in range(max(version, 1) + 1, SCHEMA_VERSION + 1):
@@ -156,14 +180,21 @@ class HistoryService:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("SELECT 1 FROM jobs LIMIT 1").fetchall()
 
-    def _set_aside_corrupt_db(self) -> None:
+    def _set_aside_corrupt_db(self) -> bool:
+        """Move the database files aside; return False if any could not be moved."""
+        ok = True
         for suffix in ("", "-wal", "-shm"):
             src = self._db_path.with_name(self._db_path.name + suffix)
             if src.exists():
                 try:
                     src.replace(src.with_name(src.name + ".corrupt"))
                 except OSError:
-                    src.unlink(missing_ok=True)
+                    try:
+                        src.unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("Could not remove %s", src, exc_info=True)
+                        ok = False
+        return ok
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -195,3 +226,8 @@ class HistoryService:
             error_message=row["error_message"],
             audio_seconds=row["audio_secs"] if "audio_secs" in keys else None,
         )
+
+
+def _is_busy(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and ("locked" in text or "busy" in text)

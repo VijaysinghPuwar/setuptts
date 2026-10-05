@@ -91,7 +91,7 @@ from app.services.history_service import HistoryService
 from app.services.tts_quality import (
     VoiceCompatibilityAssessment,
     assess_voice_compatibility,
-    build_text_profile,
+    build_guidance_profile,
 )
 from app.utils.errors import split_error
 from app.utils.output_paths import (
@@ -145,6 +145,7 @@ class OutputPanel(QWidget):
         self._preview_worker: PreviewWorker | None = None
         self._current_text = ""
         self._compatibility: VoiceCompatibilityAssessment | None = None
+        self._guidance_cache: tuple[tuple[int, int], object] | None = None
         self._visible_recommended_voice: str | None = None
         self._resume_candidates: list[ResumeCandidate] = []
         # Keep old voice-loader workers alive until their thread exits.
@@ -751,7 +752,7 @@ class OutputPanel(QWidget):
         # valueChanged does not fire when the saved rate equals the slider's
         # initial value, so sync the label and Reset button explicitly.
         self._on_rate_changed(self._rate_slider.value())
-        folder =self._settings.output_dir or str(Path.home() / "Desktop")
+        folder = self._settings.output_dir or str(Path.home() / "Desktop")
         self._set_folder_text(folder)
         idx = self._gender_combo.findText(self._settings.gender_filter)
         if idx >= 0:
@@ -956,7 +957,13 @@ class OutputPanel(QWidget):
             self._hide_voice_guidance()
             return
 
-        profile = build_text_profile(self._current_text)
+        text = self._current_text
+        cache_key = (len(text), hash(text))
+        if self._guidance_cache is not None and self._guidance_cache[0] == cache_key:
+            profile = self._guidance_cache[1]
+        else:
+            profile = build_guidance_profile(text)
+            self._guidance_cache = (cache_key, profile)
         assessment = assess_voice_compatibility(profile, selected_voice, self._all_voices)
         self._compatibility = assessment
 
@@ -994,8 +1001,9 @@ class OutputPanel(QWidget):
         profile,
         selected_voice: str,
     ) -> tuple[str, str | None] | None:
-        cleaned = profile.cleaned_text.strip()
-        if len(cleaned) < 45_000 or "multilingual" not in selected_voice.lower():
+        # The guidance profile may be a sample of a long text, so measure the
+        # editor text itself.
+        if len(self._current_text.strip()) < 45_000 or "multilingual" not in selected_voice.lower():
             return None
         if profile.language_code not in {None, "en"}:
             return None
@@ -1066,6 +1074,12 @@ class OutputPanel(QWidget):
     # ------------------------------------------------------------------ #
     # Folder browse                                                        #
     # ------------------------------------------------------------------ #
+
+    def apply_default_folder(self) -> None:
+        """Show the default save folder from Settings in the sidebar."""
+        folder = self._settings.output_dir or str(Path.home() / "Desktop")
+        self._set_folder_text(folder)
+        logger.info("Default save folder changed in Settings: %s", folder)
 
     def _set_folder_text(self, folder: str) -> None:
         """Show a folder path from its start, with the full path as a tooltip."""

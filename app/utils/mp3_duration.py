@@ -49,6 +49,12 @@ def mp3_duration_seconds(path: Path) -> float | None:
             state = _ScanState()
             buffer = fh.read(_READ_BLOCK)
             pos = _skip_id3v2(buffer, 0)
+            if pos > len(buffer):
+                # The tag (e.g. embedded cover art) is larger than the first
+                # block: jump past it, or scanning restarts inside the image.
+                fh.seek(pos)
+                buffer = fh.read(_READ_BLOCK)
+                pos = 0
             while True:
                 more = fh.read(_READ_BLOCK)
                 pos = _scan_frames(buffer, pos, state, final=not more)

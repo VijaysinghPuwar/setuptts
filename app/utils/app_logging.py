@@ -1,7 +1,11 @@
 """Structured file logging with rotation. Raw tracebacks stay in log files only."""
 
+import faulthandler
 import logging
+import os
 import sys
+import threading
+import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -71,3 +75,80 @@ def setup_logging(log_dir: Path, level: int = logging.DEBUG) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
     logging.getLogger("aiosignal").setLevel(logging.WARNING)
+
+
+#: Native crash dumps (segfaults in Qt/C extensions) go here; Python logging
+#: cannot record a crash that kills the interpreter.
+CRASH_FILENAME = "crash.log"
+
+_crash_file = None   # kept open for the life of the process (faulthandler needs it)
+
+
+def install_crash_logging(log_dir: Path) -> str:
+    """
+    Route every kind of failure into the log, and return this run's session id.
+
+    A windowed build has no console, so without this an exception raised in a
+    Qt slot or a worker thread is printed to a stderr that does not exist and
+    the user's report arrives with nothing in the log to explain it.
+    """
+    global _crash_file
+    session = uuid.uuid4().hex[:8]
+    log = logging.getLogger("app.crash")
+
+    def _excepthook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        log.critical("Uncaught exception (session %s)", session,
+                     exc_info=(exc_type, exc, tb))
+
+    def _thread_excepthook(args):
+        if args.exc_type is SystemExit:
+            return
+        name = args.thread.name if args.thread else "?"
+        log.critical("Uncaught exception in thread %s (session %s)", name, session,
+                     exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+
+    try:
+        _crash_file = open(log_dir / CRASH_FILENAME, "a", encoding="utf-8")
+        _crash_file.write(f"\n=== session {session} pid {os.getpid()} ===\n")
+        _crash_file.flush()
+        faulthandler.enable(_crash_file, all_threads=True)
+    except Exception:  # noqa: BLE001 — diagnostics must never stop startup
+        log.warning("Native crash logging unavailable", exc_info=True)
+
+    try:
+        from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+
+        qt_log = logging.getLogger("qt")
+        levels = {
+            QtMsgType.QtDebugMsg: logging.DEBUG,
+            QtMsgType.QtInfoMsg: logging.INFO,
+            QtMsgType.QtWarningMsg: logging.WARNING,
+            QtMsgType.QtCriticalMsg: logging.ERROR,
+            QtMsgType.QtFatalMsg: logging.CRITICAL,
+        }
+
+        def _qt_handler(mode, context, message):
+            where = f" ({context.file}:{context.line})" if context.file else ""
+            qt_log.log(levels.get(mode, logging.WARNING), "%s%s", message, where)
+
+        qInstallMessageHandler(_qt_handler)
+    except Exception:  # noqa: BLE001
+        log.debug("Qt message handler not installed", exc_info=True)
+
+    return session
+
+
+def log_environment(session: str) -> None:
+    """Write one block describing the build and machine at the top of a run."""
+    from app.utils.diagnostics import environment_info
+
+    log = logging.getLogger("app.env")
+    log.info("──── session %s ────", session)
+    for key, value in environment_info().items():
+        log.info("%s: %s", key, value)

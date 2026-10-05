@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 from app import APP_NAME, APP_VERSION, APP_ORG
 from app.config.settings import AppSettings
-from app.utils.app_logging import setup_logging
+from app.utils.app_logging import install_crash_logging, log_environment, setup_logging
 from app.utils.paths import AppPaths, resource_path
 
 logger = logging.getLogger(__name__)
@@ -102,7 +102,11 @@ def main() -> None:
         sys.exit(0)
 
     setup_logging(paths.log_dir)
+    session = install_crash_logging(paths.log_dir)
     logger.info("Starting %s %s", APP_NAME, APP_VERSION)
+    log_environment(session)
+    logger.info("Paths: data=%s logs=%s cache=%s", paths.data_dir, paths.log_dir,
+                paths.cache_dir)
 
     # Load settings
     settings = AppSettings(paths)
