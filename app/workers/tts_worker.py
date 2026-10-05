@@ -105,8 +105,19 @@ _PREFLIGHT_SAMPLE_CHARS = 220
 _PREFLIGHT_SAMPLE_PAYLOAD_BYTES = 360
 _PREFLIGHT_TIMEOUT_S = 45
 
-_CHUNK_TIMEOUT_MIN_S = 65
-_CHUNK_TIMEOUT_MAX_S = 180
+_CHUNK_TIMEOUT_MIN_S = 90
+_CHUNK_TIMEOUT_MAX_S = 600
+# The whole-chunk deadline must outlast a voice that streams *slower* than
+# real time.  Andrew and the Multilingual voices often stream at ~1.5x real
+# time and dip below 0.5x; the old 65 s floor (sized for fast voices such as
+# Christopher at ~8x) killed healthy streams mid-way and logged them as
+# "stalled after partial audio" — 22 of 29 such failures in one user's log hit
+# exactly 65 s.  Real stalls are caught by the idle timeout, not this one.
+_SOURCE_CHARS_PER_AUDIO_SECOND = 15.8     # measured, rate +0 %
+_SLOWEST_STREAM_REALTIME = 0.45            # worst observed streaming speed
+_RETRY_TIMEOUT_GROWTH = 1.5                # per retry after a mid-stream cut
+# 48 kbit/s CBR audio from the service = 6000 bytes per second of speech.
+_AUDIO_BYTES_PER_SECOND = 6000
 _EDGE_RECEIVE_TIMEOUT_MIN_S = 60
 _EDGE_RECEIVE_TIMEOUT_MAX_S = 180
 _FIRST_AUDIO_TIMEOUT_MIN_S = 18
@@ -128,7 +139,17 @@ _SLOW_CHUNK_MULTIPLIER = 1.5
 _HEALTHY_GROWTH_FACTOR = 1.18
 _EARLY_TIMEOUT_RECOVERY_ATTEMPTS = 2
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
+# Full-width CJK sentence/clause marks are not followed by a space, so they
+# must be split points on their own; requiring "\s+" sent every Chinese or
+# Japanese chunk to the hard splitter, cutting sentences (and words) apart.
+# A sentence end may be followed by closing quotes/brackets, which stay
+# with their sentence:  「…ね。」と  must not split between 。 and 」.
+_SENTENCE_BOUNDARY = (
+    r"(?<=[.!?])\s+|(?<=[.!?][\"'”’)\]])\s+"
+    r"|(?<=[。！？])(?![」』”’）】〕])\s*|(?<=[。！？][」』”’）】〕])\s*"
+)
+_CLAUSE_BOUNDARY = r"(?<=[，、；：])\s*|(?<=[,;:])\s+"
+_SENTENCE_SPLIT_RE = re.compile(_SENTENCE_BOUNDARY)
 
 
 @dataclass(frozen=True)
@@ -491,17 +512,31 @@ def _take_chunk_at(
 
     window = stripped[:max_chars]
     boundary_sets = (
-        _boundary_candidates(window, r"\n{2,}"),
-        _boundary_candidates(window, r"(?<=[.!?。！？])\s+"),
-        _boundary_candidates(window, r"\s+"),
+        _boundary_candidates(stripped, r"\n{2,}", limit=len(window)),
+        _boundary_candidates(stripped, _SENTENCE_BOUNDARY, limit=len(window)),
+        _boundary_candidates(stripped, _CLAUSE_BOUNDARY, limit=len(window)),
+        _boundary_candidates(stripped, r"\s+", limit=len(window)),
     )
 
-    for boundaries in boundary_sets:
-        for split_at, resume_at in boundaries:
-            candidate = stripped[:split_at].strip()
-            if candidate and _fits_chunk(candidate, max_chars, max_payload_bytes):
-                absolute_end = absolute_start + resume_at
-                return candidate, absolute_start, absolute_end, _edge_payload_size(candidate)
+    # A clause boundary (comma, colon…) is only worth using if it keeps the
+    # chunk reasonably full; otherwise "Well, <3,000 words>" became a 5-char
+    # request.  A short clause chunk is still better than a hard split.
+    clause_floor = max(1, int(min(max_chars, len(window)) * 0.4))
+    short_clause = None
+    for tier, boundaries in enumerate(boundary_sets):
+        found = _largest_fitting_boundary(stripped, boundaries, max_chars, max_payload_bytes)
+        if found is None:
+            continue
+        candidate, resume_at = found
+        if tier == 2 and len(candidate) < clause_floor:
+            short_clause = found
+            continue
+        absolute_end = absolute_start + resume_at
+        return candidate, absolute_start, absolute_end, _edge_payload_size(candidate)
+
+    if short_clause is not None:
+        candidate, resume_at = short_clause
+        return candidate, absolute_start, absolute_start + resume_at, _edge_payload_size(candidate)
 
     hard_split = _hard_split_text(stripped, max_chars, max_payload_bytes)
     chunk = hard_split[0]
@@ -557,11 +592,47 @@ def _subdivide_range_for_recovery(
     return sub_chunks
 
 
-def _boundary_candidates(text: str, pattern: str) -> list[tuple[int, int]]:
+def _largest_fitting_boundary(
+    text: str,
+    boundaries: list[tuple[int, int]],
+    max_chars: int,
+    max_payload_bytes: int,
+) -> tuple[str, int] | None:
+    """Return (chunk, resume_at) for the longest boundary prefix that fits.
+
+    ``boundaries`` is sorted longest-first.  A longer prefix never has a
+    smaller payload, so binary search finds the same answer the old
+    longest-first linear scan did, which re-escaped the whole prefix for
+    every candidate and took ~1 s per chunk on text without paragraphs.
+    """
+    lo, hi = 0, len(boundaries) - 1
+    best: tuple[str, int] | None = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        split_at, resume_at = boundaries[mid]
+        candidate = text[:split_at].strip()
+        if candidate and _fits_chunk(candidate, max_chars, max_payload_bytes):
+            best = (candidate, resume_at)
+            hi = mid - 1          # fits: try a longer prefix
+        else:
+            lo = mid + 1          # too big (or empty): try a shorter one
+    return best
+
+
+def _boundary_candidates(
+    text: str, pattern: str, *, limit: int | None = None
+) -> list[tuple[int, int]]:
+    """Boundaries that start within ``text[:limit]``.
+
+    The regex sees a little past ``limit`` so that look-aheads (a closing
+    quote after 。) judge the real next character, not the end of the window.
+    """
+    if limit is None:
+        limit = len(text)
     candidates = [
         (match.start(), match.end())
-        for match in re.finditer(pattern, text)
-        if match.start() > 0
+        for match in re.finditer(pattern, text[: limit + 8])
+        if 0 < match.start() <= limit
     ]
     candidates.sort(reverse=True)
     return candidates
@@ -811,10 +882,69 @@ class _ChunkOutcome:
     receive_duration: float | None = None
     write_duration: float | None = None
     failure_kinds: tuple[str, ...] = ()
+    audio_bytes: int = 0
     # Source sub-ranges that actually produced audio for this chunk. Used by
     # the assembler so the per-chunk manifest entry records exactly which
     # ranges contributed bytes — invaluable when chasing silent truncation.
     sub_ranges: list[tuple[int, int]] = field(default_factory=list)
+
+
+@dataclass
+class _JobStats:
+    """Per-job counters, logged as one "Job summary" line however the job ends.
+
+    A support log otherwise needs hundreds of per-chunk lines read by hand to
+    answer "was the connection flaky, or did one chunk keep failing?".
+    """
+
+    chunks_ok: int = 0
+    attempts: int = 0
+    retried_chunks: int = 0
+    recovery_splits: int = 0
+    chars_sent: int = 0
+    audio_bytes: int = 0
+    failures: dict[str, int] = field(default_factory=dict)
+    first_audio_s: list[float] = field(default_factory=list)
+    receive_s: list[float] = field(default_factory=list)
+    chunk_s: list[float] = field(default_factory=list)
+
+    def record_success(self, *, attempts: int, chars: int, audio_bytes: int,
+                       elapsed: float, first_audio: float | None,
+                       receive: float | None) -> None:
+        self.chunks_ok += 1
+        self.attempts += 1
+        self.retried_chunks += attempts > 1
+        self.chars_sent += chars
+        self.audio_bytes += audio_bytes
+        self.chunk_s.append(elapsed)
+        if first_audio is not None:
+            self.first_audio_s.append(first_audio)
+        if receive is not None:
+            self.receive_s.append(receive)
+
+    def record_failure(self, kind: str) -> None:
+        self.attempts += 1
+        self.failures[kind] = self.failures.get(kind, 0) + 1
+
+    @staticmethod
+    def _dist(values: list[float]) -> str:
+        if not values:
+            return "n/a"
+        ordered = sorted(values)
+        p95 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
+        return (f"avg={sum(ordered) / len(ordered):.1f}s p95={p95:.1f}s "
+                f"max={ordered[-1]:.1f}s")
+
+    def summary(self) -> str:
+        failures = ",".join(f"{k}={v}" for k, v in sorted(self.failures.items())) or "none"
+        return (
+            f"chunks_ok={self.chunks_ok} attempts={self.attempts} "
+            f"retried_chunks={self.retried_chunks} recovery_splits={self.recovery_splits} "
+            f"chars_sent={self.chars_sent} audio_bytes={self.audio_bytes} "
+            f"failures[{failures}] chunk_time[{self._dist(self.chunk_s)}] "
+            f"first_audio[{self._dist(self.first_audio_s)}] "
+            f"receive[{self._dist(self.receive_s)}]"
+        )
 
 
 @dataclass
@@ -1002,6 +1132,7 @@ class TTSWorker(QThread):
         self._output_written = False
         self._compatibility: VoiceCompatibilityAssessment | None = None
         self._health = _RollingHealthState()
+        self._stats = _JobStats()
 
     @property
     def _text_profile(self) -> TextProfile:
@@ -1053,6 +1184,8 @@ class TTSWorker(QThread):
             self._loop.run_until_complete(self._run_with_task())
 
             if self._cancelled and not self._output_written:
+                logger.info("Job summary [cancelled] job=%s %s", self._job_id,
+                            self._stats.summary())
                 return
             if self._cancelled:
                 # Cancel arrived during final assembly, which runs to the end
@@ -1068,13 +1201,21 @@ class TTSWorker(QThread):
                 self._output_path,
                 elapsed,
             )
+            logger.info("Job summary [completed] job=%s %s", self._job_id, self._stats.summary())
             self.completed.emit(self._output_path, elapsed)
 
         except asyncio.CancelledError:
             logger.info("Generation cancelled: %s", self._output_path)
+            logger.info("Job summary [cancelled] job=%s %s", self._job_id, self._stats.summary())
 
         except Exception as exc:
-            logger.exception("TTS generation failed")
+            logger.exception(
+                "TTS generation failed: job=%s voice=%s rate=%s volume=%s output=%s "
+                "elapsed=%.1fs error=%s",
+                self._job_id, self._voice, self._rate, self._volume, self._output_path,
+                time.monotonic() - start, type(exc).__name__,
+            )
+            logger.info("Job summary [failed] job=%s %s", self._job_id, self._stats.summary())
             if not self._cancelled:
                 self.failed.emit(self._user_message(exc))
 
@@ -1180,7 +1321,11 @@ class TTSWorker(QThread):
             self._voice,
             voices,
         )
-        if self._compatibility.requires_confirmation and not self._allow_voice_mismatch:
+        # A saved job being resumed was already confirmed when it was first
+        # started: the UI resumes with the stored voice and has no way to ask
+        # again, so the gate made every resume of a "Use anyway" job fail.
+        accepted = self._allow_voice_mismatch or self._resume_staging_dir is not None
+        if self._compatibility.requires_confirmation and not accepted:
             raise _PreflightError(
                 self._voice,
                 _AttemptFailure(
@@ -1329,10 +1474,12 @@ class TTSWorker(QThread):
             raise ValueError("No text was available to generate.")
 
         logger.info(
-            "Starting: voice=%s rate=%s chars=%d chunk_ceiling=%d payload_limit=%d "
-            "resume_chunk=%d resume_chars=%d output=%s",
+            "Starting: job=%s voice=%s rate=%s volume=%s chars=%d chunk_ceiling=%d "
+            "payload_limit=%d resume_chunk=%d resume_chars=%d output=%s",
+            self._job_id,
             self._voice,
             self._rate,
+            self._volume,
             len(stripped_text),
             max_chunk_chars,
             max_payload_bytes,
@@ -1917,7 +2064,13 @@ class TTSWorker(QThread):
                 await asyncio.sleep(wait)
 
             try:
-                timeout_s = self._chunk_timeout_for(text_chunk)
+                timeout_s = self._chunk_timeout_for(text_chunk, self._rate)
+                if attempt and "timeout_after_audio" in failure_kinds:
+                    # The same limit just failed on this text: give it more.
+                    timeout_s = int(min(
+                        _CHUNK_TIMEOUT_MAX_S,
+                        timeout_s * (_RETRY_TIMEOUT_GROWTH ** attempt),
+                    ))
                 audio_bytes, attempt_chars, stats = await self._synthesise_attempt(
                     text_chunk,
                     chunk_label=chunk_label,
@@ -1945,11 +2098,20 @@ class TTSWorker(QThread):
                     if stats.first_audio_at is not None and stats.last_event_at is not None
                     else None
                 )
+                self._stats.record_success(
+                    attempts=attempt + 1, chars=len(text_chunk), audio_bytes=len(audio_bytes),
+                    elapsed=chunk_elapsed, first_audio=first_audio_delay,
+                    receive=receive_duration,
+                )
                 logger.info(
-                    "%s succeeded (attempt %d) in %.2fs bytes=%d first_audio=%s receive=%s",
+                    "%s succeeded (attempt %d) in %.2fs chars=%d range=[%s,%s) bytes=%d "
+                    "first_audio=%s receive=%s",
                     chunk_label,
                     attempt + 1,
                     chunk_elapsed,
+                    len(text_chunk),
+                    source_start,
+                    source_end,
                     len(audio_bytes),
                     f"{first_audio_delay:.2f}s" if first_audio_delay is not None else "n/a",
                     f"{receive_duration:.2f}s" if receive_duration is not None else "n/a",
@@ -1968,6 +2130,7 @@ class TTSWorker(QThread):
                     write_duration=None,
                     failure_kinds=tuple(sorted(failure_kinds)),
                     sub_ranges=sub_ranges,
+                    audio_bytes=len(audio_bytes),
                 )
 
             except asyncio.CancelledError:
@@ -1977,7 +2140,16 @@ class TTSWorker(QThread):
                 last_failure = exc
                 failure_kinds.add(exc.kind)
                 self._record_failure_pattern(exc, chunk_label)
-                logger.warning("%s failed on attempt %d: %s", chunk_label, attempt + 1, exc)
+                self._stats.record_failure(exc.kind)
+                logger.warning(
+                    "%s failed on attempt %d: %s [kind=%s cause=%s chars=%d range=[%s,%s) "
+                    "after=%.1fs]",
+                    chunk_label, attempt + 1, exc, exc.kind,
+                    f"{type(exc.original).__name__}: {exc.original}"[:200]
+                    if exc.original is not None else "-",
+                    len(text_chunk), source_start, source_end,
+                    time.monotonic() - chunk_start,
+                )
                 if exc.kind in {"no_audio", "metadata_without_audio"} and attempt + 1 >= _NO_AUDIO_MAX_ATTEMPTS:
                     logger.warning(
                         "%s returned no audio repeatedly; stopping full-size retries early",
@@ -2002,6 +2174,7 @@ class TTSWorker(QThread):
                 source_end=source_end,
             )
             if recovery_sub_chunks:
+                self._stats.recovery_splits += 1
                 self.status_changed.emit("Recovering failed chunk…")
                 self.stage_changed.emit(
                     "waiting",
@@ -2289,8 +2462,16 @@ class TTSWorker(QThread):
             self._emit_progress_from_chars(progress_state.processed_chars, total_chars)
 
     @staticmethod
-    def _chunk_timeout_for(text: str) -> int:
-        estimated = 28 + (_edge_payload_size(text) / 36.0)
+    def _chunk_timeout_for(text: str, rate: str = "+0%") -> int:
+        """Whole-attempt deadline from the audio this chunk should produce.
+
+        Slower speech means more audio for the same text (-50 % doubles it),
+        so the speaking rate is part of the estimate.
+        """
+        expected_audio_s = len(text) / (
+            _SOURCE_CHARS_PER_AUDIO_SECOND * _rate_multiplier(rate)
+        )
+        estimated = 30 + expected_audio_s / _SLOWEST_STREAM_REALTIME
         return int(max(_CHUNK_TIMEOUT_MIN_S, min(_CHUNK_TIMEOUT_MAX_S, estimated)))
 
     @staticmethod
@@ -2321,8 +2502,13 @@ class TTSWorker(QThread):
             int(plan.max_payload_bytes * 0.74),
         )
 
+        # "Slow" means streaming slower than real time, not merely "took a
+        # while": a 9,000-character chunk legitimately takes minutes, and the
+        # old elapsed > 32 s test kept slow-streaming voices (Andrew) pinned
+        # at 1-2k-char chunks — 3-5x more requests, each one a failure risk.
+        audio_s = outcome.audio_bytes / _AUDIO_BYTES_PER_SECOND
         slow_chunk = (
-            outcome.elapsed > 32.0
+            (outcome.elapsed > 32.0 and audio_s < outcome.elapsed * 1.0)
             or (
                 outcome.first_audio_delay is not None
                 and outcome.first_audio_delay >= max(12.0, plan.first_audio_timeout_s * 0.9)
@@ -2810,3 +2996,12 @@ class TTSWorker(QThread):
             "Something went wrong while generating the audio. Please try again."
             f"\n\nTechnical details: {type(exc).__name__}: {exc}"
         )
+
+
+def _rate_multiplier(rate: str) -> float:
+    """'+25%' -> 1.25, '-50%' -> 0.5 (bounded so a typo cannot zero it)."""
+    try:
+        value = float(str(rate).strip().rstrip("%"))
+    except ValueError:
+        return 1.0
+    return max(0.3, min(3.0, 1.0 + value / 100.0))

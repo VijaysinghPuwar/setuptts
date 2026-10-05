@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from app import APP_NAME, APP_VERSION
 from app.config.settings import AppSettings
 from app.utils.app_logging import log_file_path
+from app.utils.diagnostics import build_kind, environment_text
 from app.utils.paths import AppPaths, open_in_file_manager
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self._settings = settings
         self._paths = paths or AppPaths()
-        self.setWindowTitle("Settings")
+        self.setWindowTitle(f"Settings — {APP_NAME} {APP_VERSION}")
         self.setMinimumWidth(520)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self._build_ui()
@@ -77,6 +78,14 @@ class SettingsDialog(QDialog):
         root = QVBoxLayout(content)
         root.setContentsMargins(28, 22, 28, 20)
         root.setSpacing(8)
+
+        # Version first, above the fold: "which version are you on?" is the
+        # first question in any support conversation.
+        self._version_banner = QLabel(f"{APP_NAME} version {APP_VERSION}")
+        self._version_banner.setObjectName("dialogVersion")
+        self._version_banner.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._version_banner.setAccessibleName(f"Installed version {APP_VERSION}")
+        root.addWidget(self._version_banner)
 
         # ── General ────────────────────────────────────────────────── #
         root.addWidget(self._section_title("General"))
@@ -133,9 +142,16 @@ class SettingsDialog(QDialog):
         open_file_btn.clicked.connect(self._open_log_file)
         self._copy_path_btn = QPushButton("Copy Log Path")
         self._copy_path_btn.clicked.connect(self._copy_log_path)
+        self._copy_diag_btn = QPushButton("Copy Diagnostic Info")
+        self._copy_diag_btn.setToolTip(
+            "Copies the app version, operating system and log location — "
+            "paste it into a bug report."
+        )
+        self._copy_diag_btn.clicked.connect(self._copy_diagnostics)
         column = QVBoxLayout()   # shared column → equal button widths
         column.setSpacing(6)
-        for btn in (open_folder_btn, open_file_btn, self._copy_path_btn):
+        for btn in (open_folder_btn, open_file_btn, self._copy_path_btn,
+                    self._copy_diag_btn):
             column.addWidget(btn)
         row = QHBoxLayout()
         row.addLayout(column)
@@ -145,7 +161,7 @@ class SettingsDialog(QDialog):
         # ── About ──────────────────────────────────────────────────── #
         root.addWidget(self._section_title("About"))
 
-        version_lbl = QLabel(f"{APP_NAME} {APP_VERSION}")
+        version_lbl = QLabel(f"Version {APP_VERSION} · {build_kind()}")
         version_lbl.setObjectName("dialogVersion")
         version_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         root.addWidget(version_lbl)
@@ -239,7 +255,18 @@ class SettingsDialog(QDialog):
         # Briefly rename button text as a visual confirmation
         btn = self._copy_path_btn
         btn.setText("Copied ✓")
-        QTimer.singleShot(1500, lambda: btn.setText("Copy Log Path"))
+        QTimer.singleShot(1500, btn, lambda: btn.setText("Copy Log Path"))
+
+    def _copy_diagnostics(self) -> None:
+        text = environment_text({
+            "Log file": str(self._log_file_path()),
+            "App data": str(self._paths.data_dir),
+        })
+        QApplication.clipboard().setText(text)
+        logger.info("Diagnostic info copied to clipboard")
+        btn = self._copy_diag_btn
+        btn.setText("Copied ✓")
+        QTimer.singleShot(1500, btn, lambda: btn.setText("Copy Diagnostic Info"))
 
     # ------------------------------------------------------------------ #
 

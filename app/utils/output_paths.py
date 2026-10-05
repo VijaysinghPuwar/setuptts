@@ -117,7 +117,13 @@ def next_free_path(path: str | Path) -> Path:
     path = Path(path)
     if not path.exists():
         return path
-    stem = re.sub(r" \(\d+\)$", "", path.stem)
+    stem = path.stem
+    # Only strip a " (n)" counter this function could have added — i.e. the
+    # un-numbered original sits next to it. "Annual Report (2024).mp3" is a
+    # real name and becomes "Annual Report (2024) (2).mp3".
+    counter = re.fullmatch(r"(.*) \((\d{1,4})\)", stem)
+    if counter and counter.group(1) and path.with_name(counter.group(1) + path.suffix).exists():
+        stem = counter.group(1)
     for n in range(2, 10_000):
         candidate = path.with_name(f"{stem} ({n}){path.suffix}")
         if not candidate.exists():

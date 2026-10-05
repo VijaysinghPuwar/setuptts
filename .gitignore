@@ -50,3 +50,10 @@ htmlcov/
 # Secrets / env
 .env
 .env.*
+
+# Local stress-test output
+stress_*/
+stress_*.log
+
+# Claude Code local state
+.claude/

@@ -91,7 +91,7 @@ from app.services.history_service import HistoryService
 from app.services.tts_quality import (
     VoiceCompatibilityAssessment,
     assess_voice_compatibility,
-    build_text_profile,
+    build_guidance_profile,
 )
 from app.utils.errors import split_error
 from app.utils.output_paths import (
@@ -145,6 +145,7 @@ class OutputPanel(QWidget):
         self._preview_worker: PreviewWorker | None = None
         self._current_text = ""
         self._compatibility: VoiceCompatibilityAssessment | None = None
+        self._guidance_cache: tuple[tuple[int, int], object] | None = None
         self._visible_recommended_voice: str | None = None
         self._resume_candidates: list[ResumeCandidate] = []
         # Keep old voice-loader workers alive until their thread exits.
@@ -191,6 +192,14 @@ class OutputPanel(QWidget):
             if name:
                 return name
         return self._settings.voice
+
+    def _has_visible_voice(self) -> bool:
+        idx = self._voice_combo.currentIndex()
+        return (
+            self._voice_combo.isEnabled()
+            and 0 <= idx < self._voice_combo.count()
+            and bool(self._voice_combo.itemData(idx, _ROLE_SHORT_NAME))
+        )
 
     def get_rate_string(self) -> str:
         return self._settings.rate_string()
@@ -276,6 +285,8 @@ class OutputPanel(QWidget):
                 logger.warning("Worker %s timed out — terminating", name)
                 worker.terminate()
                 worker.wait(1_000)
+                if hasattr(worker, "_cleanup"):
+                    worker._cleanup()   # a terminated preview leaves its temp MP3
             else:
                 logger.info("Worker %s stopped cleanly", name)
 
@@ -751,7 +762,7 @@ class OutputPanel(QWidget):
         # valueChanged does not fire when the saved rate equals the slider's
         # initial value, so sync the label and Reset button explicitly.
         self._on_rate_changed(self._rate_slider.value())
-        folder =self._settings.output_dir or str(Path.home() / "Desktop")
+        folder = self._settings.output_dir or str(Path.home() / "Desktop")
         self._set_folder_text(folder)
         idx = self._gender_combo.findText(self._settings.gender_filter)
         if idx >= 0:
@@ -956,7 +967,13 @@ class OutputPanel(QWidget):
             self._hide_voice_guidance()
             return
 
-        profile = build_text_profile(self._current_text)
+        text = self._current_text
+        cache_key = (len(text), hash(text))
+        if self._guidance_cache is not None and self._guidance_cache[0] == cache_key:
+            profile = self._guidance_cache[1]
+        else:
+            profile = build_guidance_profile(text)
+            self._guidance_cache = (cache_key, profile)
         assessment = assess_voice_compatibility(profile, selected_voice, self._all_voices)
         self._compatibility = assessment
 
@@ -994,8 +1011,9 @@ class OutputPanel(QWidget):
         profile,
         selected_voice: str,
     ) -> tuple[str, str | None] | None:
-        cleaned = profile.cleaned_text.strip()
-        if len(cleaned) < 45_000 or "multilingual" not in selected_voice.lower():
+        # The guidance profile may be a sample of a long text, so measure the
+        # editor text itself.
+        if len(self._current_text.strip()) < 45_000 or "multilingual" not in selected_voice.lower():
             return None
         if profile.language_code not in {None, "en"}:
             return None
@@ -1067,6 +1085,12 @@ class OutputPanel(QWidget):
     # Folder browse                                                        #
     # ------------------------------------------------------------------ #
 
+    def apply_default_folder(self) -> None:
+        """Show the default save folder from Settings in the sidebar."""
+        folder = self._settings.output_dir or str(Path.home() / "Desktop")
+        self._set_folder_text(folder)
+        logger.info("Default save folder changed in Settings: %s", folder)
+
     def _set_folder_text(self, folder: str) -> None:
         """Show a folder path from its start, with the full path as a tooltip."""
         self._folder_edit.setText(folder)
@@ -1130,6 +1154,19 @@ class OutputPanel(QWidget):
         if not text:
             QMessageBox.warning(self, "No Text",
                 "Please add some text on the left before generating.")
+            return
+
+        if not self._has_visible_voice():
+            # Voices still loading, failed to load, or filtered down to none:
+            # get_selected_voice() would fall back to the saved voice, which
+            # the user cannot see.
+            logger.info("Generate blocked: no voice selected in the picker")
+            QMessageBox.information(
+                self, "Choose a Voice",
+                "No voice is selected.\n\nWait for the voice list to load (or "
+                "click Retry if it failed), and make sure the language, gender "
+                "and search filters show at least one voice.",
+            )
             return
 
         voice        = self.get_selected_voice()
@@ -1388,9 +1425,13 @@ class OutputPanel(QWidget):
             # The original destination is gone or not writable (an unplugged
             # drive, a moved folder, blocked access) — without a way to pick a
             # new one, the saved progress could never be finished.
+            reason = "\n".join(
+                line for line in problem.message.splitlines()
+                if "Click Browse" not in line
+            ).strip()
             QMessageBox.information(
                 self, problem.title,
-                f"{problem.message}\n\nChoose where to save the finished audio instead.",
+                f"{reason}\n\nChoose where to save the finished audio instead.",
             )
             chosen, _ = QFileDialog.getSaveFileName(
                 self, "Save Resumed Audio As",
@@ -1405,6 +1446,15 @@ class OutputPanel(QWidget):
                 QMessageBox.warning(self, problem.title, problem.message)
                 return
 
+        if output_path.exists():
+            # Something was saved there after the job stopped (often another
+            # job using the default "output.mp3"): ask, as Generate does,
+            # instead of silently replacing it when the resume finishes.
+            chosen = self._confirm_existing_output(str(output_path))
+            if not chosen:
+                return
+            output_path = Path(chosen)
+
         voice = candidate.voice
         self._select_voice_by_short_name(voice)
         self._filename_edit.setText(output_path.name)
@@ -1413,10 +1463,31 @@ class OutputPanel(QWidget):
 
         parent_win = self.window()
         if hasattr(parent_win, "set_input_text"):
-            try:
-                parent_win.set_input_text(candidate.text)
-            except Exception:
-                logger.warning("Could not load resumable text into the editor", exc_info=True)
+            current = ""
+            if hasattr(parent_win, "get_input_text"):
+                try:
+                    current = parent_win.get_input_text() or ""
+                except Exception:
+                    current = ""
+            replace_editor = True
+            if current.strip() and current.strip() != candidate.text.strip():
+                # The resume uses the saved text either way; only the editor
+                # contents are at stake, so ask before discarding them.
+                answer = QMessageBox.question(
+                    self, "Replace Editor Text?",
+                    "The editor contains different text.\n\nShow the saved job's "
+                    "text in the editor instead? (The job resumes with its saved "
+                    "text either way.)",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                replace_editor = answer == QMessageBox.StandardButton.Yes
+            if replace_editor:
+                try:
+                    parent_win.set_input_text(candidate.text)
+                except Exception:
+                    logger.warning("Could not load resumable text into the editor",
+                                   exc_info=True)
 
         voice_display = _job_voice_display(voice)
 

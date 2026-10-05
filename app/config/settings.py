@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import stat
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,50 @@ _DEFAULTS: dict[str, Any] = {
     "show_history": True,
     "history_panel_height": 200,
 }
+
+
+#: Allowed ranges for numeric settings; out-of-range values are clamped.
+_RANGES: dict[str, tuple[int, int]] = {
+    "rate": (-50, 100),
+    "volume": (-50, 50),
+    "window_width": (320, 20_000),
+    "window_height": (240, 20_000),
+    "history_panel_height": (0, 5_000),
+}
+
+
+def _coerce(key: str, value: Any) -> Any:
+    """Return *value* as the type of the key's default, or raise ValueError.
+
+    A hand-edited or damaged settings.json ("rate": "abc", window_width: null)
+    used to reach int() in a property getter while the main window was being
+    built, so the app crashed at every launch until the file was deleted.
+    """
+    default = _DEFAULTS[key]
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        raise ValueError(f"{key}: expected true/false")
+    if isinstance(default, int) or key in ("window_x", "window_y"):
+        if value is None and default is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"{key}: expected a number")
+        if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip()):
+            number = int(float(value))
+        else:
+            raise ValueError(f"{key}: expected a number")
+        low, high = _RANGES.get(key, (-1_000_000, 1_000_000))
+        return max(low, min(high, number))
+    if isinstance(default, str):
+        if isinstance(value, str):
+            return value
+        raise ValueError(f"{key}: expected text")
+    if isinstance(default, list):
+        if isinstance(value, list):
+            return [v for v in value if isinstance(v, str)]
+        raise ValueError(f"{key}: expected a list")
+    return value
 
 
 class AppSettings:
@@ -189,11 +235,18 @@ class AppSettings:
         if self._path.exists():
             try:
                 loaded = json.loads(self._path.read_text(encoding="utf-8"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("settings.json is not a JSON object")
                 # Merge; unknown keys from future versions are dropped,
-                # missing keys keep the default.
+                # missing keys keep the default, and a bad value only resets
+                # its own key.
                 for key in _DEFAULTS:
                     if key in loaded:
-                        self._data[key] = loaded[key]
+                        try:
+                            self._data[key] = _coerce(key, loaded[key])
+                        except (TypeError, ValueError, OverflowError):
+                            logger.warning("Ignoring invalid setting %s=%r; using default %r",
+                                           key, loaded[key], _DEFAULTS[key])
             except Exception:
                 logger.warning("Could not load settings; using defaults.", exc_info=True)
                 try:
@@ -219,7 +272,7 @@ class AppSettings:
                 fh.write(payload)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp_path, self._path)
+            _replace_with_retry(tmp_path, self._path)
         except Exception:
             logger.error("Failed to save settings.", exc_info=True)
             try:
@@ -230,3 +283,25 @@ class AppSettings:
     def reset(self) -> None:
         self._data = dict(_DEFAULTS)
         self.save()
+
+
+def _replace_with_retry(src: Path, dst: Path, attempts: int = 5) -> None:
+    """os.replace that survives a read-only target and brief Windows locks.
+
+    Antivirus and cloud-sync tools (OneDrive, Dropbox) open files for a moment
+    after they change; a read-only settings.json failed every save silently.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            try:
+                if dst.exists() and not os.access(dst, os.W_OK):
+                    os.chmod(dst, stat.S_IWRITE | stat.S_IREAD)
+                    logger.info("Cleared read-only flag on %s", dst)
+            except OSError:
+                pass
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.1 * (attempt + 1))
