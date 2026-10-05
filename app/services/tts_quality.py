@@ -437,6 +437,30 @@ class VoiceCompatibilityAssessment:
         return self.severity != "ok"
 
 
+def _drop_stray_joiners(text: str) -> str:
+    """Keep ZWNJ/ZWJ only inside words (between letters or combining marks).
+
+    Inside Persian or Indic words they change shaping and pronunciation;
+    anywhere else — e.g. what is left of an emoji family "👨‍👩‍👧" after the
+    emoji are removed — they are noise that could make a chunk with nothing
+    speakable in it.
+    """
+    if "\u200c" not in text and "\u200d" not in text:
+        return text
+    out: list[str] = []
+    last = len(text) - 1
+    for i, ch in enumerate(text):
+        if ch in "\u200c\u200d":
+            before = text[i - 1] if i > 0 else " "
+            after = text[i + 1] if i < last else " "
+            if not (unicodedata.category(before)[0] in "LM"
+                    and unicodedata.category(after)[0] in "LM"):
+                out.append(" ")
+                continue
+        out.append(ch)
+    return "".join(out)
+
+
 def normalize_text_for_tts(text: str) -> str:
     """Clean punctuation and noisy unicode without changing the meaning."""
     if not text:
@@ -470,7 +494,7 @@ def normalize_text_for_tts(text: str) -> str:
         cleaned_chars.append(char)
 
     lines: list[str] = []
-    for raw_line in "".join(cleaned_chars).split("\n"):
+    for raw_line in _drop_stray_joiners("".join(cleaned_chars)).split("\n"):
         line = _normalize_tts_line(raw_line)
         lines.append(line)
 

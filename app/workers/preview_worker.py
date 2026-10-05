@@ -54,15 +54,25 @@ class PreviewWorker(QThread):
         self._rate = rate
         self._stop_requested = False
         self._tmp_path: str | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task | None = None
 
         # Platform playback handle (used by stop())
         self._afplay_proc: subprocess.Popen | None = None  # macOS
         self._mci_alias: str | None = None                  # Windows
 
     def stop_playback(self) -> None:
-        """Request early stop of playback."""
+        """Request early stop of generation or playback."""
         self._stop_requested = True
         self._kill_playback()
+        # Cancel generation too: closing the app mid-preview otherwise waited
+        # 4 s and then terminate()d the thread, leaking the temp file.
+        loop, task = self._loop, self._task
+        if loop is not None and task is not None:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass   # loop already closed
 
     # ------------------------------------------------------------------ #
 
@@ -71,8 +81,10 @@ class PreviewWorker(QThread):
         tmp.close()
         self._tmp_path = tmp.name
 
+        loop = asyncio.new_event_loop()
+        self._loop = loop
         try:
-            asyncio.run(
+            self._task = loop.create_task(
                 generate_audio(
                     text=_PREVIEW_TEXT,
                     voice=self._voice,
@@ -81,14 +93,29 @@ class PreviewWorker(QThread):
                     output_path=self._tmp_path,
                 )
             )
-        except Exception as exc:
-            logger.exception("Preview generation failed")
+            if self._stop_requested:
+                self._task.cancel()
+            loop.run_until_complete(self._task)
+        except (asyncio.CancelledError, Exception) as exc:
             self._cleanup()
-            if not self._stop_requested:
+            if self._stop_requested:
+                # Stopped mid-generation: the UI is waiting for this to reset
+                # its Preview/Stop buttons (it stayed on "Stop" forever when
+                # generation then failed, e.g. offline).
+                self.playback_finished.emit()
+            else:
+                logger.error("Preview generation failed: %s", exc, exc_info=True)
                 self.failed.emit(
                     f"Could not generate preview.\n\nDetails: {exc}"
                 )
             return
+        finally:
+            self._task = None
+            self._loop = None
+            try:
+                loop.close()
+            except Exception:
+                pass
 
         if self._stop_requested:
             self._cleanup()

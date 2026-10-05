@@ -106,12 +106,15 @@ class HistoryService:
 
     def delete_job(self, job_id: int) -> None:
         if self._read_only:
+            logger.warning("History is read-only this session; delete of job %s not saved",
+                           job_id)
             return
         with self._connect() as conn:
             conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
 
     def clear_history(self) -> None:
         if self._read_only:
+            logger.warning("History is read-only this session; clear not saved")
             return
         with self._connect() as conn:
             conn.execute("DELETE FROM jobs")

@@ -415,3 +415,136 @@ def test_job_summary_is_logged(stub_service, tmp_path, caplog):
     asyncio.run(worker._stream_generate())
     assert worker._stats.chunks_ok >= 1
     assert "chunks_ok=" in worker._stats.summary()
+
+
+# ------------------------------------------------------------------ #
+# Cycle-2 review findings                                             #
+# ------------------------------------------------------------------ #
+
+@pytest.mark.parametrize("word", [
+    "Olé!", "été", "Grüße", "Zoë", "Þór", "café crème",
+    "Hyvää päivää! Mitä kuuluu?", "Ég tala íslensku og þú?",
+], ids=lambda w: w.encode("ascii", "replace").decode())
+def test_short_accented_western_text_stays_western(word):
+    from app.ui.panels.input_panel import decode_text_file
+
+    assert decode_text_file(word.encode("cp1252")) == word
+
+
+def test_central_european_text_decodes_as_cp1250():
+    from app.ui.panels.input_panel import decode_text_file
+
+    text = "Příliš žluťoučký kůň úpěl ďábelské ódy."
+    assert decode_text_file(text.encode("cp1250")) == text
+
+
+def test_bomless_utf16_cjk_without_any_ascii():
+    from app.ui.panels.input_panel import decode_text_file
+
+    text = "我们今天去公园散步。"
+    assert decode_text_file(text.encode("utf-16-le")) == text
+
+
+def test_emoji_joiners_do_not_survive_cleaning():
+    from app.services.tts_quality import normalize_text_for_tts as norm
+
+    cleaned = norm("Chapter one.\n\n👨‍👩‍👧\n\nThe family arrived.")
+    assert "‍" not in cleaned
+    assert "‍" in norm("क्‍ष")
+
+
+def test_a_leading_comma_does_not_make_a_tiny_chunk():
+    text = "Well, " + " ".join(["word"] * 2000)
+    chunk, _, _, _ = tts_worker._ChunkCursor(text).take_next(3_000, 9_000)
+    assert len(chunk) > 1_000
+
+
+def test_closing_quote_stays_with_its_sentence():
+    text = "「今日はいい天気ですね。」と彼は言った。" * 40
+    for max_chars in range(20, 60):
+        cursor = tts_worker._ChunkCursor(text)
+        while cursor.has_more():
+            chunk, _, _, _ = cursor.take_next(max_chars, 4_000)
+            assert not chunk.startswith("」"), max_chars
+
+
+# ------------------------------------------------------------------ #
+# Cycle-2 GUI findings                                                #
+# ------------------------------------------------------------------ #
+
+def test_generate_refuses_when_no_voice_is_visible(window, qtbot, monkeypatch):
+    """Filters matching nothing: Generate used the hidden saved voice."""
+    from PySide6.QtWidgets import QMessageBox
+
+    shown = []
+    monkeypatch.setattr(QMessageBox, "information",
+                        staticmethod(lambda parent, title, text, *a, **k: shown.append(title)))
+    panel = window._output_panel
+    window.set_input_text("Some English text to speak.")
+    panel._search_edit.setText("zzzz-no-such-voice")
+    qtbot.wait(400)
+    submitted = []
+    monkeypatch.setattr(panel._queue, "submit", lambda **kw: submitted.append(kw))
+    panel._on_generate()
+    assert "Choose a Voice" in shown
+    assert not submitted
+
+
+def test_resume_asks_before_replacing_a_file_at_the_original_path(window, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    panel = window._output_panel
+    existing = tmp_path / "book.mp3"
+    existing.write_bytes(b"the user's newer audiobook")
+    asked, submitted = [], []
+    monkeypatch.setattr(panel, "_confirm_existing_output",
+                        lambda path: asked.append(path) or "")      # user cancels
+    monkeypatch.setattr(panel._queue, "submit", lambda **kw: submitted.append(kw))
+    candidate = SimpleNamespace(output_path=str(existing), voice="en-US-AvaNeural",
+                                text="saved text", rate="+0%", volume="+0%",
+                                job_id="abc", staging_dir=tmp_path / "staging")
+    panel._resume_candidate(candidate)
+    assert asked == [str(existing)]
+    assert not submitted
+    assert existing.read_bytes() == b"the user's newer audiobook"
+
+
+def test_preview_stopped_mid_generation_always_resets_the_buttons(qapp, qtbot, monkeypatch):
+    """Stop, then a generation error: the UI waited forever on 'Stop'."""
+    from app.workers import preview_worker
+
+
+    async def hang_then_fail(**kw):
+        await asyncio.sleep(30)
+        raise OSError("offline")
+
+    monkeypatch.setattr(preview_worker, "generate_audio", hang_then_fail)
+    worker = preview_worker.PreviewWorker("en-US-AvaNeural", "+0%")
+    failures = []
+    worker.failed.connect(failures.append)
+    with qtbot.waitSignal(worker.playback_finished, timeout=5000):
+        worker.start()
+        qtbot.wait(200)
+        began = time.monotonic()
+        worker.stop_playback()
+    assert worker.wait(3000)
+    assert time.monotonic() - began < 3.0          # cancelled, not waited out
+    assert not failures
+
+
+def test_closing_settings_right_after_copy_raises_nothing(styled_app, app_paths, qtbot):
+    from app.config.settings import AppSettings
+    from app.ui.dialogs.settings_dialog import SettingsDialog
+
+    errors = []
+    old_hook = sys.excepthook
+    sys.excepthook = lambda *exc: errors.append(exc)
+    try:
+        dialog = SettingsDialog(AppSettings(app_paths), app_paths)
+        dialog._copy_diag_btn.click()
+        dialog._copy_path_btn.click()
+        dialog.deleteLater()
+        qtbot.wait(1800)
+    finally:
+        sys.excepthook = old_hook
+    assert not errors

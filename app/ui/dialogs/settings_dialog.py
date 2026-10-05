@@ -255,7 +255,7 @@ class SettingsDialog(QDialog):
         # Briefly rename button text as a visual confirmation
         btn = self._copy_path_btn
         btn.setText("Copied ✓")
-        QTimer.singleShot(1500, lambda: btn.setText("Copy Log Path"))
+        QTimer.singleShot(1500, btn, lambda: btn.setText("Copy Log Path"))
 
     def _copy_diagnostics(self) -> None:
         text = environment_text({
@@ -266,7 +266,7 @@ class SettingsDialog(QDialog):
         logger.info("Diagnostic info copied to clipboard")
         btn = self._copy_diag_btn
         btn.setText("Copied ✓")
-        QTimer.singleShot(1500, lambda: btn.setText("Copy Diagnostic Info"))
+        QTimer.singleShot(1500, btn, lambda: btn.setText("Copy Diagnostic Info"))
 
     # ------------------------------------------------------------------ #
 

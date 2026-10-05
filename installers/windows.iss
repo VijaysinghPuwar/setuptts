@@ -4,7 +4,7 @@
 ;
 ;  CI invocation (from repo root, PowerShell):
 ;    & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-;        /DAppVersion=1.6.0 `
+;        /DAppVersion=1.6.2 `
 ;        /DSourceDir=C:\path\to\dist\SetupTTS `
 ;        /DOutputDir=C:\path\to\installer_out `
 ;        installers\windows.iss

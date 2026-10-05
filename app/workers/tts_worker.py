@@ -142,7 +142,12 @@ _EARLY_TIMEOUT_RECOVERY_ATTEMPTS = 2
 # Full-width CJK sentence/clause marks are not followed by a space, so they
 # must be split points on their own; requiring "\s+" sent every Chinese or
 # Japanese chunk to the hard splitter, cutting sentences (and words) apart.
-_SENTENCE_BOUNDARY = r"(?<=[.!?])\s+|(?<=[。！？])\s*"
+# A sentence end may be followed by closing quotes/brackets, which stay
+# with their sentence:  「…ね。」と  must not split between 。 and 」.
+_SENTENCE_BOUNDARY = (
+    r"(?<=[.!?])\s+|(?<=[.!?][\"'”’)\]])\s+"
+    r"|(?<=[。！？])(?![」』”’）】〕])\s*|(?<=[。！？][」』”’）】〕])\s*"
+)
 _CLAUSE_BOUNDARY = r"(?<=[，、；：])\s*|(?<=[,;:])\s+"
 _SENTENCE_SPLIT_RE = re.compile(_SENTENCE_BOUNDARY)
 
@@ -507,18 +512,31 @@ def _take_chunk_at(
 
     window = stripped[:max_chars]
     boundary_sets = (
-        _boundary_candidates(window, r"\n{2,}"),
-        _boundary_candidates(window, _SENTENCE_BOUNDARY),
-        _boundary_candidates(window, _CLAUSE_BOUNDARY),
-        _boundary_candidates(window, r"\s+"),
+        _boundary_candidates(stripped, r"\n{2,}", limit=len(window)),
+        _boundary_candidates(stripped, _SENTENCE_BOUNDARY, limit=len(window)),
+        _boundary_candidates(stripped, _CLAUSE_BOUNDARY, limit=len(window)),
+        _boundary_candidates(stripped, r"\s+", limit=len(window)),
     )
 
-    for boundaries in boundary_sets:
+    # A clause boundary (comma, colon…) is only worth using if it keeps the
+    # chunk reasonably full; otherwise "Well, <3,000 words>" became a 5-char
+    # request.  A short clause chunk is still better than a hard split.
+    clause_floor = max(1, int(min(max_chars, len(window)) * 0.4))
+    short_clause = None
+    for tier, boundaries in enumerate(boundary_sets):
         found = _largest_fitting_boundary(stripped, boundaries, max_chars, max_payload_bytes)
-        if found is not None:
-            candidate, resume_at = found
-            absolute_end = absolute_start + resume_at
-            return candidate, absolute_start, absolute_end, _edge_payload_size(candidate)
+        if found is None:
+            continue
+        candidate, resume_at = found
+        if tier == 2 and len(candidate) < clause_floor:
+            short_clause = found
+            continue
+        absolute_end = absolute_start + resume_at
+        return candidate, absolute_start, absolute_end, _edge_payload_size(candidate)
+
+    if short_clause is not None:
+        candidate, resume_at = short_clause
+        return candidate, absolute_start, absolute_start + resume_at, _edge_payload_size(candidate)
 
     hard_split = _hard_split_text(stripped, max_chars, max_payload_bytes)
     chunk = hard_split[0]
@@ -601,11 +619,20 @@ def _largest_fitting_boundary(
     return best
 
 
-def _boundary_candidates(text: str, pattern: str) -> list[tuple[int, int]]:
+def _boundary_candidates(
+    text: str, pattern: str, *, limit: int | None = None
+) -> list[tuple[int, int]]:
+    """Boundaries that start within ``text[:limit]``.
+
+    The regex sees a little past ``limit`` so that look-aheads (a closing
+    quote after 。) judge the real next character, not the end of the window.
+    """
+    if limit is None:
+        limit = len(text)
     candidates = [
         (match.start(), match.end())
-        for match in re.finditer(pattern, text)
-        if match.start() > 0
+        for match in re.finditer(pattern, text[: limit + 8])
+        if 0 < match.start() <= limit
     ]
     candidates.sort(reverse=True)
     return candidates
@@ -1157,6 +1184,8 @@ class TTSWorker(QThread):
             self._loop.run_until_complete(self._run_with_task())
 
             if self._cancelled and not self._output_written:
+                logger.info("Job summary [cancelled] job=%s %s", self._job_id,
+                            self._stats.summary())
                 return
             if self._cancelled:
                 # Cancel arrived during final assembly, which runs to the end
@@ -2039,7 +2068,7 @@ class TTSWorker(QThread):
                 if attempt and "timeout_after_audio" in failure_kinds:
                     # The same limit just failed on this text: give it more.
                     timeout_s = int(min(
-                        _CHUNK_TIMEOUT_MAX_S * 1.5,
+                        _CHUNK_TIMEOUT_MAX_S,
                         timeout_s * (_RETRY_TIMEOUT_GROWTH ** attempt),
                     ))
                 audio_bytes, attempt_chars, stats = await self._synthesise_attempt(

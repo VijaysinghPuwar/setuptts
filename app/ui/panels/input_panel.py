@@ -82,7 +82,7 @@ def decode_text_file(data: bytes) -> str | None:
         # and the byte-order guess above can be wrong.
         for candidate in ("utf-16-le", "utf-16-be"):
             text = _strict(data, candidate)
-            if text is not None and _looks_like_text(text) and _mostly_in(text, _is_cjk):
+            if _plausible_cjk(text):
                 return text
         return None   # not a text file
 
@@ -95,9 +95,12 @@ def decode_text_file(data: bytes) -> str | None:
 
 # Legacy (pre-Unicode) encodings Windows editors still save in.  Each is only
 # accepted when the result is plausible for its script, because nearly any
-# byte string "decodes" in some code page.
+# byte string "decodes" in some code page.  Strict CJK decoders (they reject
+# most foreign byte patterns) go before BOM-less UTF-16, lenient ones after:
+# GB18030 decodes almost anything, and UTF-16 "decodes" Shift-JIS bytes.
 _CYRILLIC = ("cp1251",)
-_CJK = ("cp932", "gb18030", "big5", "euc_kr")
+_CJK_STRICT = ("cp932", "euc_kr")
+_CJK_LENIENT = ("gb18030", "big5")
 
 
 def _decode_legacy(data: bytes) -> str:
@@ -112,19 +115,41 @@ def _decode_legacy(data: bytes) -> str:
         if text is not None and _looks_like_text(text):
             return text
 
+    # Order matters: the most selective decoders go first.  cp932 / EUC-KR
+    # reject most foreign byte patterns; cp1251 and cp1252 accept almost any
+    # byte, so they come after (Shift-JIS read as cp1251 is "88 % Cyrillic").
+    for encoding in _CJK_STRICT:
+        text = _strict(data, encoding)
+        # Modern Korean is almost all Hangul; Chinese GBK read as EUC-KR
+        # comes out as a Hangul/Hanja mix.
+        if _plausible_cjk(text) and (encoding != "euc_kr" or _letter_share(text, _is_hangul) >= 0.9):
+            return text
+    # Pure CJK text in UTF-16 has no ASCII, hence no NUL bytes at all.
+    text = _bomless_utf16_cjk(data)
+    if text is not None:
+        return text
+
     western = _strict(data, "cp1252")
-    if western is not None and _plausible_western(western):
+    if western is not None and _looks_like_text(western) and _plausible_western(western):
         return western
     for encoding in _CYRILLIC:
         text = _strict(data, encoding)
-        if text is not None and _mostly_in(text, _is_cyrillic):
+        # Measured against *all* letters: one "й" among ASCII letters is
+        # what cp1251 makes of "é", not evidence of Russian.
+        if (text is not None and _looks_like_text(text)
+                and _letter_share(text, _is_cyrillic) >= 0.8 and _has_word_spaces(text)):
             return text
-    for encoding in _CJK:
+    for encoding in _CJK_LENIENT:
         text = _strict(data, encoding)
-        if text is not None and _mostly_in(text, _is_cjk):
+        if _plausible_cjk(text):
             return text
     if western is not None:
         return western
+    # Central European (Czech, Polish, Hungarian…) uses bytes cp1252 leaves
+    # undefined, so it lands here.
+    central = _strict(data, "cp1250")
+    if central is not None and _plausible_western(central):
+        return central
     return data.decode("utf-8", errors="replace")
 
 
@@ -136,12 +161,77 @@ def _strict(data: bytes, encoding: str) -> str | None:
 
 
 def _plausible_western(text: str) -> bool:
-    """Accented letters are a small minority in every Western language."""
+    """Accented letters are a small minority in every Western language.
+
+    Russian cp1251 read as cp1252 is ~100 % accented letters ("Ïðèâåò"); real
+    Western text stays well under half even in short, accent-dense words such
+    as "été" or "Hyvää päivää".
+    """
     letters = [ch for ch in text[:20_000] if ch.isalpha()]
     if not letters:
         return True
     non_ascii = sum(1 for ch in letters if ord(ch) > 0x7F)
-    return non_ascii <= 0.3 * len(letters)
+    limit = 0.3 if len(letters) >= 200 else 0.7
+    return non_ascii <= limit * len(letters)
+
+
+def _letter_share(text: str, predicate) -> float:
+    letters = [ch for ch in text[:20_000] if ch.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(1 for ch in letters if predicate(ch)) / len(letters)
+
+
+def _bomless_utf16_cjk(data: bytes) -> str | None:
+    """
+    UTF-16 Chinese/Japanese/Korean saved without a byte-order mark.
+
+    Ordinary 8-bit text also "decodes" as UTF-16 into CJK-looking code units
+    ("He" -> U+6548), but then both bytes of every unit are printable ASCII;
+    real CJK code units have a low byte spread over the whole 0-255 range.
+    """
+    if len(data) < 20 or len(data) % 2:
+        return None
+    # CJK code units put a high (>= 0x80) byte in most units; Western 8-bit
+    # text only has the odd accented letter ("café" is 1 byte in 4).
+    head = data[:8192]
+    if sum(1 for b in head if b >= 0x80) < 0.15 * len(head):
+        return None
+    for encoding, low_bytes in (("utf-16-le", data[0::2]), ("utf-16-be", data[1::2])):
+        sample = low_bytes[:4096]
+        unusual = sum(1 for b in sample if b < 0x20 or b > 0x7E)
+        if unusual < 0.25 * len(sample):
+            continue
+        text = _strict(data, encoding)
+        if _plausible_cjk(text):
+            return text
+    return None
+
+
+def _plausible_cjk(text: str | None) -> bool:
+    """Is this decode real Chinese/Japanese/Korean prose?
+
+    Wrong decodes also produce ideographs ("oãn" -> "o縅", Russian read as
+    GB18030), so require several CJK characters that dominate the letters,
+    and few ASCII spaces — CJK prose does not separate words with spaces,
+    while text in another script decoded this way keeps its spaces.
+    """
+    if text is None or not _looks_like_text(text):
+        return False
+    sample = text[:20_000]
+    letters = [ch for ch in sample if ch.isalpha()]
+    cjk = sum(1 for ch in letters if _is_cjk(ch))
+    if cjk < 3 or cjk < 0.6 * len(letters) or not _mostly_in(text, _is_cjk):
+        return False
+    is_korean = sum(1 for ch in letters if _is_hangul(ch)) >= 0.5 * len(letters)
+    return is_korean or sample.count(" ") <= 0.08 * len(sample)
+
+
+def _has_word_spaces(text: str) -> bool:
+    """Alphabetic prose (Russian included) separates words with spaces."""
+    sample = text[:20_000]
+    letters = sum(1 for ch in sample if ch.isalpha())
+    return letters < 12 or sample.count(" ") >= 0.05 * len(sample)
 
 
 def _mostly_in(text: str, predicate) -> bool:
@@ -153,6 +243,10 @@ def _mostly_in(text: str, predicate) -> bool:
 
 def _is_cyrillic(ch: str) -> bool:
     return 0x0400 <= ord(ch) <= 0x04FF or ch in "«»—–…№“”„‘’•"
+
+
+def _is_hangul(ch: str) -> bool:
+    return 0xAC00 <= ord(ch) <= 0xD7AF or 0x1100 <= ord(ch) <= 0x11FF
 
 
 def _is_cjk(ch: str) -> bool:
