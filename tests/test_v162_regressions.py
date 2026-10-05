@@ -548,3 +548,16 @@ def test_closing_settings_right_after_copy_raises_nothing(styled_app, app_paths,
     finally:
         sys.excepthook = old_hook
     assert not errors
+
+
+def test_tiny_accented_files_are_not_read_as_cyrillic():
+    from app.ui.panels.input_panel import decode_text_file
+
+    for word in ("à", "ÄÖÜ", "Ça"):
+        assert decode_text_file(word.encode("cp1252")) == word
+
+
+def test_joiner_after_virama_is_kept_at_word_end():
+    from app.services.tts_quality import normalize_text_for_tts as norm
+
+    assert "‍" in norm("അവന്‍ വന്നു")      # Malayalam chillu (legacy form)

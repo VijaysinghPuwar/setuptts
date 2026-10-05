@@ -453,8 +453,11 @@ def _drop_stray_joiners(text: str) -> str:
         if ch in "\u200c\u200d":
             before = text[i - 1] if i > 0 else " "
             after = text[i + 1] if i < last else " "
-            if not (unicodedata.category(before)[0] in "LM"
-                    and unicodedata.category(after)[0] in "LM"):
+            # After a virama a joiner selects a letter form (Malayalam chillu
+            # "ന്‍", Bengali khanda-ta "ত্‍") even at the end of a word.
+            after_virama = unicodedata.combining(before) == 9
+            if not after_virama and not (unicodedata.category(before)[0] in "LM"
+                                         and unicodedata.category(after)[0] in "LM"):
                 out.append(" ")
                 continue
         out.append(ch)

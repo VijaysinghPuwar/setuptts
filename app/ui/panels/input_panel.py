@@ -136,7 +136,9 @@ def _decode_legacy(data: bytes) -> str:
         text = _strict(data, encoding)
         # Measured against *all* letters: one "й" among ASCII letters is
         # what cp1251 makes of "é", not evidence of Russian.
+        # A handful of letters ("à", "ÄÖÜ") is too little to call Russian.
         if (text is not None and _looks_like_text(text)
+                and sum(1 for ch in text if ch.isalpha()) >= 4
                 and _letter_share(text, _is_cyrillic) >= 0.8 and _has_word_spaces(text)):
             return text
     for encoding in _CJK_LENIENT:
