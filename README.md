@@ -5,7 +5,8 @@
 <h1 align="center">SetupTTS</h1>
 
 <p align="center">
-  A desktop app that turns text into MP3 audio with Microsoft's neural voices,<br>
+  A desktop app that turns text into MP3 audio with Microsoft's neural voices,
+  free offline voices and your computer's built-in voices,<br>
   built to finish 12-hour audiobooks without silently losing a sentence.
 </p>
 
@@ -39,6 +40,14 @@ The apps are not code-signed. On macOS, the first launch may need **System Setti
 ## What it does
 
 Paste text or open a `.txt` file, pick one of 300+ voices in 70+ languages, and export an MP3. Short clips take seconds; a full book runs in the background with live progress, and can be stopped and resumed later — even after closing the app.
+
+Three kinds of voices, all in one picker (**All · Online · Offline · Built-in**):
+
+| Voices | Needs internet | What you get |
+|--------|----------------|--------------|
+| **Online** — Microsoft neural | Yes | 300+ voices in 70+ languages, best quality |
+| **Offline** — [Piper](https://github.com/rhasspy/piper) neural | No | One English voice included; ~170 more in ~50 languages one click away in **+ Get voices** |
+| **Built-in** — your OS | No | Windows: Cortana, David, Zira, Mark and any installed SAPI / Narrator voice. macOS: every system voice |
 
 The hard part is not calling a speech API; it is making a **multi-hour job over an unreliable connection** come out complete. The service accepts a few thousand characters per request, so a book becomes a few hundred requests, any of which can time out, return nothing, or — worst of all — end early without an error. SetupTTS treats every one of those as a normal event and refuses to hand over a file it cannot prove is complete.
 

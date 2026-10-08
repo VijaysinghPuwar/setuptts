@@ -41,7 +41,15 @@ source .venv/bin/activate        # macOS / Linux
 ```bash
 pip install -r requirements.txt
 pip install pyinstaller          # only needed for building
+python scripts/fetch_bundled_voice.py   # the offline voice bundled with the app (63 MB, checksum-verified)
 ```
+
+Offline voices use [Piper](https://github.com/rhasspy/piper) (`piper-tts`, with
+`onnxruntime`) and `lameenc` for MP3 encoding.  Built-in voices need nothing
+extra: on Windows they are driven through SAPI via PowerShell, on macOS via
+`say`.  The installer and macOS app include one Piper voice
+(`en_US-lessac-medium`); the portable EXE leaves it out to keep start-up fast,
+and every build can download more from **Get voices**.
 
 ### 3. Run in development
 

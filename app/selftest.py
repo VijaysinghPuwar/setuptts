@@ -9,6 +9,10 @@ so results are written to a JSON file rather than printed.
 
 With --network it also fetches the voice list and synthesises one short
 sentence through the same code the app uses, verifying the audio is complete.
+
+Offline voices are always checked: the Piper runtime must load, the bundled
+voice must speak when present (--bundled-voice makes its absence a failure),
+and the OS built-in voices are listed and the first one spoken.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ def run(argv: list[str]) -> int:
     out = Path(argv[idx + 1]) if len(argv) > idx + 1 and not argv[idx + 1].startswith("--") \
         else Path("setuptts-selftest.json")
     network = "--network" in argv
+    require_bundled = "--bundled-voice" in argv
 
     results: dict = {"checks": {}, "ok": False}
 
@@ -95,10 +100,53 @@ def run(argv: list[str]) -> int:
         from PySide6 import QtNetwork  # noqa: F401
         return f"edge_tts {getattr(edge_tts, '__version__', '?')}, aiohttp {aiohttp.__version__}"
 
+    def offline_voice():
+        import tempfile
+        from app.services import piper_tts
+        from app.services.local_tts import synthesize_to_mp3
+        from app.utils.mp3_duration import mp3_duration_seconds
+
+        import lameenc  # noqa: F401 - MP3 encoder for every local voice
+        if not piper_tts.piper_available():
+            raise RuntimeError("Piper runtime failed to import")
+        if piper_tts.model_path(piper_tts.BUNDLED_VOICE) is None:
+            if require_bundled:
+                raise FileNotFoundError(f"bundled voice {piper_tts.BUNDLED_VOICE} missing")
+            return "runtime ok; no bundled voice in this build"
+        out = Path(tempfile.gettempdir()) / "setuptts-selftest-piper.mp3"
+        try:
+            synthesize_to_mp3(piper_tts.PIPER_PREFIX + piper_tts.BUNDLED_VOICE,
+                              "SetupTTS offline voice check. The quick brown fox.", "+0%", out)
+            seconds = mp3_duration_seconds(out)
+        finally:
+            out.unlink(missing_ok=True)
+        if not seconds or seconds < 1.5:
+            raise RuntimeError(f"implausible duration {seconds}")
+        return f"{piper_tts.BUNDLED_VOICE}: {seconds:.1f} s"
+
+    def system_voices():
+        import tempfile
+        from app.services import system_tts
+        from app.services.local_tts import synthesize_to_mp3
+
+        found = system_tts.list_system_voices()
+        if not found:
+            return "none installed"
+        out = Path(tempfile.gettempdir()) / "setuptts-selftest-system.mp3"
+        try:
+            seconds = synthesize_to_mp3(found[0]["ShortName"], "Built-in voice check.", "+0%", out)
+        finally:
+            out.unlink(missing_ok=True)
+        if seconds < 0.3:
+            raise RuntimeError(f"implausible duration {seconds}")
+        return f"{len(found)} voices; {system_tts.system_display_name(found[0]['ShortName'])}: {seconds:.1f} s"
+
     check("assets", assets)
     check("imports", imports)
     check("tls", tls)
     check("qt_gui", qt_gui)
+    check("offline_voice", offline_voice)
+    check("system_voices", system_voices)
 
     if network:
         import asyncio

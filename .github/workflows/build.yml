@@ -65,6 +65,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller pytest pytest-qt
+          python scripts/fetch_bundled_voice.py
 
       - name: Run tests
         env:
@@ -84,6 +85,7 @@ jobs:
             test -f "$RES/$f" || { echo "::error::$f missing from bundle"; exit 1; }
           done
           test -d "$RES/edge_tts" || { echo "::error::edge_tts missing"; exit 1; }
+          test -f "$RES/app/assets/piper/en_US-lessac-medium.onnx" || { echo "::error::bundled voice missing"; exit 1; }
           echo "Bundle size: $(du -sh dist/SetupTTS.app | cut -f1)"
 
       - name: Verify declared minimum macOS covers every bundled binary
@@ -114,7 +116,7 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          dist/SetupTTS.app/Contents/MacOS/SetupTTS --selftest selftest-app.json --network \
+          dist/SetupTTS.app/Contents/MacOS/SetupTTS --selftest selftest-app.json --network --bundled-voice \
             || { cat selftest-app.json; exit 1; }
           cat selftest-app.json
           python3 -c "import json,sys; d=json.load(open('selftest-app.json')); \
@@ -144,7 +146,7 @@ jobs:
         run: |
           MNT=$(mktemp -d)
           hdiutil attach "SetupTTS-macOS.dmg" -nobrowse -readonly -mountpoint "$MNT"
-          "$MNT/SetupTTS.app/Contents/MacOS/SetupTTS" --selftest selftest-dmg.json \
+          "$MNT/SetupTTS.app/Contents/MacOS/SetupTTS" --selftest selftest-dmg.json --bundled-voice \
             || { cat selftest-dmg.json; hdiutil detach "$MNT"; exit 1; }
           test -L "$MNT/Applications" || { echo "::error::Applications link missing"; exit 1; }
           hdiutil detach "$MNT"
@@ -161,7 +163,7 @@ jobs:
         run: |
           TMP=$(mktemp -d)
           ditto -x -k "SetupTTS-macOS.zip" "$TMP"
-          "$TMP/SetupTTS.app/Contents/MacOS/SetupTTS" --selftest selftest-zip.json \
+          "$TMP/SetupTTS.app/Contents/MacOS/SetupTTS" --selftest selftest-zip.json --bundled-voice \
             || { cat selftest-zip.json; exit 1; }
           cat selftest-zip.json
           rm -rf "$TMP"
@@ -240,6 +242,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller pytest pytest-qt
+          python scripts/fetch_bundled_voice.py
 
       - name: Run tests
         shell: pwsh
@@ -256,7 +259,8 @@ jobs:
           foreach ($f in @("dist\SetupTTS\SetupTTS.exe",
                            "dist\SetupTTS\_internal\app\assets\styles\app.qss",
                            "dist\SetupTTS\_internal\app\assets\icons\app.png",
-                           "dist\SetupTTS\_internal\app\assets\icons\chevron-down.svg")) {
+                           "dist\SetupTTS\_internal\app\assets\icons\chevron-down.svg",
+                           "dist\SetupTTS\_internal\app\assets\piper\en_US-lessac-medium.onnx")) {
             if (!(Test-Path $f)) { Write-Error "$f not found"; exit 1 }
           }
           $dirSize = [math]::Round((Get-ChildItem -Recurse "dist\SetupTTS" |
@@ -269,9 +273,10 @@ jobs:
         shell: pwsh
         run: |
           @'
-          param([string]$Exe, [string]$Out, [string]$Version, [switch]$Network)
+          param([string]$Exe, [string]$Out, [string]$Version, [switch]$Network, [switch]$BundledVoice)
           $argList = @("--selftest", "`"$Out`"")
           if ($Network) { $argList += "--network" }
+          if ($BundledVoice) { $argList += "--bundled-voice" }
           $env:QT_QPA_PLATFORM = "offscreen"
           $p = Start-Process -FilePath $Exe -ArgumentList $argList -Wait -PassThru
           if (!(Test-Path $Out)) { Write-Error "no self-test output from $Exe (exit $($p.ExitCode))"; exit 1 }
@@ -285,7 +290,7 @@ jobs:
         shell: pwsh
         run: |
           $ver = if ("${{ github.event_name }}" -eq "push") { "${{ steps.ver.outputs.version }}" } else { "" }
-          ./selftest.ps1 -Exe "dist\SetupTTS\SetupTTS.exe" -Out "$pwd\selftest-onedir.json" -Version $ver -Network
+          ./selftest.ps1 -Exe "dist\SetupTTS\SetupTTS.exe" -Out "$pwd\selftest-onedir.json" -Version $ver -Network -BundledVoice
 
       - name: Build Inno Setup installer
         shell: pwsh
@@ -325,7 +330,7 @@ jobs:
           Write-Host "Installed EXE ProductVersion: $fileVer"
           if ($fileVer -ne $appVer) { Write-Error "EXE version info $fileVer != $appVer"; exit 1 }
           $ver = if ("${{ github.event_name }}" -eq "push") { "${{ steps.ver.outputs.version }}" } else { "" }
-          ./selftest.ps1 -Exe $exe -Out "$pwd\selftest-installed.json" -Version $ver -Network
+          ./selftest.ps1 -Exe $exe -Out "$pwd\selftest-installed.json" -Version $ver -Network -BundledVoice
 
       - name: Build portable (onefile)
         run: |

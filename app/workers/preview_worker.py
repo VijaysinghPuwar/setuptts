@@ -17,6 +17,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from app.services.local_tts import is_local_voice, make_synthesizer, synthesize_to_mp3
 from app.services.tts_service import generate_audio
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class PreviewWorker(QThread):
         self._tmp_path: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task | None = None
+        self._local_synth = None   # built-in / offline voice being rendered
 
         # Platform playback handle (used by stop())
         self._afplay_proc: subprocess.Popen | None = None  # macOS
@@ -65,6 +67,9 @@ class PreviewWorker(QThread):
         """Request early stop of generation or playback."""
         self._stop_requested = True
         self._kill_playback()
+        synth = self._local_synth
+        if synth is not None:
+            synth.cancel()
         # Cancel generation too: closing the app mid-preview otherwise waited
         # 4 s and then terminate()d the thread, leaking the temp file.
         loop, task = self._loop, self._task
@@ -81,41 +86,11 @@ class PreviewWorker(QThread):
         tmp.close()
         self._tmp_path = tmp.name
 
-        loop = asyncio.new_event_loop()
-        self._loop = loop
-        try:
-            self._task = loop.create_task(
-                generate_audio(
-                    text=_PREVIEW_TEXT,
-                    voice=self._voice,
-                    rate=self._rate,
-                    volume="+0%",
-                    output_path=self._tmp_path,
-                )
-            )
-            if self._stop_requested:
-                self._task.cancel()
-            loop.run_until_complete(self._task)
-        except (asyncio.CancelledError, Exception) as exc:
-            self._cleanup()
-            if self._stop_requested:
-                # Stopped mid-generation: the UI is waiting for this to reset
-                # its Preview/Stop buttons (it stayed on "Stop" forever when
-                # generation then failed, e.g. offline).
-                self.playback_finished.emit()
-            else:
-                logger.error("Preview generation failed: %s", exc, exc_info=True)
-                self.failed.emit(
-                    f"Could not generate preview.\n\nDetails: {exc}"
-                )
+        if is_local_voice(self._voice):
+            if not self._generate_local():
+                return
+        elif not self._generate_online():
             return
-        finally:
-            self._task = None
-            self._loop = None
-            try:
-                loop.close()
-            except Exception:
-                pass
 
         if self._stop_requested:
             self._cleanup()
@@ -132,6 +107,66 @@ class PreviewWorker(QThread):
         finally:
             self._cleanup()
             self.playback_finished.emit()
+
+    def _generation_failed(self, exc: BaseException) -> None:
+        self._cleanup()
+        if self._stop_requested:
+            # Stopped mid-generation: the UI is waiting for this to reset
+            # its Preview/Stop buttons (it stayed on "Stop" forever when
+            # generation then failed, e.g. offline).
+            self.playback_finished.emit()
+        else:
+            logger.error("Preview generation failed: %s", exc, exc_info=True)
+            self.failed.emit(f"Could not generate preview.\n\nDetails: {exc}")
+
+    def _generate_local(self) -> bool:
+        """Render the sample with a voice on this computer.  False on failure."""
+        try:
+            synth = make_synthesizer(self._voice)
+            self._local_synth = synth
+            if self._stop_requested:
+                synth.cancel()
+            synthesize_to_mp3(self._voice, _PREVIEW_TEXT, self._rate, self._tmp_path, synth=synth)
+            return True
+        except Exception as exc:  # noqa: BLE001 - includes cancellation
+            self._generation_failed(exc)
+            return False
+        finally:
+            synth, self._local_synth = self._local_synth, None
+            if synth is not None:
+                try:
+                    synth.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _generate_online(self) -> bool:
+        """Render the sample with the Microsoft service.  False on failure."""
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        try:
+            self._task = loop.create_task(
+                generate_audio(
+                    text=_PREVIEW_TEXT,
+                    voice=self._voice,
+                    rate=self._rate,
+                    volume="+0%",
+                    output_path=self._tmp_path,
+                )
+            )
+            if self._stop_requested:
+                self._task.cancel()
+            loop.run_until_complete(self._task)
+            return True
+        except (asyncio.CancelledError, Exception) as exc:
+            self._generation_failed(exc)
+            return False
+        finally:
+            self._task = None
+            self._loop = None
+            try:
+                loop.close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # Platform-specific blocking playback                                  #
