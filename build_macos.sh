@@ -42,6 +42,7 @@ rm -f "${ZIP_PATH}"
 
 # ── 2. Build with PyInstaller ────────────────────────────────────────────────
 echo "[2/5] Running PyInstaller..."
+python3 scripts/fetch_bundled_voice.py   # the offline voice that ships in the app
 python3 -m PyInstaller "${SPEC}" --noconfirm
 
 # ── 3. Verify bundle ─────────────────────────────────────────────────────────

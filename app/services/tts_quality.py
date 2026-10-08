@@ -867,6 +867,9 @@ def recommend_voice(
         return None
 
     prefer_multilingual = profile.mixed and profile.secondary_share >= 0.22
+    # Suggest a voice of the same kind: someone using an offline voice may
+    # have no internet, and someone on an online voice wants that quality.
+    prefer_local = _is_local_name(exclude or "")
 
     if profile.locale_hint:
         exact = [voice for voice in candidates if _voice_locale(voice) == profile.locale_hint]
@@ -874,6 +877,7 @@ def recommend_voice(
             exact,
             preferred_gender,
             prefer_multilingual=prefer_multilingual,
+            prefer_local=prefer_local,
         )
         if chosen:
             return _voice_short_name(chosen)
@@ -887,6 +891,7 @@ def recommend_voice(
             same_language,
             preferred_gender,
             prefer_multilingual=prefer_multilingual,
+            prefer_local=prefer_local,
         )
         if chosen:
             return _voice_short_name(chosen)
@@ -900,6 +905,7 @@ def recommend_voice(
             same_script,
             preferred_gender,
             prefer_multilingual=prefer_multilingual,
+            prefer_local=prefer_local,
         )
         if chosen:
             return _voice_short_name(chosen)
@@ -1028,18 +1034,26 @@ def _pick_preferred_voice(
     preferred_gender: str | None,
     *,
     prefer_multilingual: bool = False,
+    prefer_local: bool = False,
 ) -> Any | None:
     if not voices:
         return None
 
-    def sort_key(voice: Any) -> tuple[int, int, str]:
+    def sort_key(voice: Any) -> tuple[int, int, int, str]:
+        name = _voice_short_name(voice)
+        kind_penalty = 0 if _is_local_name(name) == prefer_local else 1
         gender = (_voice_gender(voice) or "").lower()
         gender_match = 0 if preferred_gender and gender == preferred_gender.lower() else 1
-        is_multilingual = "multilingual" in _voice_short_name(voice).lower()
+        is_multilingual = "multilingual" in name.lower()
         multilingual_penalty = 0 if is_multilingual == prefer_multilingual else 1
-        return (gender_match, multilingual_penalty, _voice_short_name(voice))
+        return (kind_penalty, gender_match, multilingual_penalty, name)
 
     return sorted(voices, key=sort_key)[0]
+
+
+def _is_local_name(short_name: str) -> bool:
+    """Built-in or offline voice (see app.services.local_tts)."""
+    return short_name.startswith(("system:", "piper:"))
 
 
 def _voice_short_name(voice: Any) -> str:
@@ -1054,6 +1068,10 @@ def _voice_locale(voice: Any) -> str:
     if voice is None:
         return ""
     if isinstance(voice, str):
+        if voice.startswith("piper:"):
+            return voice[len("piper:"):].split("-")[0].replace("_", "-")
+        if voice.startswith("system:"):
+            return ""
         parts = voice.split("-")
         return "-".join(parts[:2]) if len(parts) >= 2 else voice
     if isinstance(voice, dict):

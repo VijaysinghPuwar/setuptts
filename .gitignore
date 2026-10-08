@@ -57,3 +57,6 @@ stress_*.log
 
 # Claude Code local state
 .claude/
+
+# Bundled offline voice — fetched at build time by scripts/fetch_bundled_voice.py
+app/assets/piper/

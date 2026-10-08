@@ -1076,3 +1076,143 @@ QLabel#dialogVersion {
     color: #F2F2F4;
     background: transparent;
 }
+
+
+/* ── Voice source tabs (All · Online · Offline · Built-in) ─────────── */
+QFrame#sourceTabs {
+    background-color: #1E1E21;
+    border: 1px solid #2C2C30;
+    border-radius: 8px;
+}
+
+QPushButton#sourceTab {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: #9A9A9F;
+    padding: 2px 6px;
+    font-size: 12px;
+    font-weight: 600;
+    min-height: 20px;
+}
+
+QPushButton#sourceTab:hover {
+    color: #F2F2F4;
+    background-color: #28282C;
+}
+
+QPushButton#sourceTab:checked {
+    color: #FFFFFF;
+    background-color: #0A84FF;
+}
+
+QPushButton#sourceTab:disabled {
+    color: #5A5A60;
+}
+
+QPushButton#sourceTab:focus {
+    border: 1px solid #3D9EFF;
+}
+
+QWidget#sidePanel[compact="true"] QPushButton#sourceTab {
+    min-height: 18px;
+    padding: 1px 6px;
+}
+
+QPushButton#headerLinkButton,
+QWidget#sidePanel[compact="true"] QPushButton#headerLinkButton {
+    background: transparent;
+    border: none;
+    color: #0A84FF;
+    padding: 0 2px;
+    font-size: 12px;
+    font-weight: 600;
+    min-height: 0;
+}
+
+QPushButton#headerLinkButton:hover {
+    color: #3D9EFF;
+}
+
+QPushButton#headerLinkButton:focus {
+    border: 1px solid #0A84FF;
+    border-radius: 4px;
+}
+
+QLabel#voiceSourceNote {
+    color: #9A9A9F;
+    font-size: 11px;
+    padding: 0 2px;
+}
+
+QLabel#voiceSourceNote[source="piper"],
+QLabel#voiceSourceNote[source="system"] {
+    color: #30D158;
+}
+
+/* ── Get Voices dialog ─────────────────────────────────────────────── */
+QTableWidget#voiceCatalog {
+    background-color: #161618;
+    alternate-background-color: #1A1A1D;
+    border: 1px solid #2C2C30;
+    border-radius: 8px;
+    gridline-color: transparent;
+}
+
+QTableWidget#voiceCatalog::item {
+    padding: 4px 6px;
+}
+
+QLabel#dialogTitle {
+    font-size: 16px;
+    font-weight: 700;
+}
+
+/* ── Compact preview / stop beside the voice picker ────────────────── */
+QPushButton#previewIconButton {
+    background-color: #0F2440;
+    color: #3D9EFF;
+    border: 1px solid #1A3A60;
+    border-radius: 7px;
+    padding: 0;
+    font-size: 13px;
+    font-weight: 700;
+    min-width: 34px;
+    max-width: 34px;
+}
+
+QPushButton#previewIconButton:hover {
+    background-color: #152D52;
+    border-color: #2A4A78;
+    color: #5AAFFF;
+}
+
+QPushButton#previewIconButton:disabled {
+    background-color: #111620;
+    color: #2A3A50;
+    border-color: #1A2030;
+}
+
+QPushButton#stopPreviewButton {
+    background-color: #2E1210;
+    color: #FF6961;
+    border: 1px solid #3A1A18;
+    border-radius: 7px;
+    padding: 0;
+    font-size: 13px;
+    font-weight: 700;
+    min-width: 34px;
+    max-width: 34px;
+}
+
+QPushButton#stopPreviewButton:hover {
+    background-color: #3A1614;
+    border-color: #501E1C;
+}
+
+QWidget#sidePanel[compact="true"] QPushButton#previewIconButton,
+QWidget#sidePanel[compact="true"] QPushButton#stopPreviewButton {
+    padding: 0;
+    min-width: 30px;
+    max-width: 30px;
+}

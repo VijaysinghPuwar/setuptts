@@ -24,6 +24,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
+from app.services.local_tts import is_local_voice
+from app.workers.local_tts_worker import LocalTTSWorker
 from app.workers.tts_worker import TTSWorker
 
 logger = logging.getLogger(__name__)
@@ -268,7 +270,10 @@ class JobQueue(QObject):
             self._start_job(item)
 
     def _start_job(self, item: JobItem) -> None:
-        worker = TTSWorker(
+        # Voices on this computer (built-in / offline neural) take the local
+        # pipeline; Microsoft's online voices the network one.
+        worker_cls = LocalTTSWorker if is_local_voice(item.voice) else TTSWorker
+        worker = worker_cls(
             text=item.text, voice=item.voice,
             rate=item.rate, volume=item.volume,
             output_path=item.output_path,
@@ -306,7 +311,7 @@ class JobQueue(QObject):
         )
 
         item.status      = "running"
-        item.status_text = "Connecting…"
+        item.status_text = "Preparing…" if worker_cls is LocalTTSWorker else "Connecting…"
         item.worker      = worker
         self._running[jid] = (item, worker)
 

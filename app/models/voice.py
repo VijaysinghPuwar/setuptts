@@ -14,6 +14,9 @@ def persona_name(short_name: str) -> str:
     picker listed two identical entries that behave differently — the
     multilingual model is chunked and recovered differently on long jobs.
     """
+    if short_name and short_name.startswith(("system:", "piper:")):
+        from app.services.local_tts import local_display_name
+        return local_display_name(short_name)
     persona = short_name.split("-")[-1] if short_name else short_name
     if persona.endswith("Neural"):
         persona = persona[: -len("Neural")]
@@ -29,7 +32,17 @@ class Voice:
     short_name: str      # e.g. "en-US-AvaNeural"
     friendly_name: str   # e.g. "Microsoft Ava Online (Natural) - English (United States)"
     locale: str          # e.g. "en-US"
-    gender: str          # "Female" | "Male"
+    gender: str          # "Female" | "Male" | "" (unknown, some local voices)
+    source: str = "online"   # "online" (Microsoft) | "system" (OS built-in) | "piper" (offline neural)
+
+    @property
+    def is_local(self) -> bool:
+        """Runs on this computer — works offline, no Microsoft service."""
+        return self.source != "online"
+
+    @property
+    def source_label(self) -> str:
+        return {"system": "Built-in", "piper": "Offline"}.get(self.source, "Online")
 
     @property
     def persona(self) -> str:
@@ -39,7 +52,7 @@ class Voice:
     @property
     def display_name(self) -> str:
         """Short label for combobox: 'Ava · Female'"""
-        return f"{self.persona} · {self.gender}"
+        return f"{self.persona} · {self.gender}" if self.gender else self.persona
 
     @property
     def language_tag(self) -> str:
@@ -53,6 +66,7 @@ class Voice:
             friendly_name=d.get("FriendlyName", d.get("ShortName", "")),
             locale=d.get("Locale", ""),
             gender=d.get("Gender", ""),
+            source=d.get("Source", "online") or "online",
         )
 
     def to_edge_dict(self) -> dict:
@@ -62,4 +76,5 @@ class Voice:
             "FriendlyName": self.friendly_name,
             "Locale": self.locale,
             "Gender": self.gender,
+            "Source": self.source,
         }

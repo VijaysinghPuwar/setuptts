@@ -67,6 +67,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -87,6 +88,7 @@ from PySide6.QtWidgets import (
 from app.config.settings import AppSettings
 from app.models.job import Job, JobStatus
 from app.models.voice import Voice, persona_name
+from app.services.local_tts import SOURCE_ONLINE, SOURCE_PIPER, SOURCE_SYSTEM, source_of
 from app.services.history_service import HistoryService
 from app.services.tts_quality import (
     VoiceCompatibilityAssessment,
@@ -359,7 +361,40 @@ class OutputPanel(QWidget):
         self._voice_count_label = QLabel("")
         self._voice_count_label.setObjectName("metaLabel")
         hdr.addWidget(self._voice_count_label)
+        # Preview progress ("Playing…") takes the count's place while shown.
+        self._preview_status = QLabel("")
+        self._preview_status.setObjectName("metaLabel")
+        self._preview_status.hide()
+        hdr.addWidget(self._preview_status)
+        self._get_voices_btn = QPushButton("+ Get voices")
+        self._get_voices_btn.setObjectName("headerLinkButton")
+        self._get_voices_btn.setToolTip(
+            "Download free offline voices that work without internet")
+        hdr.addWidget(self._get_voices_btn)
         ly.addLayout(hdr)
+
+        # Where the voice comes from: Microsoft's online service, an offline
+        # neural voice (Piper), or a voice built into the operating system.
+        tabs = QFrame()
+        tabs.setObjectName("sourceTabs")
+        tl = QHBoxLayout(tabs)
+        tl.setContentsMargins(1, 1, 1, 1)
+        tl.setSpacing(1)
+        self._source_group = QButtonGroup(self)
+        self._source_group.setExclusive(True)
+        self._source_buttons: dict[str, QPushButton] = {}
+        for key, label, tip in _SOURCE_TABS:
+            btn = _SourceTab(label)
+            btn.setObjectName("sourceTab")
+            btn.setCheckable(True)
+            btn.setToolTip(tip)
+            btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            btn.setProperty("sourceKey", key)
+            self._source_group.addButton(btn)
+            self._source_buttons[key] = btn
+            tl.addWidget(btn, 1)
+        self._source_buttons[""].setChecked(True)
+        ly.addWidget(tabs)
 
         # Search gets its own full-width row; the filters share the next one.
         # Packing all three onto one row let the language combo's sizeHint
@@ -397,7 +432,27 @@ class OutputPanel(QWidget):
         self._voice_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self._voice_combo.setMinimumContentsLength(12)
         self._voice_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        ly.addWidget(self._voice_combo)
+
+        # Preview sits beside the picker rather than on a row of its own:
+        # every row here is a row a short window cannot show.
+        voice_row = QHBoxLayout()
+        voice_row.setSpacing(5)
+        voice_row.addWidget(self._voice_combo, 1)
+
+        self._preview_btn = QPushButton("▶")
+        self._preview_btn.setObjectName("previewIconButton")
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.setToolTip("Preview — play a short sample of this voice")
+        self._preview_btn.setAccessibleName("Preview voice")
+        voice_row.addWidget(self._preview_btn)
+
+        self._stop_preview_btn = QPushButton("■")
+        self._stop_preview_btn.setObjectName("stopPreviewButton")
+        self._stop_preview_btn.setToolTip("Stop the preview")
+        self._stop_preview_btn.setAccessibleName("Stop preview")
+        self._stop_preview_btn.hide()
+        voice_row.addWidget(self._stop_preview_btn)
+        ly.addLayout(voice_row)
 
         self._voice_warning = QFrame()
         self._voice_warning.setObjectName("voiceWarning")
@@ -428,26 +483,6 @@ class OutputPanel(QWidget):
         self._retry_voices_btn.hide()
         ly.addWidget(self._retry_voices_btn, alignment=Qt.AlignLeft)
 
-        # Preview row
-        prev = QHBoxLayout()
-        prev.setSpacing(6)
-
-        self._preview_btn = QPushButton("▶  Preview Voice")
-        self._preview_btn.setObjectName("previewButton")
-        self._preview_btn.setEnabled(False)
-        self._preview_btn.setToolTip("Play a short sample through your speakers")
-        prev.addWidget(self._preview_btn)
-
-        self._stop_preview_btn = QPushButton("■  Stop")
-        self._stop_preview_btn.setObjectName("cancelButton")
-        self._stop_preview_btn.setFixedHeight(30)
-        self._stop_preview_btn.hide()
-        prev.addWidget(self._stop_preview_btn)
-
-        self._preview_status = QLabel("")
-        self._preview_status.setObjectName("metaLabel")
-        prev.addWidget(self._preview_status, 1)
-        ly.addLayout(prev)
 
         return card
 
@@ -702,6 +737,8 @@ class OutputPanel(QWidget):
         )
         self._lang_combo.currentIndexChanged.connect(self._on_filter_changed)
         self._gender_combo.currentIndexChanged.connect(self._on_filter_changed)
+        self._source_group.buttonClicked.connect(lambda _btn: self._on_filter_changed())
+        self._get_voices_btn.clicked.connect(self._open_voice_manager)
         self._voice_combo.currentIndexChanged.connect(self._on_voice_selection_changed)
 
         # Speed
@@ -767,6 +804,9 @@ class OutputPanel(QWidget):
         idx = self._gender_combo.findText(self._settings.gender_filter)
         if idx >= 0:
             self._gender_combo.setCurrentIndex(idx)
+        btn = self._source_buttons.get(self._settings.source_filter)
+        if btn is not None:
+            btn.setChecked(True)
 
     # ------------------------------------------------------------------ #
     # Voice loading                                                        #
@@ -801,6 +841,7 @@ class OutputPanel(QWidget):
         self._lang_combo.setEnabled(False)
         self._gender_combo.setEnabled(False)
         self._preview_btn.setEnabled(False)
+        self._voice_combo.setToolTip("")
         self._voice_count_label.setText("Connecting…")
 
         self._voice_loader = VoiceLoaderWorker(
@@ -833,13 +874,27 @@ class OutputPanel(QWidget):
         self._gender_combo.setEnabled(True)
         self._apply_filters()
 
+        self._update_source_tabs()
         loader = self._voice_loader
-        if loader is not None and getattr(loader, "from_cache", False):
+        if loader is not None and getattr(loader, "online_unavailable", False):
+            self._voice_error_label.setText(
+                "No internet — showing the voices on this computer. Microsoft "
+                "online voices come back when you reconnect and click Retry."
+            )
+            self._voice_error_label.setToolTip("")
+            self._voice_error_label.show()
+            self._retry_voices_btn.show()
+            if self._settings.source_filter == SOURCE_ONLINE:
+                self._source_buttons[""].setChecked(True)
+                self._settings.source_filter = ""
+                self._apply_filters()
+            self.status_message.emit("Offline — using voices on this computer")
+        elif loader is not None and getattr(loader, "from_cache", False):
             # Offline: the picker works from the saved list, but generating
             # needs the service — say so rather than fail at Generate.
             self._voice_error_label.setText(
-                "Offline — showing your saved voice list. Generating audio "
-                "needs an internet connection."
+                "Offline — online voices need an internet connection. Offline "
+                "and Built-in voices still work."
             )
             self._voice_error_label.show()
             self._retry_voices_btn.show()
@@ -864,14 +919,18 @@ class OutputPanel(QWidget):
     def _on_filter_changed(self) -> None:
         self._settings.language_filter = self._lang_combo.currentData(Qt.UserRole) or ""
         self._settings.gender_filter   = self._gender_combo.currentText()
+        self._settings.source_filter   = self._current_source_filter()
         self._filter_timer.start()   # also debounced — consistent path
 
     def _apply_filters(self) -> None:
         query  = self._search_edit.text().lower().strip()
         locale = self._lang_combo.currentData(Qt.UserRole) or ""
         gender = self._gender_combo.currentText()
+        source = self._current_source_filter()
 
         filtered = self._all_voices
+        if source:
+            filtered = [v for v in filtered if v.source == source]
         if locale:
             filtered = [v for v in filtered if v.locale == locale]
         if gender != "All":
@@ -883,7 +942,8 @@ class OutputPanel(QWidget):
                     or query in v.friendly_name.lower()
                     or query in v.locale.lower()
                     or query in _locale_label(v.locale).lower()
-                    or query in v.gender.lower())
+                    or query in v.gender.lower()
+                    or query in v.source_label.lower())
             ]
 
         self._filtered_voices = filtered
@@ -897,7 +957,14 @@ class OutputPanel(QWidget):
         self._voice_combo.clear()
 
         if not self._filtered_voices:
-            self._voice_combo.addItem("No voices match your search")
+            source = self._current_source_filter()
+            if source == SOURCE_PIPER and not any(v.source == SOURCE_PIPER for v in self._all_voices):
+                empty = "No offline voices yet — click + Get voices"
+            elif source and not any(v.source == source for v in self._all_voices):
+                empty = "No voices of this kind on this computer"
+            else:
+                empty = "No voices match your search"
+            self._voice_combo.addItem(empty)
             self._voice_combo.setEnabled(False)
             self._preview_btn.setEnabled(False)
             self._voice_count_label.setText("0 voices")
@@ -927,16 +994,31 @@ class OutputPanel(QWidget):
                 if v.short_name == saved_voice:
                     restore = self._voice_combo.count() - 1
 
+        # Group by source (Online, Offline, Built-in) when more than one is
+        # listed, under disabled header rows like "Recently Used".
+        rest.sort(key=lambda v: _SOURCE_ORDER.get(v.source, 9))
+        grouped = len({v.source for v in rest}) > 1
+        first_real = 1 if recent_in else -1
+        current_source = None
         for v in rest:
+            if grouped and v.source != current_source:
+                current_source = v.source
+                self._voice_combo.addItem(f"── {_SOURCE_HEADERS.get(v.source, v.source)} ──")
+                item = self._voice_combo.model().item(self._voice_combo.count() - 1)
+                if item:
+                    item.setEnabled(False)
+                    item.setForeground(Qt.darkGray)
             self._voice_combo.addItem(_voice_display(v))
             self._voice_combo.setItemData(
                 self._voice_combo.count() - 1, v.short_name, _ROLE_SHORT_NAME
             )
+            if first_real < 0:
+                first_real = self._voice_combo.count() - 1
             if v.short_name == saved_voice and restore < 0:
                 restore = self._voice_combo.count() - 1
 
         if restore < 0:
-            restore = 1 if recent_in else 0
+            restore = max(0, first_real)
         self._voice_combo.setCurrentIndex(restore)
         self._voice_combo.setEnabled(True)
         self._voice_combo.blockSignals(False)
@@ -955,7 +1037,56 @@ class OutputPanel(QWidget):
         selected = self.get_selected_voice()
         if selected:
             self._settings.voice = selected
+        if not self._stop_preview_btn.isVisible():
+            # A stale "Preview unavailable" belongs to the previous voice.
+            self._set_preview_status("")
+        self._refresh_source_note()
         self._refresh_voice_guidance()
+
+    def _current_source_filter(self) -> str:
+        btn = self._source_group.checkedButton()
+        return (btn.property("sourceKey") or "") if btn is not None else ""
+
+    def _update_source_tabs(self) -> None:
+        """Show how many voices each source offers in the tab tooltips."""
+        counts: dict[str, int] = {}
+        for v in self._all_voices:
+            counts[v.source] = counts.get(v.source, 0) + 1
+        for key, _label, tip in _SOURCE_TABS:
+            n = len(self._all_voices) if key == "" else counts.get(key, 0)
+            plural = "" if n == 1 else "s"
+            self._source_buttons[key].setToolTip(f"{tip}\n{n} voice{plural}")
+
+    def _refresh_source_note(self) -> None:
+        """Tooltip on the picker saying what the selected voice needs."""
+        if not self._has_visible_voice():
+            self._voice_combo.setToolTip("")
+            return
+        name = self.get_selected_voice()
+        voice = next((v for v in self._all_voices if v.short_name == name), None)
+        label = _voice_display(voice) if voice else persona_name(name)
+        note = _SOURCE_NOTES.get(source_of(name), "")
+        self._voice_combo.setToolTip(f"{label}\n{note}" if note else label)
+
+    def _set_preview_status(self, text: str, *, tooltip: str = "") -> None:
+        self._preview_status.setText(text)
+        self._preview_status.setToolTip(tooltip)
+        self._preview_status.setVisible(bool(text))
+        self._voice_count_label.setVisible(not text)
+
+    def _open_voice_manager(self) -> None:
+        from app.ui.dialogs.voice_manager_dialog import VoiceManagerDialog
+
+        dialog = VoiceManagerDialog(self)
+        dialog.exec()
+        if dialog.changed:
+            if dialog.last_installed:
+                # Show the voice just downloaded.
+                self._settings.voice = dialog.last_installed
+                self._settings.source_filter = SOURCE_PIPER
+                self._source_buttons[SOURCE_PIPER].setChecked(True)
+                self._settings.language_filter = ""
+            self._start_voice_load()
 
     def _refresh_voice_guidance(self) -> None:
         if not self._all_voices:
@@ -1064,6 +1195,10 @@ class OutputPanel(QWidget):
             all_idx = self._gender_combo.findText("All")
             if all_idx >= 0:
                 self._gender_combo.setCurrentIndex(all_idx)
+        # The voice may be on another source tab (a recommendation can be).
+        if self._current_source_filter() not in ("", voice.source):
+            self._source_buttons[""].setChecked(True)
+            self._settings.source_filter = ""
 
         self._apply_filters()
         for idx in range(self._voice_combo.count()):
@@ -1115,10 +1250,10 @@ class OutputPanel(QWidget):
         rate  = self.get_rate_string()
         self._preview_btn.hide()
         self._stop_preview_btn.show()
-        self._preview_status.setText("Generating preview…")
+        self._set_preview_status("Generating preview…")
         self._preview_worker = PreviewWorker(voice=voice, rate=rate)
         self._preview_worker.started_playing.connect(
-            lambda: self._preview_status.setText("Playing…")
+            lambda: self._set_preview_status("Playing…")
         )
         self._preview_worker.playback_finished.connect(self._on_preview_done)
         self._preview_worker.failed.connect(self._on_preview_failed)
@@ -1131,12 +1266,14 @@ class OutputPanel(QWidget):
     def _on_preview_done(self) -> None:
         self._stop_preview_btn.hide()
         self._preview_btn.show()
-        self._preview_status.setText("")
+        self._set_preview_status("")
+        self._refresh_source_note()
 
     def _on_preview_failed(self, message: str) -> None:
         logger.warning("Preview failed: %s", message)
         self._on_preview_done()
-        self._preview_status.setText("Preview unavailable")
+        self._set_preview_status("Preview unavailable", tooltip=split_error(message).summary)
+        self.status_message.emit("Preview unavailable — " + split_error(message).summary)
 
     # ------------------------------------------------------------------ #
     # Submit generation job                                                #
@@ -2094,6 +2231,25 @@ class _AdaptiveLabelButton(QPushButton):
         self.refresh_label()
 
 
+class _SourceTab(QPushButton):
+    """
+    Segment of the All / Online / Offline / Built-in switch.
+
+    QPushButton's size hint includes the platform's minimum button width
+    (75 px+ on Windows), so four of them overflowed a narrow sidebar.  A tab
+    only needs its label plus the stylesheet padding.
+    """
+
+    def sizeHint(self):  # noqa: N802 - Qt override
+        hint = super().sizeHint()
+        fm = self.fontMetrics()
+        hint.setWidth(fm.horizontalAdvance(self.text()) + 16)
+        return hint
+
+    def minimumSizeHint(self):  # noqa: N802 - Qt override
+        return self.sizeHint()
+
+
 class _ElidingLabel(QLabel):
     """
     Single-line label that elides overflow instead of forcing its parent wider.
@@ -2185,12 +2341,44 @@ def _field_label(text: str) -> QLabel:
     return lbl
 
 
+_SOURCE_TABS = (
+    ("", "All", "Every voice"),
+    (SOURCE_ONLINE, "Online", "Microsoft neural voices — best quality, need internet"),
+    (SOURCE_PIPER, "Offline", "Offline neural voices — natural sound, no internet needed"),
+    (SOURCE_SYSTEM, "Built-in", "Voices built into your computer (Cortana, David, Zira…)"),
+)
+_SOURCE_ORDER = {SOURCE_ONLINE: 0, SOURCE_PIPER: 1, SOURCE_SYSTEM: 2}
+_SOURCE_HEADERS = {
+    SOURCE_ONLINE: "Microsoft Online",
+    SOURCE_PIPER: "Offline Neural",
+    SOURCE_SYSTEM: "Built into this computer",
+}
+_SOURCE_NOTES = {
+    SOURCE_ONLINE: "Online voice · needs internet",
+    SOURCE_PIPER: "Offline voice · runs on this computer, no internet needed",
+    SOURCE_SYSTEM: "Built-in voice · works offline",
+}
+_SOURCE_TAGS = {SOURCE_PIPER: "Offline", SOURCE_SYSTEM: "Built-in"}
+
+
 def _voice_display(v: Voice) -> str:
-    return f"{v.persona}  ·  {v.gender}  ·  {_locale_label(v.locale)}"
+    # The source tag goes right after the name so a narrow picker, which
+    # elides the end, still shows whether the voice needs internet.
+    parts = [v.persona]
+    tag = _SOURCE_TAGS.get(v.source)
+    if tag:
+        parts.append(tag)
+    if v.gender:
+        parts.append(v.gender)
+    parts.append(_locale_label(v.locale))
+    return "  ·  ".join(parts)
 
 
 def _job_voice_display(short_name: str) -> str:
     """Compact 'Andrew (Multilingual) · English (US)' label for a job row."""
+    tag = _SOURCE_TAGS.get(source_of(short_name))
+    if tag:
+        return f"{persona_name(short_name)} · {tag}"
     parts  = short_name.split("-")
     locale = "-".join(parts[:2]) if len(parts) >= 2 else short_name
     return f"{persona_name(short_name)} · {_locale_label(locale)}"

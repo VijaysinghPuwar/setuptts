@@ -3,12 +3,14 @@
 import asyncio
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
 from app.models.voice import Voice
+from app.services.local_tts import list_local_voices
 from app.services.tts_service import list_voices
 
 logger = logging.getLogger(__name__)
@@ -29,8 +31,13 @@ class VoiceLoaderWorker(QThread):
 
     Signals
     -------
-    loaded(list[Voice])    Voice list (live, or the saved copy)
+    loaded(list[Voice])    Voice list (live, or the saved copy) plus the
+                           voices installed on this computer
     failed(str)            User-friendly error message
+
+    Voices on this computer (OS built-in and offline Piper voices) are listed
+    in parallel and always included, so with no internet at all the picker
+    still offers them (``online_unavailable`` is then set).
     """
 
     loaded = Signal(list)
@@ -40,8 +47,24 @@ class VoiceLoaderWorker(QThread):
         super().__init__(parent)
         self._cache_path = cache_path
         self.from_cache = False
+        self.online_unavailable = False
 
     def run(self) -> None:
+        local: list[Voice] = []
+
+        def _load_local() -> None:
+            try:
+                local.extend(_to_voices(list_local_voices()))
+            except Exception:  # noqa: BLE001
+                logger.warning("Listing local voices failed", exc_info=True)
+
+        local_thread = threading.Thread(target=_load_local, name="local-voices", daemon=True)
+        local_thread.start()
+
+        def _local() -> list[Voice]:
+            local_thread.join(40)
+            return list(local)
+
         last_exc: Exception | None = None
         for attempt in range(_ATTEMPTS):
             if attempt:
@@ -55,7 +78,7 @@ class VoiceLoaderWorker(QThread):
                     raise ValueError("The speech service returned an empty voice list")
                 logger.info("Loaded %d voices", len(voices))
                 self._save_cache(voices)
-                self.loaded.emit(voices)
+                self.loaded.emit(voices + _local())
                 return
             except Exception as exc:
                 last_exc = exc
@@ -67,7 +90,13 @@ class VoiceLoaderWorker(QThread):
         if cached:
             logger.info("Using %d voices from the saved voice list", len(cached))
             self.from_cache = True
-            self.loaded.emit(cached)
+            self.loaded.emit(cached + _local())
+            return
+        local_now = _local()
+        if local_now:
+            logger.info("Online voices unavailable; offering %d local voices", len(local_now))
+            self.online_unavailable = True
+            self.loaded.emit(local_now)
             return
         self.failed.emit(
             "Couldn't load the voice list. Please check your internet "
@@ -86,7 +115,8 @@ class VoiceLoaderWorker(QThread):
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._cache_path.with_name(self._cache_path.name + ".tmp")
-            tmp.write_text(json.dumps([v.to_edge_dict() for v in voices]), encoding="utf-8")
+            online = [v.to_edge_dict() for v in voices if not v.is_local]
+            tmp.write_text(json.dumps(online), encoding="utf-8")
             tmp.replace(self._cache_path)
         except OSError:
             logger.warning("Could not save the voice list cache", exc_info=True)
@@ -95,7 +125,8 @@ class VoiceLoaderWorker(QThread):
         if self._cache_path is None or not self._cache_path.exists():
             return []
         try:
-            return _to_voices(json.loads(self._cache_path.read_text(encoding="utf-8")))
+            cached = _to_voices(json.loads(self._cache_path.read_text(encoding="utf-8")))
+            return [v for v in cached if not v.is_local]
         except (OSError, ValueError, TypeError):
             logger.warning("Saved voice list is unreadable", exc_info=True)
             return []

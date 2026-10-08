@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "setuptts"
-version = "1.6.2"
+version = "1.7.0"
 description = "Professional text-to-audio desktop application"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6>=6.11,<6.12",
     "edge-tts>=7.2,<8",
     "platformdirs>=4.0.0",
+    "piper-tts>=1.8,<2",
+    "onnxruntime>=1.20,<2",
+    "lameenc>=1.8,<2",
 ]
 
 [project.optional-dependencies]

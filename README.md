@@ -5,7 +5,8 @@
 <h1 align="center">SetupTTS</h1>
 
 <p align="center">
-  A desktop app that turns text into MP3 audio with Microsoft's neural voices,<br>
+  A desktop app that turns text into MP3 audio with Microsoft's neural voices,
+  free offline voices and your computer's built-in voices,<br>
   built to finish 12-hour audiobooks without silently losing a sentence.
 </p>
 
@@ -14,7 +15,7 @@
   <a href="../../actions/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/VijaysinghPuwar/setuptts/build.yml?label=build"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-555">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12-3776AB">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-382%20passing-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-450%20passing-2ea44f">
 </p>
 
 <p align="center">
@@ -40,6 +41,14 @@ The apps are not code-signed. On macOS, the first launch may need **System Setti
 
 Paste text or open a `.txt` file, pick one of 300+ voices in 70+ languages, and export an MP3. Short clips take seconds; a full book runs in the background with live progress, and can be stopped and resumed later — even after closing the app.
 
+Three kinds of voices, all in one picker (**All · Online · Offline · Built-in**):
+
+| Voices | Needs internet | What you get |
+|--------|----------------|--------------|
+| **Online** — Microsoft neural | Yes | 300+ voices in 70+ languages, best quality |
+| **Offline** — [Piper](https://github.com/rhasspy/piper) neural | No | One English voice included; ~170 more in ~50 languages one click away in **+ Get voices** |
+| **Built-in** — your OS | No | Windows: Cortana, David, Zira, Mark and any installed SAPI / Narrator voice. macOS: every system voice |
+
 The hard part is not calling a speech API; it is making a **multi-hour job over an unreliable connection** come out complete. The service accepts a few thousand characters per request, so a book becomes a few hundred requests, any of which can time out, return nothing, or — worst of all — end early without an error. SetupTTS treats every one of those as a normal event and refuses to hand over a file it cannot prove is complete.
 
 ---
@@ -51,7 +60,7 @@ The hard part is not calling a speech API; it is making a **multi-hour job over 
 - **Fail-closed assembly.** Before the MP3 is written, the ranges must tile the source text exactly (no gaps, no overlaps), every chunk file must exist with the recorded size, the assembled byte count must match, and the audio length must be plausible for the text. The length check runs on a temporary file *before* it replaces anything, so a bad result can never overwrite an existing good file.
 - **Adaptive recovery.** Retries with exponential backoff and a fresh connection each time; sections that keep failing are split into smaller sub-ranges whose union must equal the original range exactly.
 - **Responsive UI during long work.** Generation runs on `QThread` workers with their own `asyncio` loops; the UI thread only receives throttled progress signals. Up to two jobs run concurrently with per-destination conflict checks.
-- **Tested as shipped.** 382 automated tests, including 12-hour-scale simulations and regression tests that fail on the pre-fix code. CI also launches the *packaged* apps — the macOS bundle, the app inside the DMG, the app installed by the real Windows installer, and the portable EXE — and has each one load the voice list and synthesise a verified sample.
+- **Tested as shipped.** 450 automated tests, including 12-hour-scale simulations and regression tests that fail on the pre-fix code. CI also launches the *packaged* apps — the macOS bundle, the app inside the DMG, the app installed by the real Windows installer, and the portable EXE — and has each one load the voice list and synthesise a verified sample.
 
 ---
 

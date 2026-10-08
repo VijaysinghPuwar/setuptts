@@ -10,3 +10,10 @@ edge-tts==7.2.8
 aiohttp==3.13.3
 platformdirs==4.9.4
 certifi==2026.2.25
+#  - Offline voices: piper-tts runs Piper voice models on onnxruntime (CPU);
+#    onnxruntime 1.30 wheels need macOS 14+, within the app's macOS 15 floor.
+#    lameenc encodes offline / built-in voice audio to MP3.
+piper-tts==1.8.0
+onnxruntime==1.30.0
+numpy==2.5.3
+lameenc==1.8.4

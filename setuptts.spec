@@ -75,6 +75,21 @@ _fzl_d, _fzl_b, _fzl_h = collect_all("frozenlist")
 _mdi_d, _mdi_b, _mdi_h = collect_all("multidict")
 _yrl_d, _yrl_b, _yrl_h = collect_all("yarl")
 
+# Offline voices: Piper (native espeak-ng bridge + its espeak-ng-data folder),
+# the ONNX runtime that runs the voice models, and numpy, which both use.
+# lameenc encodes local-voice audio to MP3.
+_pip_d, _pip_b, _pip_h = collect_all("piper")
+# Unused parts of piper: the Hebrew phonemizer model (21 MB; Hebrew voices are
+# not offered), training code and the HTTP server's templates.
+_PIPER_UNUSED = ("hebrew", "train", "templates")
+_pip_d = [(src, dst) for src, dst in _pip_d
+          if not any(part in Path(dst).parts for part in _PIPER_UNUSED)]
+_pip_h = [m for m in _pip_h
+          if not any(m.startswith(f"piper.{part}") for part in _PIPER_UNUSED)
+          and m not in ("piper.http_server", "piper.phonemize_hebrew")]
+_onx_d, _onx_b, _onx_h = collect_all("onnxruntime")
+_lam_d, _lam_b, _lam_h = collect_all("lameenc")
+
 # ── Hidden imports ────────────────────────────────────────────────── #
 # PyInstaller's static analysis misses dynamically-imported submodules.
 # edge_tts uses aiohttp for all HTTP/WebSocket connections.
@@ -83,6 +98,8 @@ _hidden = [
     *collect_submodules("edge_tts"),
     # aiohttp + all its dependencies (collected above via collect_all)
     *_aio_h, *_sig_h, *_fzl_h, *_mdi_h, *_yrl_h,
+    *_pip_h, *_onx_h, *_lam_h,
+    "piper", "piper.voice", "onnxruntime", "numpy", "lameenc", "wave",
     "aiohttp", "aiosignal", "frozenlist", "multidict", "yarl",
     "attrs", "attr",
     # async runtime
@@ -122,12 +139,14 @@ a = Analysis(
     binaries=[
         # C extension binaries for aiohttp dependencies
         *_aio_b, *_sig_b, *_fzl_b, *_mdi_b, *_yrl_b,
+        *_pip_b, *_onx_b, *_lam_b,
     ],
     datas=[
-        (str(ROOT / "app" / "assets"), "app/assets"),
+        (str(ROOT / "app" / "assets"), "app/assets"),   # includes the bundled Piper voice
         *edge_tts_datas,
         *certifi_datas,
         *_aio_d, *_sig_d, *_fzl_d, *_mdi_d, *_yrl_d,
+        *_pip_d, *_onx_d, *_lam_d,
     ],
     hiddenimports=_hidden,
     hookspath=[],
@@ -152,7 +171,6 @@ a = Analysis(
         "PySide6.QtTest",
         # Large data-science packages
         "matplotlib",
-        "numpy",
         "pandas",
         "scipy",
         "PIL",

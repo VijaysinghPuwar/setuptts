@@ -18,6 +18,7 @@ _DEFAULTS: dict[str, Any] = {
     "volume": 0,                    # integer -50..+50
     "language_filter": "en-US",
     "gender_filter": "All",         # "All" | "Female" | "Male"
+    "source_filter": "",            # "" (all) | "online" | "piper" | "system"
     "voice_search": "",             # last search query (cleared on start)
     "recently_used_voices": [],     # list of ShortName strings, max 5
     "auto_switch_recommended_voice": False,
@@ -197,6 +198,15 @@ class AppSettings:
     @gender_filter.setter
     def gender_filter(self, value: str) -> None:
         self._data["gender_filter"] = value
+
+    @property
+    def source_filter(self) -> str:
+        value = self._data.get("source_filter", "")
+        return value if value in ("", "online", "piper", "system") else ""
+
+    @source_filter.setter
+    def source_filter(self, value: str) -> None:
+        self._data["source_filter"] = value
 
     @property
     def recently_used_voices(self) -> list[str]:
