@@ -540,6 +540,45 @@ def test_catalog_falls_back_to_cache_when_offline(tmp_path, monkeypatch):
         piper_tts.fetch_catalog()
 
 
+def test_long_phoneme_runs_are_capped_at_word_gaps():
+    words = ["a", "b", "c", " "] * 200
+    pieces = piper_tts._cap_phonemes(words, limit=50)
+    assert all(len(p) <= 50 for p in pieces)
+    assert all(p[0] != " " for p in pieces)
+    # Nothing lost except the gaps it split at.
+    assert sum(len(p) for p in pieces) >= len(words) - len(pieces)
+    giant = ["x"] * 175
+    assert [len(p) for p in piper_tts._cap_phonemes(giant, limit=50)] == [50, 50, 50, 25]
+    assert piper_tts._cap_phonemes(["a"] * 10, limit=50) == [["a"] * 10]
+
+
+@pytest.mark.real_local_voices
+def test_real_piper_memory_stays_bounded_on_unpunctuated_text():
+    if not piper_tts.piper_available() or piper_tts.model_path(piper_tts.BUNDLED_VOICE) is None:
+        pytest.skip("bundled Piper voice not present")
+    synth = piper_tts.PiperSynthesizer(piper_tts.PIPER_PREFIX + piper_tts.BUNDLED_VOICE)
+    # Without the phoneme cap this one call held ~3 GB.
+    pcm = synth.synthesize("1234567890 " * 60, "+0%")
+    assert len(pcm) / 2 / synth.sample_rate > 30
+
+
+def test_piper_voice_cache_is_bounded(monkeypatch, tmp_path):
+    import types
+
+    loads = []
+    fake = types.SimpleNamespace(PiperVoice=types.SimpleNamespace(
+        load=lambda path, download_dir=None: loads.append(path) or types.SimpleNamespace()))
+    monkeypatch.setitem(sys.modules, "piper", fake)
+    monkeypatch.setattr(piper_tts, "_LOADED", piper_tts.OrderedDict())
+    monkeypatch.setattr(piper_tts, "user_dir", lambda: tmp_path)
+    monkeypatch.setattr(piper_tts, "_MAX_LOADED", 2)
+    for name in ("a", "b", "a", "c", "a", "b"):
+        piper_tts._load(tmp_path / f"{name}.onnx")
+    assert len(piper_tts._LOADED) == 2
+    # "a" was kept hot by reuse; "b" was evicted by "c" and loaded again.
+    assert [Path(p).stem for p in loads] == ["a", "b", "c", "b"]
+
+
 def test_piper_synthesizer_reports_a_missing_model(piper_user_dir):
     with pytest.raises(piper_tts.PiperError, match="not installed"):
         piper_tts.PiperSynthesizer("piper:en_US-nothere-low")

@@ -21,6 +21,7 @@ import ssl
 import threading
 import time
 import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -320,18 +321,31 @@ def remove_voice(key: str) -> bool:
 #  Synthesis                                                             #
 # ══════════════════════════════════════════════════════════════════════ #
 
-_LOADED: dict[str, object] = {}
+# Loaded voices, most recently used last.  Each holds ~400 MB once it has run
+# (onnxruntime keeps its memory arena, which is ~35% faster than without), so
+# only the last one used stays cached.  A job keeps its own reference, so
+# evicting a voice never disturbs one in progress — it is freed when that
+# job ends.
+_LOADED: "OrderedDict[str, object]" = OrderedDict()
 _LOADED_LOCK = threading.Lock()
+_MAX_LOADED = 1
 _PHONEMIZE_LOCK = threading.Lock()
 
 
 def _load(path: Path):
+    key = str(path)
     with _LOADED_LOCK:
-        voice = _LOADED.get(str(path))
+        voice = _LOADED.get(key)
         if voice is None:
             from piper import PiperVoice
-            voice = PiperVoice.load(str(path), download_dir=str(user_dir()))
-            _LOADED[str(path)] = voice
+            voice = PiperVoice.load(key, download_dir=str(user_dir()))
+            # Runs of one model take turns (see PiperSynthesizer.synthesize).
+            voice.setuptts_run_lock = threading.Lock()
+            _LOADED[key] = voice
+            while len(_LOADED) > _MAX_LOADED:
+                _LOADED.popitem(last=False)
+        else:
+            _LOADED.move_to_end(key)
         return voice
 
 
@@ -344,6 +358,31 @@ class PiperCancelled(PiperError):
 
 
 _RATE_RE = re.compile(r"\s*([+-]?\d+)\s*%\s*")
+
+
+#: Longest phoneme run sent to the model at once (~40-60 words).  The model's
+#: memory grows steeply with input length and onnxruntime keeps the peak, so
+#: one long unpunctuated run (a list of numbers, a table pasted as text) took
+#: the app past 3 GB.  Ordinary sentences are far below this.
+_MAX_PHONEMES = 250
+
+
+def _cap_phonemes(phonemes: list[str], limit: int = _MAX_PHONEMES) -> list[list[str]]:
+    """Split an over-long sentence at word gaps (or hard, for one giant word)."""
+    if len(phonemes) <= limit:
+        return [phonemes]
+    pieces: list[list[str]] = []
+    start = 0
+    while len(phonemes) - start > limit:
+        cut = start + limit
+        space = max((i for i in range(start + limit // 2, cut) if phonemes[i] == " "), default=None)
+        if space is not None:
+            cut = space
+        pieces.append(phonemes[start:cut])
+        start = cut + 1 if space is not None else cut
+    if start < len(phonemes):
+        pieces.append(phonemes[start:])
+    return [p for p in pieces if p]
 
 
 class PiperSynthesizer:
@@ -364,6 +403,7 @@ class PiperSynthesizer:
         except Exception as exc:  # noqa: BLE001
             raise PiperError(f"Could not load the offline voice “{display_name(key)}”: {exc}") from exc
         self.sample_rate = int(self._voice.config.sample_rate)
+        self._run_lock = getattr(self._voice, "setuptts_run_lock", None) or threading.Lock()
         self._cancelled = False
 
     def synthesize(self, text: str, rate: str) -> bytes:
@@ -379,18 +419,28 @@ class PiperSynthesizer:
         # job and a preview) phonemizing at once can crash it.  Inference
         # itself is thread-safe and runs unlocked.
         with _PHONEMIZE_LOCK:
-            sentences = self._voice.phonemize(text)
+            # (phonemes, ends_sentence): a split sentence gets no pause
+            # between its pieces, so it still sounds like one sentence.
+            pieces = [(piece, i == len(split) - 1)
+                      for sentence in self._voice.phonemize(text)
+                      for split in [_cap_phonemes(sentence)]
+                      for i, piece in enumerate(split)]
         # A short pause between sentences: Piper returns each sentence
         # trimmed, and joined back-to-back they run together.
         gap = bytes(2 * int(self.sample_rate * 0.12))
         parts = []
-        for phonemes in sentences:
+        for phonemes, ends_sentence in pieces:
             if self._cancelled:
                 raise PiperCancelled("cancelled")
             if not phonemes:
                 continue
             ids = self._voice.phonemes_to_ids(phonemes)
-            audio = self._voice.phoneme_ids_to_audio(ids, cfg)
+            # One run at a time per model: concurrent runs each need their own
+            # working memory and onnxruntime keeps every peak (two jobs and a
+            # preview on one voice reached 1.2 GB), while a single run already
+            # uses every CPU core, so taking turns costs no throughput.
+            with self._run_lock:
+                audio = self._voice.phoneme_ids_to_audio(ids, cfg)
             if isinstance(audio, tuple):
                 audio = audio[0]
             audio = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -399,7 +449,8 @@ class PiperSynthesizer:
                 continue
             audio = np.clip(audio / peak * 32767.0, -32767, 32767).astype("<i2")
             parts.append(audio.tobytes())
-            parts.append(gap)
+            if ends_sentence:
+                parts.append(gap)
         return b"".join(parts)
 
     def cancel(self) -> None:
