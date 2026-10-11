@@ -26,6 +26,7 @@ from app.services.local_tts import (
     make_synthesizer,
 )
 from app.services.tts_quality import build_text_profile
+from app.utils.power import keep_awake
 from app.workers.tts_worker import JobTelemetry, _split_text
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,11 @@ class LocalTTSWorker(QThread):
     # ------------------------------------------------------------------ #
 
     def run(self) -> None:
+        # Hours-long jobs must not be cut by the computer idle-sleeping.
+        with keep_awake():
+            self._run_job()
+
+    def _run_job(self) -> None:
         start = time.monotonic()
         writer: Mp3Writer | None = None
         synth = None

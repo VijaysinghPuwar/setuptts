@@ -42,11 +42,14 @@ from app.services.tts_quality import (
 )
 from app.services.tts_service import (
     DEFAULT_CONNECT_TIMEOUT_S,
+    SPEECH_HOST,
     build_communicate,
     list_voices,
+    system_proxy,
 )
 from app.utils.mp3_duration import mp3_duration_seconds
 from app.utils.paths import AppPaths
+from app.utils.power import keep_awake
 from app.workers.chunk_store import (
     ChunkStore,
     CoverageError,
@@ -138,6 +141,19 @@ _ADAPTIVE_SHRINK_FACTOR = 0.82
 _SLOW_CHUNK_MULTIPLIER = 1.5
 _HEALTHY_GROWTH_FACTOR = 1.18
 _EARLY_TIMEOUT_RECOVERY_ATTEMPTS = 2
+
+# ── Network outages ─────────────────────────────────────────────────────── #
+# Failures that may just mean the connection is gone (Wi-Fi dropped, the
+# computer woke from sleep).  Each one is followed by a quick reachability
+# probe; only when the service really is unreachable does the job wait.
+_OUTAGE_FAILURE_KINDS = frozenset({
+    "dns", "network", "timeout_after_audio", "timeout_waiting_for_audio",
+})
+_OUTAGE_MAX_WAIT_S = 30 * 60
+_OUTAGE_POLL_S = (3.0, 5.0, 10.0, 15.0, 30.0)
+_OUTAGE_PROBE_TIMEOUT_S = 6.0
+# A connection that flaps up and down must still end in a clear failure.
+_OUTAGE_MAX_WAITS_PER_CHUNK = 12
 
 # Full-width CJK sentence/clause marks are not followed by a space, so they
 # must be split points on their own; requiring "\s+" sent every Chinese or
@@ -1031,11 +1047,34 @@ def _disk_problem_text(exc: BaseException | None, *, output: bool = False) -> st
     return "A problem occurred while writing to the disk."
 
 
+async def _service_reachable() -> bool:
+    """True when a TCP connection to the speech service can be opened."""
+    if system_proxy():
+        # Behind a proxy the service host may not resolve directly; a failed
+        # probe would mean nothing, so leave it to the normal retries.
+        return True
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(SPEECH_HOST, 443),
+            _OUTAGE_PROBE_TIMEOUT_S,
+        )
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return True
+
+
 def _estimate_total_chunks(
     chunk_idx: int,
     source_start: int,
     source_end: int,
     total_chars: int,
+    *,
+    typical_len: int | None = None,
 ) -> int:
     """
     Estimated chunk count for the whole job, for "chunk N of ~M" labels.
@@ -1044,7 +1083,7 @@ def _estimate_total_chunks(
     its size already reflects the payload limit (which binds well before the
     character ceiling) and the adaptive ramp.
     """
-    current_len = max(source_end - source_start, 1)
+    current_len = max(source_end - source_start, typical_len or 0, 1)
     remaining = max(total_chars - source_start, current_len)
     return max(chunk_idx + 1, chunk_idx + math.ceil(remaining / current_len))
 
@@ -1172,6 +1211,11 @@ class TTSWorker(QThread):
                 pass
 
     def run(self) -> None:
+        # Hours-long jobs must not be cut by the computer idle-sleeping.
+        with keep_awake():
+            self._run_job()
+
+    def _run_job(self) -> None:
         start = time.monotonic()
 
         if sys.platform == "win32":
@@ -1540,6 +1584,9 @@ class TTSWorker(QThread):
                 # chunk 150 of 210 was reported as "chunk 150/150".)
                 estimated_total = _estimate_total_chunks(
                     chunk_idx, source_start, source_end, total_chars,
+                    # The warm-up probe is cut tiny on purpose; extrapolating
+                    # from it read "chunk 1/4955" on a 187-chunk job.
+                    typical_len=chunk_plan.ramp_chars if chunk_idx == 0 else None,
                 )
 
                 chunk_number = chunk_idx + 1
@@ -2042,11 +2089,14 @@ class TTSWorker(QThread):
         chunk_start = time.monotonic()
         failure_kinds: set[str] = set()
 
-        for attempt in range(_MAX_ATTEMPTS):
+        attempt = 0
+        outage_waits = 0
+        after_outage = False
+        while attempt < _MAX_ATTEMPTS:
             if self._cancelled:
                 raise asyncio.CancelledError()
 
-            if attempt > 0:
+            if attempt > 0 and not after_outage:
                 wait = _BACKOFF_BASE * (2 ** (attempt - 1))
                 logger.warning(
                     "%s attempt %d/%d failed: %s — retrying in %.0f s",
@@ -2062,6 +2112,7 @@ class TTSWorker(QThread):
                     f"Retry {attempt}/{_MAX_ATTEMPTS - 1} on {chunk_label} — waiting {wait:.0f} s before a fresh connection",
                 )
                 await asyncio.sleep(wait)
+            after_outage = False
 
             try:
                 timeout_s = self._chunk_timeout_for(text_chunk, self._rate)
@@ -2150,13 +2201,26 @@ class TTSWorker(QThread):
                     len(text_chunk), source_start, source_end,
                     time.monotonic() - chunk_start,
                 )
-                if exc.kind in {"no_audio", "metadata_without_audio"} and attempt + 1 >= _NO_AUDIO_MAX_ATTEMPTS:
+                # Wi-Fi dropped or the computer just woke from sleep: wait for
+                # the connection to come back, then retry without spending an
+                # attempt.  Retries alone gave up after ~30 s of outage and
+                # then split the chunk, which can't help with a dead network.
+                if (
+                    exc.kind in _OUTAGE_FAILURE_KINDS
+                    and outage_waits < _OUTAGE_MAX_WAITS_PER_CHUNK
+                    and await self._wait_out_outage(chunk_label)
+                ):
+                    outage_waits += 1
+                    after_outage = True
+                    continue
+                attempt += 1
+                if exc.kind in {"no_audio", "metadata_without_audio"} and attempt >= _NO_AUDIO_MAX_ATTEMPTS:
                     logger.warning(
                         "%s returned no audio repeatedly; stopping full-size retries early",
                         chunk_label,
                     )
                     break
-                if exc.kind == "timeout_waiting_for_audio" and attempt + 1 >= _EARLY_TIMEOUT_RECOVERY_ATTEMPTS:
+                if exc.kind == "timeout_waiting_for_audio" and attempt >= _EARLY_TIMEOUT_RECOVERY_ATTEMPTS:
                     logger.warning(
                         "%s kept timing out before audio arrived; switching to smaller recovery sections",
                         chunk_label,
@@ -2550,6 +2614,51 @@ class TTSWorker(QThread):
             )
 
         return next_chars, next_payload
+
+    async def _wait_out_outage(self, chunk_label: str) -> bool:
+        """
+        If the speech service is unreachable, wait until it is back.
+
+        Returns True once it is reachable again after an outage (the failed
+        attempt was the network's fault and should not count), False if it
+        was reachable all along or stayed down past ``_OUTAGE_MAX_WAIT_S``.
+        """
+        if await _service_reachable():
+            return False
+        started = time.monotonic()
+        logger.warning(
+            "%s: cannot reach %s — waiting for the connection to return",
+            chunk_label, SPEECH_HOST,
+        )
+        self.status_changed.emit("Waiting for internet connection…")
+        self.stage_changed.emit(
+            "waiting",
+            f"No connection to Microsoft — {chunk_label} will continue "
+            "automatically when the internet is back",
+        )
+        poll_idx = 0
+        while True:
+            delay = _OUTAGE_POLL_S[min(poll_idx, len(_OUTAGE_POLL_S) - 1)]
+            poll_idx += 1
+            waited_until = time.monotonic() + delay
+            while time.monotonic() < waited_until:
+                if self._cancelled:
+                    raise asyncio.CancelledError()
+                await asyncio.sleep(min(0.5, max(0.0, waited_until - time.monotonic())))
+            if await _service_reachable():
+                logger.info(
+                    "%s: connection restored after %.0fs — resuming",
+                    chunk_label, time.monotonic() - started,
+                )
+                self.status_changed.emit("Connection restored — resuming…")
+                self.stage_changed.emit("remote", f"Connection restored — retrying {chunk_label}")
+                return True
+            if time.monotonic() - started >= _OUTAGE_MAX_WAIT_S:
+                logger.error(
+                    "%s: no connection for %.0f min — giving up",
+                    chunk_label, _OUTAGE_MAX_WAIT_S / 60,
+                )
+                return False
 
     def _record_failure_pattern(
         self,
