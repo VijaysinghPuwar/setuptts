@@ -278,6 +278,31 @@ def test_warmup_chunk_does_not_inflate_the_chunk_estimate():
     assert 100 < fixed < 200
 
 
+def test_one_short_chunk_does_not_swing_the_chunk_estimate():
+    """Chunk sizes from a real 376k-char job: a chapter ending cut a 36-char
+    chunk and the label jumped from "43 of ~142" to "43 of ~7357"."""
+    total = 376_566
+    sizes = [74, 2032, 2360, 2791, 163, 2799, 2281, 2174, 2751, 2626] + [2750] * 32 + [36] + [2700] * 20
+    recent: list[int] = []
+    pos = 0
+    estimates = []
+    for idx, size in enumerate(sizes):
+        typical = tts_worker._typical_chunk_len(recent, size, 2_600 if idx == 0 else None)
+        estimates.append(tts_worker._estimate_total_chunks(idx, pos, pos + size, total,
+                                                            typical_len=typical))
+        recent = [*recent[-7:], size]
+        pos += size
+    assert max(estimates) < 200, estimates
+    assert min(estimates[3:]) > 120, estimates
+
+
+def test_estimate_follows_a_real_shrink_in_chunk_size():
+    recent = [2700] * 8
+    for _ in range(5):
+        recent = [*recent[-7:], 900]
+    assert tts_worker._typical_chunk_len(recent, 900, None) == 900
+
+
 # ------------------------------------------------------------------ #
 # Keeping the computer awake                                          #
 # ------------------------------------------------------------------ #
@@ -362,3 +387,23 @@ def test_keep_awake_really_holds_a_macos_assertion(monkeypatch):
         ).stdout
         assert f"pid {proc.pid}(caffeinate)" in out
     assert proc.poll() is not None
+
+
+def test_short_unsplittable_chunk_gets_all_its_retries(fake_net, tmp_path):
+    """A chapter's last lines (too short to split) timed out twice and the job
+    failed after 2 of 5 attempts, because the early switch to smaller
+    sections had no sections to switch to."""
+
+    class _TwoTimeouts(_FakeNetwork):
+        def on_request(self, text):
+            self.requests += 1
+            if len(text) < 300 and self.requests < 50 and not getattr(self, "hit", 0) >= 2:
+                self.hit = getattr(self, "hit", 0) + 1
+                return "timeout_before_audio"
+            return "ok"
+
+    fake_net(_TwoTimeouts())
+    text = "A short ending to the chapter, read aloud. " * 5
+    out = tmp_path / "short.mp3"
+    _run(text, out)
+    assert "".join(out.read_bytes().decode().split()) == _cleaned(text)

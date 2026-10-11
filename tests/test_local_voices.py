@@ -1005,3 +1005,102 @@ def test_saved_voice_follows_an_os_rename(tmp_path):
     settings.replace_voice_ids({"system:Samantha": "system:Samantha (English (US))"})
     assert settings.voice == "system:Samantha (English (US))"
     assert settings.recently_used_voices == ["system:Samantha (English (US))", "system:Kyoko"]
+
+
+# ── Offline voices: two sentences at a time ────────────────────────────── #
+
+class _SlowFakeVoice:
+    """Renders sentence N as N samples of value N, at random speed."""
+
+    def __init__(self):
+        import types
+        self.config = types.SimpleNamespace(sample_rate=1000, length_scale=1.0)
+        self.setuptts_run_lock = threading.BoundedSemaphore(2)
+        self.active = 0
+        self.max_active = 0
+        self._guard = threading.Lock()
+
+    def phonemize(self, text):
+        return [[str(n)] for n in range(1, int(text) + 1)]
+
+    def phonemes_to_ids(self, phonemes):
+        return [int(phonemes[0])]
+
+    def phoneme_ids_to_audio(self, ids, cfg):
+        import random
+        import numpy as np
+        with self._guard:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(random.random() * 0.01)
+        with self._guard:
+            self.active -= 1
+        return np.full(ids[0], ids[0] / 100.0, dtype=np.float32)
+
+
+def _fake_synth(voice):
+    synth = object.__new__(piper_tts.PiperSynthesizer)
+    synth._voice = voice
+    synth.sample_rate = 1000
+    synth._run_lock = voice.setuptts_run_lock
+    synth._cancelled = False
+    from concurrent.futures import ThreadPoolExecutor
+    synth._pool = ThreadPoolExecutor(2)
+    return synth
+
+
+def test_parallel_piper_keeps_sentence_order(monkeypatch):
+    import numpy as np
+    pytest.importorskip("piper")
+    voice = _SlowFakeVoice()
+    synth = _fake_synth(voice)
+    try:
+        pcm = synth.synthesize("40", "+0%")
+    finally:
+        synth.close()
+    samples = np.frombuffer(pcm, dtype="<i2")
+    nonzero = samples[samples != 0]
+    # Each sentence is normalised to full scale, so recover order from run lengths.
+    runs = np.diff(np.flatnonzero(np.diff(np.r_[0, (samples != 0).astype(int), 0])))[::2]
+    assert list(runs) == list(range(1, 41))
+    assert nonzero.size == sum(range(1, 41))
+    assert voice.max_active == 2
+
+
+def test_parallel_runs_are_capped_across_jobs():
+    pytest.importorskip("piper")
+    voice = _SlowFakeVoice()
+    synths = [_fake_synth(voice) for _ in range(3)]
+    threads = [threading.Thread(target=s.synthesize, args=("30", "+0%")) for s in synths]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    for s in synths:
+        s.close()
+    # Three jobs on one voice still never exceed two runs at once (memory).
+    assert voice.max_active <= 2
+
+
+def test_parallel_piper_cancel_stops_promptly():
+    pytest.importorskip("piper")
+    voice = _SlowFakeVoice()
+    synth = _fake_synth(voice)
+    timer = threading.Timer(0.02, synth.cancel)
+    timer.start()
+    start = time.monotonic()
+    with pytest.raises(piper_tts.PiperCancelled):
+        synth.synthesize("5000", "+0%")
+    synth.close()
+    assert time.monotonic() - start < 3
+
+
+def test_small_machines_keep_one_run(monkeypatch):
+    monkeypatch.setattr(piper_tts, "_total_ram_bytes", lambda: 4 * 1024 ** 3)
+    assert piper_tts._plan_parallel_runs() == (1, 0)
+    monkeypatch.setattr(piper_tts, "_total_ram_bytes", lambda: 16 * 1024 ** 3)
+    monkeypatch.setattr(piper_tts.os, "cpu_count", lambda: 2)
+    assert piper_tts._plan_parallel_runs() == (1, 0)
+    monkeypatch.setattr(piper_tts.os, "cpu_count", lambda: 16)
+    runs, threads = piper_tts._plan_parallel_runs()
+    assert runs == 2 and threads >= 2
