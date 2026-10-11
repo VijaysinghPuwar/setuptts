@@ -92,6 +92,53 @@ _PIPER = [("en_US-lessac-medium", "en"), ("de_DE-thorsten-medium", "de"),
           ("es_ES-davefx-medium", "es"), ("fr_FR-siwis-medium", "fr")]
 
 
+def _book_segments(path: str, size: int) -> dict[str, str]:
+    """Start, end, and the passage with the most unusual characters."""
+    book = Path(path).read_text(encoding="utf-8-sig")
+    if len(book) <= size * 3:
+        return {"whole": book}
+
+    def at_paragraph(pos: int) -> int:
+        cut = book.rfind("\n", 0, pos)
+        return cut + 1 if cut > 0 else pos
+
+    step = max(size // 4, 1)
+    odd = max(range(0, len(book) - size, step),
+              key=lambda i: sum(not ch.isascii() for ch in book[i:i + size]))
+    starts = {"start": 0, "unusual": at_paragraph(odd), "end": at_paragraph(len(book) - size)}
+    return {name: book[i:i + size] for name, i in starts.items()}
+
+
+_BOOK_ONLINE = [
+    "en-US-AndrewNeural", "en-US-AvaNeural", "en-US-BrianNeural", "en-US-EmmaNeural",
+    "en-US-ChristopherNeural", "en-GB-SoniaNeural", "en-US-AvaMultilingualNeural",
+    "en-US-AndrewMultilingualNeural",
+]
+_BOOK_SYSTEM = ["Samantha", "Daniel", "Karen", "Moira", "Fred"]
+
+
+def _book_cases(sources: set[str], path: str, size: int, rate: str) -> list[dict]:
+    from app.services import piper_tts
+    from app.services.system_tts import list_system_voices
+
+    segments = _book_segments(path, size)
+    voices: list[tuple[str, str]] = []
+    if "online" in sources:
+        voices += [("online", v) for v in _BOOK_ONLINE]
+    if "piper" in sources and piper_tts.piper_available():
+        voices += [("piper", v["ShortName"]) for v in piper_tts.list_piper_voices()
+                   if v["Locale"].startswith("en")]
+    if "system" in sources:
+        installed = {v["ShortName"] for v in list_system_voices()}
+        for name in _BOOK_SYSTEM:
+            match = next((s for s in installed
+                          if s == f"system:{name}" or s.startswith(f"system:{name} (")), None)
+            if match:
+                voices.append(("system", match))
+    return [{"source": src, "voice": v, "kind": f"book:{seg}", "text": text, "rate": rate}
+            for src, v in voices for seg, text in segments.items()]
+
+
 def _cases(sources: set[str], long_chars: int) -> list[dict]:
     from app.services import piper_tts
     from app.services.system_tts import list_system_voices
@@ -184,6 +231,11 @@ def main() -> int:
     ap.add_argument("--long-chars", type=int, default=30_000)
     ap.add_argument("--workdir", default=str(ROOT / "stress_out" / "voices"))
     ap.add_argument("--only", default="", help="substring filter on voice/kind")
+    ap.add_argument("--text-file", default="",
+                    help="run passages of this book through every voice instead")
+    ap.add_argument("--segment-chars", type=int, default=15_000)
+    ap.add_argument("--rate", default="+0%", help="speed for --text-file runs")
+    ap.add_argument("--parallel", type=int, default=2, help="jobs at once (the app runs 2)")
     args = ap.parse_args()
 
     work = Path(args.workdir).resolve()
@@ -202,7 +254,9 @@ def main() -> int:
         setup_logging()
 
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)
-    cases = _cases(set(args.sources.split(",")), args.long_chars)
+    sources = set(args.sources.split(","))
+    cases = (_book_cases(sources, args.text_file, args.segment_chars, args.rate)
+             if args.text_file else _cases(sources, args.long_chars))
     if args.only:
         cases = [c for c in cases if args.only in c["voice"] or args.only in c["kind"]]
     print(f"{len(cases)} cases", flush=True)
@@ -212,7 +266,7 @@ def main() -> int:
     pending = list(cases)
 
     def submit_next() -> None:
-        while pending and queue.running_count + queue.pending_count < 2:
+        while pending and queue.running_count + queue.pending_count < args.parallel:
             case = pending.pop(0)
             idx = cases.index(case)
             safe = case["voice"].replace(":", "_").replace("/", "_")
