@@ -69,6 +69,9 @@ from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
+    QStyle,
+    QStyleOptionComboBox,
+    QStylePainter,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -90,6 +93,7 @@ from app.models.job import Job, JobStatus
 from app.models.voice import Voice, persona_name
 from app.services.local_tts import SOURCE_ONLINE, SOURCE_PIPER, SOURCE_SYSTEM, source_of
 from app.services.history_service import HistoryService
+from app.services.system_tts import current_short_name
 from app.services.tts_quality import (
     VoiceCompatibilityAssessment,
     assess_voice_compatibility,
@@ -408,7 +412,7 @@ class OutputPanel(QWidget):
         sf = QHBoxLayout()
         sf.setSpacing(5)
 
-        self._lang_combo = QComboBox()
+        self._lang_combo = _ElidingComboBox()
         self._lang_combo.addItem("All Languages", userData="")
         self._lang_combo.setMaxVisibleItems(18)
         # Do not let the widest locale name dictate the layout width.
@@ -425,7 +429,7 @@ class OutputPanel(QWidget):
         ly.addLayout(sf)
 
         # Voice selector
-        self._voice_combo = QComboBox()
+        self._voice_combo = _ElidingComboBox()
         self._voice_combo.addItem("Loading voices…")
         self._voice_combo.setEnabled(False)
         self._voice_combo.setMaxVisibleItems(16)
@@ -853,6 +857,15 @@ class OutputPanel(QWidget):
 
     def _on_voices_loaded(self, voices: list[Voice]) -> None:
         self._all_voices = voices
+        available = {v.short_name for v in voices}
+        renamed = {
+            old: new
+            for old in [self._settings.voice, *self._settings.recently_used_voices]
+            if old and (new := current_short_name(old, available)) != old
+        }
+        if renamed:
+            logger.info("System voices renamed by the OS: %s", renamed)
+            self._settings.replace_voice_ids(renamed)
         seen: dict[str, str] = {}
         for v in voices:
             if v.locale not in seen:
@@ -1227,10 +1240,12 @@ class OutputPanel(QWidget):
         logger.info("Default save folder changed in Settings: %s", folder)
 
     def _set_folder_text(self, folder: str) -> None:
-        """Show a folder path from its start, with the full path as a tooltip."""
+        """Show a folder path, scrolled to its end, with the full path as a tooltip."""
         self._folder_edit.setText(folder)
         self._folder_edit.setToolTip(folder)
-        self._folder_edit.setCursorPosition(0)
+        # Show the end of the path: "…/Downloads/Audiobooks" says where the
+        # file goes; "/Users/name/" is the same for every folder.
+        self._folder_edit.setCursorPosition(len(folder))
 
     def _browse_folder(self) -> None:
         current = self._folder_edit.text() or str(Path.home() / "Desktop")
@@ -2248,6 +2263,23 @@ class _SourceTab(QPushButton):
 
     def minimumSizeHint(self):  # noqa: N802 - Qt override
         return self.sizeHint()
+
+
+class _ElidingComboBox(QComboBox):
+    """Combo box whose closed label ends in "…" instead of being cut mid-letter."""
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt override
+        painter = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        painter.drawComplexControl(QStyle.CC_ComboBox, opt)
+        field = self.style().subControlRect(
+            QStyle.CC_ComboBox, opt, QStyle.SC_ComboBoxEditField, self,
+        )
+        opt.currentText = self.fontMetrics().elidedText(
+            opt.currentText, Qt.ElideRight, max(0, field.width() - 4),
+        )
+        painter.drawControl(QStyle.CE_ComboBoxLabel, opt)
 
 
 class _ElidingLabel(QLabel):

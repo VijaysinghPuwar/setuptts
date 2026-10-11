@@ -230,6 +230,9 @@ if sys.platform != "win32":
             "NSHighResolutionCapable":   True,
             "NSRequiresAquaSystemAppearance": False,
             "LSMinimumSystemVersion":    "15.0",   # PySide6 6.10+ (shiboken) needs macOS 15 — CI verifies against the bundled binaries
+            # App Nap throttles a hidden app's timers and network: a job left
+            # running behind other windows would slow down or stall.
+            "NSAppSleepDisabled":        True,
             "NSHumanReadableCopyright":  "© 2025–2026 SetupTTS",
         },
     )

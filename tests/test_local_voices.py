@@ -567,7 +567,7 @@ def test_piper_voice_cache_is_bounded(monkeypatch, tmp_path):
 
     loads = []
     fake = types.SimpleNamespace(PiperVoice=types.SimpleNamespace(
-        load=lambda path, download_dir=None: loads.append(path) or types.SimpleNamespace()))
+        load=lambda path, download_dir=None, **_kw: loads.append(path) or types.SimpleNamespace()))
     monkeypatch.setitem(sys.modules, "piper", fake)
     monkeypatch.setattr(piper_tts, "_LOADED", piper_tts.OrderedDict())
     monkeypatch.setattr(piper_tts, "user_dir", lambda: tmp_path)
@@ -652,6 +652,7 @@ def test_loader_still_fails_plainly_with_nothing_at_all(tmp_path, monkeypatch):
 @pytest.fixture
 def window(qapp, tmp_path, monkeypatch, qtbot):
     from app.config.settings import AppSettings
+    from app.utils.paths import AppPaths
     from app.ui.main_window import MainWindow
     from app.utils.paths import AppPaths
     from app.workers import voice_loader
@@ -867,3 +868,140 @@ def test_real_piper_is_safe_from_two_threads():
     for t in threads:
         t.join(120)
     assert not errors and len(out) == 9 and all(n > 0 for n in out)
+
+
+# ── Windows: espeak-ng can't open non-ASCII paths ───────────────────── #
+
+def test_espeak_data_dir_untouched_when_ascii(monkeypatch, tmp_path):
+    from piper import phonemize_espeak
+
+    monkeypatch.setattr(piper_tts, "_ESPEAK_DIR", None)
+    monkeypatch.setattr(phonemize_espeak, "ESPEAK_DATA_DIR", tmp_path)
+    monkeypatch.setattr(piper_tts, "_IS_WINDOWS", True)
+    if not str(tmp_path).isascii():
+        pytest.skip("temp dir is not ASCII here")
+    assert piper_tts._espeak_data_dir() == tmp_path
+
+
+def test_espeak_data_dir_copied_to_ascii_folder_on_windows(monkeypatch, tmp_path):
+    from piper import phonemize_espeak
+
+    src = tmp_path / "Usuários" / "José" / "espeak-ng-data"
+    src.mkdir(parents=True)
+    (src / "phontab").write_bytes(b"data")
+    program_data = tmp_path / "ProgramData"
+    if not str(program_data).isascii():
+        pytest.skip("temp dir is not ASCII here")
+    monkeypatch.setattr(piper_tts, "_ESPEAK_DIR", None)
+    monkeypatch.setattr(phonemize_espeak, "ESPEAK_DATA_DIR", src)
+    monkeypatch.setattr(piper_tts, "_IS_WINDOWS", True)
+    monkeypatch.setattr(piper_tts, "_windows_short_path", lambda _p: None)
+    monkeypatch.setenv("ProgramData", str(program_data))
+
+    first = piper_tts._espeak_data_dir()
+    assert str(first).isascii()
+    assert (first / "phontab").read_bytes() == b"data"
+    # Second call (new session) reuses the finished copy.
+    monkeypatch.setattr(piper_tts, "_ESPEAK_DIR", None)
+    (src / "phontab").write_bytes(b"changed")
+    assert piper_tts._espeak_data_dir() == first
+
+
+def test_remove_voice_evicts_the_loaded_model_before_deleting(monkeypatch, tmp_path):
+    """Windows refuses to delete an open file: drop our reference first."""
+    monkeypatch.setattr(piper_tts, "user_dir", lambda: tmp_path)
+    model = tmp_path / "en_US-x-medium.onnx"
+    model.write_bytes(b"m")
+    (tmp_path / "en_US-x-medium.onnx.json").write_text("{}")
+    order = []
+    piper_tts._LOADED[str(model)] = object()
+
+    real_unlink = Path.unlink
+
+    def unlink(self, *a, **k):
+        order.append(("unlink", str(model) in piper_tts._LOADED))
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    assert piper_tts.remove_voice("en_US-x-medium")
+    assert order and all(not still_loaded for _, still_loaded in order)
+
+
+# ── macOS `say`: markup and embedded commands in the user's text ──────── #
+
+def test_say_safe_neutralises_markup_and_embedded_commands():
+    from app.services.system_tts import _say_safe
+
+    out = _say_safe("Hello </voice> <b>bold</b> x < 5 and y > 3 [[slnc 5000]] [[[rate 900]]]")
+    assert "<" not in out
+    assert "x \uff1c 5" in out and "y > 3" in out
+    assert "[[" not in out
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS say")
+@pytest.mark.real_local_voices
+def test_say_reads_past_a_less_than_sign():
+    from app.services.system_tts import SystemSynthesizer
+
+    sentence = "Five < six > four, and then the rest of this sentence is read aloud. "
+    with SystemSynthesizer("system:Samantha") as synth:
+        once = synth.synthesize(sentence, "+0%")
+        thrice = synth.synthesize(sentence * 3, "+0%")
+    # Everything after the "<" used to be dropped, so three copies were no
+    # longer than one.
+    assert len(thrice) > 2.5 * len(once)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS say")
+@pytest.mark.real_local_voices
+def test_say_reads_text_containing_a_closing_tag():
+    from app.services.system_tts import SystemSynthesizer
+
+    with SystemSynthesizer("system:Samantha") as synth:
+        pcm = synth.synthesize("Use the </voice> tag carefully, she said.", "+0%")
+    # A stray closing tag used to silence the whole chunk (header-only WAV).
+    assert len(pcm) > 20_000
+
+
+def test_macos_voice_list_handles_qualified_and_duplicate_names(monkeypatch):
+    """After an Enhanced voice is added, macOS lists "Samantha (English (US))"
+    twice and plain "Samantha" disappears."""
+    import subprocess as sp
+
+    listing = (
+        "Samantha (English (US)) en_US    # Hello! My name is Samantha.\n"
+        "Samantha (English (US)) en_US    # Hello! My name is Samantha.\n"
+        "Eddy (German (Germany)) de_DE    # Hallo! Ich heiße Eddy.\n"
+        "Eddy (English (US))     en_US    # Hello! My name is Eddy.\n"
+        "Albert              en_US    # Hello! My name is Albert.\n"
+    ).encode()
+    monkeypatch.setattr(system_tts.subprocess, "run",
+                        lambda *a, **k: sp.CompletedProcess(a, 0, listing, b""))
+    voices = system_tts._list_macos()
+    ids = [v["ShortName"] for v in voices]
+
+    assert len(ids) == len(set(ids)) == 4
+    assert system_tts.system_display_name("system:Samantha (English (US))") == "Samantha"
+    assert system_tts.system_display_name("system:Eddy (English (US))") == "Eddy"
+    # A voice saved before the rename is found under its new id, and back.
+    available = set(ids)
+    assert system_tts.current_short_name("system:Samantha", available) == \
+        "system:Samantha (English (US))"
+    assert system_tts.current_short_name(
+        "system:Albert (English (US))", available) == "system:Albert"
+    # Ambiguous (Eddy exists in two languages): leave it alone.
+    assert system_tts.current_short_name("system:Eddy", available) == "system:Eddy"
+    assert system_tts.current_short_name("en-US-AvaNeural", available) == "en-US-AvaNeural"
+
+
+def test_saved_voice_follows_an_os_rename(tmp_path):
+    from app.config.settings import AppSettings
+    from app.utils.paths import AppPaths
+
+    settings = AppSettings(AppPaths())
+    settings.voice = "system:Samantha"
+    settings.add_recently_used_voice("system:Kyoko")
+    settings.add_recently_used_voice("system:Samantha")
+    settings.replace_voice_ids({"system:Samantha": "system:Samantha (English (US))"})
+    assert settings.voice == "system:Samantha (English (US))"
+    assert settings.recently_used_voices == ["system:Samantha (English (US))", "system:Kyoko"]

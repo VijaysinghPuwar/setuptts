@@ -133,6 +133,7 @@ class VoiceManagerDialog(QDialog):
         self._installed: set[str] = set()
         self._loader: _CatalogLoader | None = None
         self._downloader: _Downloader | None = None
+        self._dl_name = ""
         self._old_threads: list[QThread] = []
 
         self._filter_timer = QTimer(self)
@@ -192,6 +193,9 @@ class VoiceManagerDialog(QDialog):
         self._table.setWordWrap(False)
         self._table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         hdr = self._table.horizontalHeader()
+        # Headers line up with the left-aligned cells below them; Qt centres
+        # them by default, which left each label floating off its column.
+        hdr.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         hdr.setSectionResizeMode(_COL_VOICE, QHeaderView.Stretch)
         hdr.setSectionResizeMode(_COL_LANG, QHeaderView.Stretch)
         for col in (_COL_QUALITY, _COL_SIZE):
@@ -212,7 +216,10 @@ class VoiceManagerDialog(QDialog):
         prog = QHBoxLayout()
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
-        self._progress.setTextVisible(True)
+        # The bar is a thin 8 px track: its own text would spill out of it.
+        # Progress is spelled out in the status line instead.
+        self._progress.setTextVisible(False)
+        self._progress.setAccessibleName("Download progress")
         self._progress.hide()
         prog.addWidget(self._progress, 1)
         self._cancel_btn = QPushButton("Cancel download")
@@ -331,7 +338,9 @@ class VoiceManagerDialog(QDialog):
             self._table.setCellWidget(r, _COL_ACTION, self._action_button(v, busy_key))
         self._table.setUpdatesEnabled(True)
 
-        if self._catalog or self._installed:
+        # Typing in the search box mid-download must not wipe out the
+        # download's progress line.
+        if (self._catalog or self._installed) and not self._dl_name:
             self._status.setText(f"{len(rows)} voices shown · {len(self._installed)} installed")
 
     def _action_button(self, v: CatalogVoice, busy_key: str | None) -> QWidget:
@@ -367,17 +376,24 @@ class VoiceManagerDialog(QDialog):
         self._downloader.failed.connect(self._on_download_failed)
         self._downloader.cancelled.connect(self._on_download_cancelled)
         self._progress.setValue(0)
-        self._progress.setFormat(f"{voice.display_name}: %p%")
         self._progress.show()
+        self._dl_name = voice.display_name
+        self._status.setText(f"Downloading {voice.display_name}…")
         self._cancel_btn.show()
         self._downloader.start()
         self._populate()
 
     def _on_progress(self, done: int, total: int) -> None:
         if total > 0:
-            self._progress.setValue(min(100, int(done * 100 / total)))
+            pct = min(100, int(done * 100 / total))
+            self._progress.setValue(pct)
+            self._status.setText(
+                f"Downloading {self._dl_name} — {pct}% "
+                f"({done / 1e6:.0f} of {total / 1e6:.0f} MB)"
+            )
 
     def _finish_download_ui(self) -> None:
+        self._dl_name = ""
         self._progress.hide()
         self._cancel_btn.hide()
 
@@ -411,7 +427,17 @@ class VoiceManagerDialog(QDialog):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        piper_tts.remove_voice(key)
+        try:
+            piper_tts.remove_voice(key)
+        except OSError:
+            # Windows: the file is open in a running job or an antivirus scan.
+            logger.warning("Could not remove voice %s", key, exc_info=True)
+            QMessageBox.warning(
+                self, "Remove Voice",
+                "This voice is in use right now. Wait for the conversion "
+                "using it to finish, then try again.",
+            )
+            return
         self.changed = True
         if self.last_installed == piper_tts.PIPER_PREFIX + key:
             self.last_installed = None

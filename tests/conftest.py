@@ -30,6 +30,20 @@ def _no_real_local_voices(request, monkeypatch):
     monkeypatch.setattr(voice_loader, "list_local_voices", lambda: [])
 
 
+@pytest.fixture(autouse=True)
+def _service_always_reachable(request, monkeypatch):
+    """
+    Tests inject network failures; the outage probe must not open a real
+    connection.  Tests of the outage wait itself patch it explicitly.
+    """
+    from app.workers import tts_worker
+
+    async def _reachable() -> bool:
+        return True
+
+    monkeypatch.setattr(tts_worker, "_service_reachable", _reachable)
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers", "real_local_voices: use the voices installed on this machine")

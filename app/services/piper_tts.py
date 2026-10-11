@@ -304,6 +304,11 @@ def download_voice(
 
 def remove_voice(key: str) -> bool:
     """Delete a downloaded voice.  The bundled voice cannot be removed."""
+    # Drop the cached model first: Windows won't delete a file that is
+    # still open.
+    with _LOADED_LOCK:
+        for path in [p for p in _LOADED if Path(p).stem == key]:
+            _LOADED.pop(path, None)
     removed = False
     for p in (user_dir() / f"{key}.onnx", user_dir() / f"{key}.onnx.json"):
         try:
@@ -311,9 +316,6 @@ def remove_voice(key: str) -> bool:
             removed = True
         except FileNotFoundError:
             pass
-    with _LOADED_LOCK:
-        for path in [p for p in _LOADED if Path(p).stem == key]:
-            _LOADED.pop(path, None)
     return removed
 
 
@@ -332,13 +334,74 @@ _MAX_LOADED = 1
 _PHONEMIZE_LOCK = threading.Lock()
 
 
+_ESPEAK_DIR: Path | None = None
+_IS_WINDOWS = os.name == "nt"
+
+
+def _espeak_data_dir() -> Path:
+    """
+    espeak-ng's data folder, at a path espeak-ng can open.
+
+    On Windows espeak-ng opens files with the ANSI APIs, so a folder under a
+    profile such as C:\\Users\\José (the portable build unpacks into %TEMP%)
+    can't be read and every offline voice fails.  Use the 8.3 short name, or
+    failing that a one-time copy in an ASCII-named folder.
+    """
+    global _ESPEAK_DIR
+    if _ESPEAK_DIR is not None:
+        return _ESPEAK_DIR
+    from piper.phonemize_espeak import ESPEAK_DATA_DIR
+
+    data = Path(ESPEAK_DATA_DIR)
+    if not _IS_WINDOWS or str(data).isascii():
+        _ESPEAK_DIR = data
+        return data
+    short = _windows_short_path(data)
+    if short is not None and str(short).isascii():
+        _ESPEAK_DIR = short
+        return short
+    for root in (os.environ.get("ProgramData"), os.environ.get("PUBLIC"), "C:\\SetupTTS"):
+        if not root or not root.isascii():
+            continue
+        target = Path(root) / "SetupTTS" / "espeak-ng-data"
+        try:
+            marker = target / ".complete"
+            if not marker.exists():
+                import shutil
+
+                shutil.rmtree(target, ignore_errors=True)
+                shutil.copytree(data, target)
+                marker.write_text("1", encoding="ascii")
+            logger.info("Using an ASCII copy of espeak-ng data at %s", target)
+            _ESPEAK_DIR = target
+            return target
+        except OSError:
+            logger.warning("Could not copy espeak-ng data to %s", target, exc_info=True)
+    logger.warning("espeak-ng data path is not ASCII and no fallback worked: %s", data)
+    _ESPEAK_DIR = data
+    return data
+
+
+def _windows_short_path(path: Path) -> Path | None:
+    try:
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf))
+        return Path(buf.value) if 0 < n < len(buf) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _load(path: Path):
     key = str(path)
     with _LOADED_LOCK:
         voice = _LOADED.get(key)
         if voice is None:
             from piper import PiperVoice
-            voice = PiperVoice.load(key, download_dir=str(user_dir()))
+            voice = PiperVoice.load(
+                key, download_dir=str(user_dir()), espeak_data_dir=_espeak_data_dir(),
+            )
             # Runs of one model take turns (see PiperSynthesizer.synthesize).
             voice.setuptts_run_lock = threading.Lock()
             _LOADED[key] = voice
