@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import ssl
+import sys
 import threading
 import time
 import urllib.request
@@ -334,6 +335,47 @@ _MAX_LOADED = 1
 _PHONEMIZE_LOCK = threading.Lock()
 
 
+def _total_ram_bytes() -> int:
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            status = _MemStatus()
+            status.dwLength = ctypes.sizeof(_MemStatus)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+            return int(status.ullTotalPhys)
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _plan_parallel_runs() -> tuple[int, int]:
+    """
+    (runs at once per voice, CPU threads per run).
+
+    One run of a voice model stops getting faster past ~6 threads, so two
+    sentences in flight with the cores split between them is ~30% faster
+    (Ryan high on an M-series Mac: 133 → 171 chars/s; Lessac medium 810 →
+    1015) for ~220 MB more memory.  Small machines keep one run.
+    """
+    cores = os.cpu_count() or 1
+    if cores < 4 or _total_ram_bytes() < 8 * 1024 ** 3:
+        return 1, 0                     # 0 = onnxruntime's default
+    # Windows/Linux count hyper-threads; macOS (no SMT) counts real cores.
+    physical = cores if sys.platform == "darwin" else max(2, cores // 2)
+    return 2, max(2, physical // 2)
+
+
+_PARALLEL_RUNS, _THREADS_PER_RUN = _plan_parallel_runs()
+
+
 _ESPEAK_DIR: Path | None = None
 _IS_WINDOWS = os.name == "nt"
 
@@ -393,6 +435,21 @@ def _windows_short_path(path: Path) -> Path | None:
         return None
 
 
+def _configure_session(voice, model: str) -> None:
+    """Re-open the model with threads sized for parallel runs."""
+    try:
+        import onnxruntime
+
+        opts = onnxruntime.SessionOptions()
+        opts.intra_op_num_threads = _THREADS_PER_RUN
+        opts.inter_op_num_threads = 1
+        voice.session = onnxruntime.InferenceSession(
+            model, sess_options=opts, providers=["CPUExecutionProvider"],
+        )
+    except Exception:  # noqa: BLE001 - the default session still works
+        logger.warning("Could not tune the offline voice session", exc_info=True)
+
+
 def _load(path: Path):
     key = str(path)
     with _LOADED_LOCK:
@@ -402,8 +459,11 @@ def _load(path: Path):
             voice = PiperVoice.load(
                 key, download_dir=str(user_dir()), espeak_data_dir=_espeak_data_dir(),
             )
-            # Runs of one model take turns (see PiperSynthesizer.synthesize).
-            voice.setuptts_run_lock = threading.Lock()
+            if _THREADS_PER_RUN:
+                _configure_session(voice, key)
+            # At most _PARALLEL_RUNS runs of one model at a time, across every
+            # job and preview using it (see PiperSynthesizer.synthesize).
+            voice.setuptts_run_lock = threading.BoundedSemaphore(_PARALLEL_RUNS)
             _LOADED[key] = voice
             while len(_LOADED) > _MAX_LOADED:
                 _LOADED.popitem(last=False)
@@ -468,6 +528,11 @@ class PiperSynthesizer:
         self.sample_rate = int(self._voice.config.sample_rate)
         self._run_lock = getattr(self._voice, "setuptts_run_lock", None) or threading.Lock()
         self._cancelled = False
+        self._pool = None
+        if _PARALLEL_RUNS > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pool = ThreadPoolExecutor(_PARALLEL_RUNS, thread_name_prefix="piper")
 
     def synthesize(self, text: str, rate: str) -> bytes:
         import numpy as np
@@ -491,27 +556,37 @@ class PiperSynthesizer:
         # A short pause between sentences: Piper returns each sentence
         # trimmed, and joined back-to-back they run together.
         gap = bytes(2 * int(self.sample_rate * 0.12))
-        parts = []
-        for phonemes, ends_sentence in pieces:
+
+        def render(phonemes: list[str]) -> bytes:
             if self._cancelled:
                 raise PiperCancelled("cancelled")
-            if not phonemes:
-                continue
             ids = self._voice.phonemes_to_ids(phonemes)
-            # One run at a time per model: concurrent runs each need their own
-            # working memory and onnxruntime keeps every peak (two jobs and a
-            # preview on one voice reached 1.2 GB), while a single run already
-            # uses every CPU core, so taking turns costs no throughput.
+            # Runs per model are capped across all jobs and previews:
+            # onnxruntime keeps the peak working memory of every concurrent
+            # run (unbounded, two jobs and a preview reached 1.2 GB).
             with self._run_lock:
+                if self._cancelled:
+                    raise PiperCancelled("cancelled")
                 audio = self._voice.phoneme_ids_to_audio(ids, cfg)
             if isinstance(audio, tuple):
                 audio = audio[0]
             audio = np.asarray(audio, dtype=np.float32).reshape(-1)
             peak = float(np.max(np.abs(audio))) if audio.size else 0.0
             if peak < 1e-8:
+                return b""
+            return np.clip(audio / peak * 32767.0, -32767, 32767).astype("<i2").tobytes()
+
+        work = [(p, ends) for p, ends in pieces if p]
+        if self._pool is not None and len(work) > 1:
+            # Sentences render two at a time; map() keeps them in order.
+            rendered = list(self._pool.map(render, [p for p, _ in work]))
+        else:
+            rendered = [render(p) for p, _ in work]
+        parts = []
+        for audio, (_, ends_sentence) in zip(rendered, work):
+            if not audio:
                 continue
-            audio = np.clip(audio / peak * 32767.0, -32767, 32767).astype("<i2")
-            parts.append(audio.tobytes())
+            parts.append(audio)
             if ends_sentence:
                 parts.append(gap)
         return b"".join(parts)
@@ -520,7 +595,9 @@ class PiperSynthesizer:
         self._cancelled = True
 
     def close(self) -> None:
-        pass
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
 
     def __enter__(self) -> "PiperSynthesizer":
         return self
