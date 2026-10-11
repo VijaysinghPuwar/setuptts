@@ -130,6 +130,9 @@ class HistoryPanel(QWidget):
         header_view.setSectionResizeMode(_COL_PREVIEW, QHeaderView.Stretch)
         header_view.setSectionResizeMode(_COL_FILE, QHeaderView.Stretch)
         header_view.setMinimumSectionSize(56)
+        # Headers line up with the left-aligned cells below them; Qt centres
+        # them by default, which left each label floating off its column.
+        header_view.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._table.horizontalHeaderItem(_COL_TOOK).setToolTip("How long generation took")
         self._table.horizontalHeaderItem(_COL_LENGTH).setToolTip("Length of the audio")
         self._table.setToolTip("Double-click to play · right-click for more")

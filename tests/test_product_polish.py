@@ -499,3 +499,41 @@ def test_legacy_log_file_is_renamed(tmp_path):
     _migrate_legacy_log(tmp_path)
     assert (tmp_path / LOG_FILENAME).read_text() == "old entries"
     assert not (tmp_path / "voicecraft.log").exists()
+
+
+# ── Visual polish: things that looked broken ───────────────────────────── #
+
+def test_table_headers_line_up_with_left_aligned_cells(window):
+    from PySide6.QtCore import Qt
+
+    header = window._history_panel._table.horizontalHeader()
+    assert header.defaultAlignment() & Qt.AlignLeft
+
+
+def test_voice_download_progress_text_does_not_overflow_the_bar(qapp, qtbot, monkeypatch):
+    from app.ui.dialogs import voice_manager_dialog as vmd
+
+    monkeypatch.setattr(vmd._CatalogLoader, "start", lambda self: None)
+    dlg = vmd.VoiceManagerDialog()
+    qtbot.addWidget(dlg)
+    # The bar is an 8 px track; text drawn inside it spilled out.
+    assert not dlg._progress.isTextVisible()
+    dlg._dl_name = "Ryan (high)"
+    dlg._on_progress(76_000_000, 121_000_000)
+    assert dlg._progress.value() == 62
+    assert "Ryan (high)" in dlg._status.text() and "62%" in dlg._status.text()
+    dlg._populate()                       # filtering mid-download
+    assert "62%" in dlg._status.text()
+
+
+def test_voice_picker_elides_instead_of_clipping(window):
+    from app.ui.panels.output_panel import _ElidingComboBox
+
+    assert isinstance(window._output_panel._voice_combo, _ElidingComboBox)
+
+
+def test_save_folder_shows_the_end_of_the_path(window, tmp_path):
+    panel = window._output_panel
+    folder = str(tmp_path / "Audiobooks" / "Series One")
+    panel._set_folder_text(folder)
+    assert panel._folder_edit.cursorPosition() == len(folder)
