@@ -59,8 +59,10 @@ The hard part is not calling a speech API; it is making a **multi-hour job over 
 - **Crash-safe, resumable pipeline.** Every finished section is written to a staging folder with a manifest recording its exact `[start, end)` character range and a hash of that text. Writes are atomic (unique temp file, `fsync`, rename, with retries for transient Windows file locks). After a crash, power loss or cancel, only the verified contiguous prefix is trusted, and the job continues from there.
 - **Fail-closed assembly.** Before the MP3 is written, the ranges must tile the source text exactly (no gaps, no overlaps), every chunk file must exist with the recorded size, the assembled byte count must match, and the audio length must be plausible for the text. The length check runs on a temporary file *before* it replaces anything, so a bad result can never overwrite an existing good file.
 - **Adaptive recovery.** Retries with exponential backoff and a fresh connection each time; sections that keep failing are split into smaller sub-ranges whose union must equal the original range exactly.
+- **Survives sleep and dropped Wi-Fi.** While a job runs, the computer is kept from idle-sleeping (`caffeinate` on macOS, `SetThreadExecutionState` on Windows). If the service becomes unreachable, the job probes the connection and waits up to 30 minutes for it to return, without using up retries.
+- **Fast offline voices.** Piper renders two sentences at a time with the CPU cores split between them (1.75x faster on Ryan high), capped at two runs per voice across all jobs to bound memory.
 - **Responsive UI during long work.** Generation runs on `QThread` workers with their own `asyncio` loops; the UI thread only receives throttled progress signals. Up to two jobs run concurrently with per-destination conflict checks.
-- **Tested as shipped.** 450 automated tests, including 12-hour-scale simulations and regression tests that fail on the pre-fix code. CI also launches the *packaged* apps — the macOS bundle, the app inside the DMG, the app installed by the real Windows installer, and the portable EXE — and has each one load the voice list and synthesise a verified sample.
+- **Tested as shipped.** 495 automated tests, including 12-hour-scale simulations, network-outage and sleep/wake simulations and regression tests that fail on the pre-fix code. CI also launches the *packaged* apps — the macOS bundle, the app inside the DMG, the app installed by the real Windows installer, and the portable EXE — and has each one load the voice list and synthesise a verified sample.
 
 ---
 
@@ -77,6 +79,7 @@ flowchart TB
     subgraph Jobs["Background work"]
         JQ["JobQueue<br/>2 concurrent jobs"]
         W["TTSWorker<br/>QThread + asyncio"]
+        LW["LocalTTSWorker<br/>Piper · OS voices"]
         VL["VoiceLoaderWorker"]
     end
 
@@ -91,6 +94,8 @@ flowchart TB
     IP -- text --> OP
     OP -- submit / cancel / resume --> JQ
     JQ --> W
+    JQ --> LW
+    LW -- "MP3 written as .part, then renamed" --> OUT
     W <-->|"sections ⇄ audio + sentence timing"| SVC
     VL <-->|"voice catalog"| SVC
     W -- verified sections --> CS
@@ -129,6 +134,7 @@ flowchart TD
 |---|---|
 | Connection drops in the middle of a section | Detects the missing audio, discards the attempt, requests the section again |
 | DNS failure, timeout, service returns no audio | Retries with backoff; splits stubborn sections; if it still fails, keeps finished sections and offers **Resume** |
+| Wi-Fi drops, or the computer wakes from sleep offline | Shows *Waiting for internet connection…* and continues by itself when the service is reachable again (up to 30 min) |
 | App closed or crashes mid-book | Finished sections survive on disk; **Resume Unfinished Job** continues from the first unverified section |
 | Disk full or file locked while saving | Job stops with a plain explanation and stays resumable |
 | A chunk file or the manifest is damaged | Resume trusts only the verified contiguous prefix and regenerates the rest |
@@ -140,26 +146,12 @@ flowchart TD
 
 ---
 
-## Codebase at a glance
-
-Counted with `wc -l` over tracked files at v1.6.1 (includes comments and docstrings).
-
-| Area | Files | Lines | Contents |
-|---|---:|---:|---|
-| `app/workers` | 6 | 4,734 | generation pipeline, chunk store, job queue, voice loading, preview |
-| `app/ui` | 10 | 3,942 | main window, panels, dialogs, stylesheet loader |
-| `app/services` | 4 | 1,402 | speech-service client, text profiling and voice matching, history DB |
-| `app/utils`, `app/models`, `app/config` | 12 | 1,063 | paths, logging, errors, MP3 parsing, settings, single-instance lock |
-| `app/main.py`, `app/selftest.py` | 3 | 289 | startup, packaged-build self-test |
-| **Application total** | **35** | **11,430** | Python |
-| `tests` | 12 | 3,857 | 331 tests (pytest, pytest-qt) |
-| Stylesheet | 1 | 1,078 | Qt stylesheet (dark theme) |
-| Build and CI | 7 | 1,243 | PyInstaller specs, Inno Setup installer, GitHub Actions, build scripts |
+## Built with
 
 | Layer | Technology |
 |---|---|
 | UI | PySide6 (Qt 6) — widgets, QThread, QLocalServer |
-| Speech | edge-tts over aiohttp websockets (Microsoft neural voices) |
+| Speech | edge-tts over aiohttp websockets (online); Piper on onnxruntime (offline); SAPI / OneCore and `say` (built-in) |
 | Storage | SQLite (history), JSON manifest + per-section MP3 files (resume) |
 | Packaging | PyInstaller; DMG via create-dmg; Inno Setup installer; single-file portable EXE |
 | CI/CD | GitHub Actions: tests on macOS and Windows, packaged-app self-tests, release publishing |
@@ -169,7 +161,7 @@ Counted with `wc -l` over tracked files at v1.6.1 (includes comments and docstri
 ## Using SetupTTS
 
 1. **Add text** — paste or type, **Open File…** (Ctrl/⌘+O), or drag a `.txt` file in. UTF-8, UTF-16 and ANSI files are recognised.
-2. **Choose a voice** — search by name or language; **Preview Voice** plays a sample. "(Multilingual)" voices can read mixed-language text; standard voices are more reliable for long English books.
+2. **Choose a voice** — pick **All · Online · Offline · Built-in**, search by name or language; **▶** plays a sample. **+ Get voices** downloads offline voices. "(Multilingual)" voices can read mixed-language text; standard voices are more reliable for long English books.
 3. **Speed** — −50% to +100%; **Reset** returns to normal.
 4. **Export** — file name and folder, then **Generate & Export MP3** (Ctrl/⌘+Enter).
 
@@ -177,9 +169,8 @@ Progress appears under **Active Jobs**: stage, percentage, section count, speed 
 
 ## Requirements and limitations
 
-- **Internet required.** Speech is generated by Microsoft's online service (the voices behind Edge's Read Aloud); text preparation, verification and file writing are local. The service is used without an official API agreement, so its availability can change.
-- Generation speed depends on the service and your connection, not your CPU — low CPU use while generating is expected.
-- Output is 24 kHz, 48 kbit/s mono MP3 (the format the service provides).
+- **Online voices need internet.** They come from Microsoft's service (the voices behind Edge's Read Aloud), used without an official API agreement, so availability can change. Their speed depends on the service, not your CPU. Offline and built-in voices work without internet and use the CPU.
+- Output: online voices 24 kHz, 48 kbit/s mono MP3; offline and built-in voices 22 kHz, 64 kbit/s mono MP3.
 - macOS 15 or later on Apple Silicon (the bundled Qt requires it); Windows 10/11, 64-bit.
 
 ## Troubleshooting
@@ -229,6 +220,13 @@ pip install pytest pytest-qt
 QT_QPA_PLATFORM=offscreen pytest -q
 ```
 
+### Stress-test real voices
+
+```bash
+python scripts/stress_voices.py                                   # every voice source, hostile text
+python scripts/stress_voices.py --text-file book.txt --rate +100%  # passages of a book through many voices
+```
+
 ### Check a packaged build
 
 ```bash
@@ -265,15 +263,6 @@ GitHub Actions checks that the tag matches `APP_VERSION`, runs the test suite, b
 - `SetupTTS-Windows-Installer.exe`
 - `SetupTTS-Windows-Portable.zip`
 
-### Stack
-
-| Layer | Technology |
-|-------|-----------|
-| UI | PySide6 (Qt 6) |
-| TTS | edge-tts (Microsoft Neural TTS) |
-| Storage | SQLite (job history) |
-| Packaging | PyInstaller |
-
 ### Project structure
 
 ```
@@ -282,6 +271,7 @@ setuptts/
 ├── setuptts.spec              ← PyInstaller spec (macOS app / Windows onedir)
 ├── setuptts_portable.spec     ← PyInstaller spec (Windows portable EXE)
 ├── release_notes/             ← one file per release, used by CI
+├── scripts/                   ← stress tests against the real voices
 ├── requirements.txt
 ├── build_macos.sh             ← macOS release build script
 ├── build_windows.ps1          ← Windows release build (PowerShell)
