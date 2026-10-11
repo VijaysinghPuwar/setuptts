@@ -1079,13 +1079,27 @@ def _estimate_total_chunks(
     """
     Estimated chunk count for the whole job, for "chunk N of ~M" labels.
 
-    The chunk being cut right now is the best predictor of the ones to come:
-    its size already reflects the payload limit (which binds well before the
-    character ceiling) and the adaptive ramp.
+    ``typical_len`` is the size chunks are actually being cut to (see
+    _typical_chunk_len); without it the current chunk stands in for it.
     """
-    current_len = max(source_end - source_start, typical_len or 0, 1)
+    current_len = max(typical_len or (source_end - source_start), 1)
     remaining = max(total_chars - source_start, current_len)
     return max(chunk_idx + 1, chunk_idx + math.ceil(remaining / current_len))
+
+
+def _typical_chunk_len(recent: list[int], current: int, warmup_len: int | None) -> int:
+    """
+    Size the rest of the job will be cut to, for the chunk-count estimate.
+
+    The median of the last few chunks and the current one: a single short
+    chunk — a chapter ending, the warm-up probe — no longer swings the label
+    from "chunk 43 of ~143" to "chunk 43 of ~7357", while a real shrink
+    (smaller chunks after repeated failures) shows up within a few chunks.
+    """
+    if not recent and warmup_len:
+        return max(current, warmup_len)
+    sizes = sorted([*recent, current])
+    return sizes[len(sizes) // 2]
 
 
 class _DurationShortfall(RuntimeError):
@@ -1564,6 +1578,7 @@ class TTSWorker(QThread):
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         chunk_idx = resume_chunk_idx
+        recent_chunk_lens: list[int] = []
 
         try:
             while chunk_cursor.has_more():
@@ -1584,9 +1599,11 @@ class TTSWorker(QThread):
                 # chunk 150 of 210 was reported as "chunk 150/150".)
                 estimated_total = _estimate_total_chunks(
                     chunk_idx, source_start, source_end, total_chars,
-                    # The warm-up probe is cut tiny on purpose; extrapolating
-                    # from it read "chunk 1/4955" on a 187-chunk job.
-                    typical_len=chunk_plan.ramp_chars if chunk_idx == 0 else None,
+                    typical_len=_typical_chunk_len(
+                        recent_chunk_lens,
+                        source_end - source_start,
+                        chunk_plan.ramp_chars if chunk_idx == 0 else None,
+                    ),
                 )
 
                 chunk_number = chunk_idx + 1
@@ -1682,6 +1699,7 @@ class TTSWorker(QThread):
                     chunk_plan,
                     chunk_index=chunk_idx,
                 )
+                recent_chunk_lens = [*recent_chunk_lens[-7:], source_end - source_start]
                 chunk_idx += 1
 
         except asyncio.CancelledError:
@@ -2214,16 +2232,24 @@ class TTSWorker(QThread):
                     after_outage = True
                     continue
                 attempt += 1
-                if exc.kind in {"no_audio", "metadata_without_audio"} and attempt >= _NO_AUDIO_MAX_ATTEMPTS:
+                # Cutting retries short only pays off when there are smaller
+                # sections to fall back on.  A short chunk (a chapter's last
+                # lines) can't be split, and used to fail after 2 attempts.
+                early_kind = (
+                    exc.kind in {"no_audio", "metadata_without_audio"}
+                    and attempt >= _NO_AUDIO_MAX_ATTEMPTS
+                ) or (
+                    exc.kind == "timeout_waiting_for_audio"
+                    and attempt >= _EARLY_TIMEOUT_RECOVERY_ATTEMPTS
+                )
+                if early_kind and self._subdivide_for_recovery(
+                    text_chunk, char_limit, payload_limit, depth,
+                    source_text=source_text, source_start=source_start,
+                    source_end=source_end,
+                ):
                     logger.warning(
-                        "%s returned no audio repeatedly; stopping full-size retries early",
-                        chunk_label,
-                    )
-                    break
-                if exc.kind == "timeout_waiting_for_audio" and attempt >= _EARLY_TIMEOUT_RECOVERY_ATTEMPTS:
-                    logger.warning(
-                        "%s kept timing out before audio arrived; switching to smaller recovery sections",
-                        chunk_label,
+                        "%s kept failing (%s); switching to smaller recovery sections",
+                        chunk_label, exc.kind,
                     )
                     break
 
