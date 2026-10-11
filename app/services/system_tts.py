@@ -230,25 +230,39 @@ def _list_windows() -> list[dict]:
 _SAY_LINE = re.compile(r"^(?P<name>.+?)\s+(?P<loc>[a-z]{2,3}(?:[_-][A-Za-z0-9]+)+)\s+#")
 
 
+# "Samantha (English (US))", "Eddy (German (Germany))" → the trailing language.
+_SAY_QUALIFIED = re.compile(r"\s*\((?:[^()]|\([^()]*\))*\)$")
+
+
 def _list_macos() -> list[dict]:
     proc = subprocess.run(["say", "-v", "?"], capture_output=True, timeout=_LIST_TIMEOUT_S,
                           stdin=subprocess.DEVNULL)
     if proc.returncode != 0:
         raise RuntimeError(f"`say -v ?` failed (exit {proc.returncode})")
-    voices: list[dict] = []
+    entries: list[tuple[str, str]] = []
     for line in proc.stdout.decode("utf-8", "replace").splitlines():
         m = _SAY_LINE.match(line.strip())
         if not m:
             continue
-        name = m.group("name").strip()
-        locale = m.group("loc").replace("_", "-")
+        entry = (m.group("name").strip(), m.group("loc").replace("_", "-"))
+        # Once an Enhanced/Premium voice is added, macOS lists the voice
+        # twice under the same name; `say -v` can only address one of them.
+        if entry not in entries:
+            entries.append(entry)
+
+    # The id stays the name `say` lists; saved settings follow a rename via
+    # current_short_name().  The picker shows "Samantha", not
+    # "Samantha (English (US))" — the language is beside it already.
+    voices: list[dict] = []
+    for name, locale in entries:
+        base = _SAY_QUALIFIED.sub("", name) or name
         voices.append({
             "ShortName": SYSTEM_PREFIX + name,
-            "FriendlyName": f"{name} (macOS) - {locale}",
+            "FriendlyName": f"{base} (macOS) - {locale}",
             "Locale": locale,
             "Gender": "",
             "Source": "system",
-            "_display": name,
+            "_display": base,
         })
     return _dedupe_names(voices)
 
@@ -263,6 +277,22 @@ def _dedupe_names(voices: list[dict]) -> list[dict]:
             v["_display"] = f'{v["_display"]} ({counts[key]})'
         _register(v["ShortName"], v.pop("_display"))
     return voices
+
+
+def current_short_name(saved: str, available: set[str]) -> str:
+    """
+    The id *saved* has now, when macOS renamed the voice since it was saved
+    ("system:Samantha" ⇄ "system:Samantha (English (US))", which flips when
+    an Enhanced voice is added).  Returns *saved* unchanged otherwise.
+    """
+    if not is_system_voice(saved) or saved in available:
+        return saved
+    base = _SAY_QUALIFIED.sub("", saved[len(SYSTEM_PREFIX):])
+    matches = [
+        s for s in available
+        if is_system_voice(s) and _SAY_QUALIFIED.sub("", s[len(SYSTEM_PREFIX):]) == base
+    ]
+    return matches[0] if len(matches) == 1 else saved
 
 
 def list_system_voices() -> list[dict]:
@@ -288,6 +318,19 @@ def list_system_voices() -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════ #
 #  Synthesis                                                             #
 # ══════════════════════════════════════════════════════════════════════ #
+
+# `say` reads its input as SSML when it looks like markup: a stray "</voice>"
+# silences the whole chunk, and in "5 < 6 > 4" everything after the "<" is
+# dropped.  It also runs "[[...]]" as embedded commands ("[[slnc 5000]]"
+# inserts five seconds of silence).  Windows passes SVSFIsNotXML, so only the
+# macOS path needs this.
+def _say_safe(text: str) -> str:
+    """Text for `say` with markup and embedded commands made inert."""
+    text = text.replace("<", "\uff1c")     # ＜ full-width less-than
+    while "[[" in text:
+        text = text.replace("[[", "[ [")
+    return text
+
 
 class SystemSpeechError(RuntimeError):
     pass
@@ -363,6 +406,8 @@ class SystemSynthesizer:
         self._count += 1
         text_path = self._tmpdir / f"in_{self._count}.txt"
         wav_path = self._tmpdir / f"out_{self._count}.wav"
+        if sys.platform == "darwin":
+            text = _say_safe(text)
         text_path.write_text(text, encoding="utf-8")
         try:
             if sys.platform == "win32":

@@ -212,6 +212,13 @@ class AppSettings:
     def recently_used_voices(self) -> list[str]:
         return list(self._data.get("recently_used_voices", []))
 
+    def replace_voice_ids(self, mapping: dict[str, str]) -> None:
+        """Point the saved and recent voices at renamed ids."""
+        if self.voice in mapping:
+            self.voice = mapping[self.voice]
+        recent = [mapping.get(v, v) for v in self.recently_used_voices]
+        self._data["recently_used_voices"] = list(dict.fromkeys(recent))[:5]
+
     def add_recently_used_voice(self, short_name: str) -> None:
         recent: list[str] = self.recently_used_voices
         if short_name in recent:
