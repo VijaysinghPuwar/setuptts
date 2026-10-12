@@ -15,7 +15,7 @@
   <a href="../../actions/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/VijaysinghPuwar/setuptts/build.yml?label=build"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-555">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12-3776AB">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-500%20passing-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-508%20passing-2ea44f">
 </p>
 
 <p align="center">
@@ -62,7 +62,7 @@ The hard part is not calling a speech API; it is making a **multi-hour job over 
 - **Survives sleep and dropped Wi-Fi.** While a job runs, the computer is kept from idle-sleeping (`caffeinate` on macOS, `SetThreadExecutionState` on Windows). If the service becomes unreachable, the job probes the connection and waits up to 30 minutes for it to return, without using up retries.
 - **Fast offline voices.** Piper renders two sentences at a time with the CPU cores split between them (1.75x faster on Ryan high), capped at two runs per voice across all jobs to bound memory.
 - **Responsive UI during long work.** Generation runs on `QThread` workers with their own `asyncio` loops; the UI thread only receives throttled progress signals. Up to two jobs run concurrently with per-destination conflict checks.
-- **Tested as shipped.** 500 automated tests, including 12-hour-scale simulations, network-outage and sleep/wake simulations and regression tests that fail on the pre-fix code. CI also launches the *packaged* apps — the macOS bundle, the app inside the DMG, the app installed by the real Windows installer, and the portable EXE — and has each one load the voice list and synthesise a verified sample.
+- **Tested as shipped.** 508 automated tests, including 12-hour-scale simulations, network-outage and sleep/wake simulations and regression tests that fail on the pre-fix code. CI also launches the *packaged* apps — the macOS bundle, the app inside the DMG, the app installed by the real Windows installer, and the portable EXE — and has each one load the voice list and synthesise a verified sample.
 
 ---
 
