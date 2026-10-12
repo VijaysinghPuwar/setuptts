@@ -107,6 +107,10 @@ _COMPLEX_SCRIPT_LIMITS = {
 _PREFLIGHT_SAMPLE_CHARS = 220
 _PREFLIGHT_SAMPLE_PAYLOAD_BYTES = 360
 _PREFLIGHT_TIMEOUT_S = 45
+# "No audio" is often a passing hiccup (Multilingual voices especially): one
+# refused a whole book at the startup check, then returned audio for the same
+# sample 8 times in 8.  Only a voice that keeps failing is turned away.
+_PREFLIGHT_ATTEMPTS = 3
 
 _CHUNK_TIMEOUT_MIN_S = 90
 _CHUNK_TIMEOUT_MAX_S = 600
@@ -1994,12 +1998,12 @@ class TTSWorker(QThread):
         )
 
         last_failure: _AttemptFailure | None = None
-        for attempt in range(2):
+        for attempt in range(_PREFLIGHT_ATTEMPTS):
             if self._cancelled:
                 raise asyncio.CancelledError()
 
             if attempt > 0:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.5 * attempt)
 
             try:
                 await self._synthesise_attempt(
@@ -2013,7 +2017,9 @@ class TTSWorker(QThread):
                 return
             except _AttemptFailure as exc:
                 last_failure = exc
-                if exc.kind in {"invalid_voice", "no_audio", "metadata_without_audio"}:
+                logger.warning("Startup check attempt %d/%d failed: %s",
+                               attempt + 1, _PREFLIGHT_ATTEMPTS, exc)
+                if exc.kind == "invalid_voice":
                     break
 
         if last_failure is None:
