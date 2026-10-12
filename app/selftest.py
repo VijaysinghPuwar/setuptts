@@ -167,8 +167,8 @@ def run(argv: list[str]) -> int:
 
             text = "SetupTTS packaged build check. The quick brown fox jumps over the lazy dog."
 
-            async def go():
-                comm = build_communicate(text=text, voice="en-US-AndrewNeural",
+            async def go(voice):
+                comm = build_communicate(text=text, voice=voice,
                                          rate="+0%", volume="+0%")
                 audio, bounds = b"", []
                 async for ev in comm.stream():
@@ -178,14 +178,29 @@ def run(argv: list[str]) -> int:
                         bounds.append((ev["offset"], ev["duration"], ev["text"]))
                 return audio, bounds
 
-            audio, bounds = asyncio.run(go())
-            problem = _stream_incomplete_reason(text, bounds, len(audio))
-            if problem:
-                raise RuntimeError(f"incomplete audio: {problem}")
-            seconds = mp3_duration_from_bytes(audio)
-            if not seconds or seconds < 2:
-                raise RuntimeError(f"implausible duration {seconds}")
-            return f"{len(audio)} bytes, {seconds:.1f} s"
+            def attempt(voice):
+                audio, bounds = asyncio.run(go(voice))
+                problem = _stream_incomplete_reason(text, bounds, len(audio))
+                if problem:
+                    raise RuntimeError(f"incomplete audio: {problem}")
+                seconds = mp3_duration_from_bytes(audio)
+                if not seconds or seconds < 2:
+                    raise RuntimeError(f"implausible duration {seconds}")
+                return f"{len(audio)} bytes, {seconds:.1f} s"
+
+            # The service now and then refuses a datacenter address (HTTP 403)
+            # or drops a stream; the app retries those, so the check does too.
+            # One refusal failed the v1.7.2 release build on a good bundle.
+            failures = []
+            for n, (voice, wait) in enumerate([("en-US-AndrewNeural", 0), ("en-US-AvaNeural", 10),
+                                               ("en-US-AndrewNeural", 30), ("en-US-AvaNeural", 60)]):
+                time.sleep(wait)
+                try:
+                    result = attempt(voice)
+                    return result + (f" (after {n} retries: {'; '.join(failures)})" if failures else "")
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"{type(exc).__name__}: {str(exc)[:80]}")
+            raise RuntimeError("all attempts failed: " + " | ".join(failures))
 
         check("voices", voices)
         check("synthesis", synthesis)

@@ -8,19 +8,91 @@ All callers use this service rather than touching edge_tts.
 import logging
 import os
 import ssl
+import threading
 import time
 import urllib.request
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import certifi
 import edge_tts
 import edge_tts.communicate
+import edge_tts.drm
 import edge_tts.voices
+from edge_tts.constants import TRUSTED_CLIENT_TOKEN
 
 logger = logging.getLogger(__name__)
 
-#: Where edge_tts sends voice-list and synthesis requests.
+#: Where edge_tts sends voice-list requests.
 SPEECH_HOST = "speech.platform.bing.com"
+
+#: Where speech is synthesised, preferred first.  On 12 October 2026 the
+#: legacy host began answering every synthesis request with HTTP 403 (it had
+#: already in some countries); Microsoft Edge itself synthesises through
+#: api.msedgeservices.com, which accepts the same token and returns the same
+#: 24 kHz 48 kbit/s MP3.  If the active host starts refusing, the other is
+#: tried, so the next change on Microsoft's side need not break every job.
+SYNTHESIS_ENDPOINTS: tuple[str, ...] = (
+    "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+    f"?Ocp-Apim-Subscription-Key={TRUSTED_CLIENT_TOKEN}",
+    edge_tts.communicate.WSS_URL,
+)
+_endpoint_lock = threading.Lock()
+_endpoint_index = 0
+
+
+def synthesis_host() -> str:
+    """Host name of the synthesis endpoint in use."""
+    return urlsplit(SYNTHESIS_ENDPOINTS[_endpoint_index]).hostname or SPEECH_HOST
+
+
+def _use_endpoint(index: int) -> None:
+    global _endpoint_index
+    _endpoint_index = index
+    # edge_tts reads this module global each time it connects.
+    edge_tts.communicate.WSS_URL = SYNTHESIS_ENDPOINTS[index]
+
+
+def synthesis_refused(host: str | None) -> bool:
+    """
+    The service refused a synthesis connection on *host* (HTTP 401/403).
+
+    Switches to the next endpoint when *host* is the one in use; a refusal
+    reported late for an endpoint already left behind changes nothing, so
+    two jobs failing at once cannot flip it back.  Returns True if switched.
+    """
+    with _endpoint_lock:
+        if host and host != synthesis_host():
+            return False
+        new = (_endpoint_index + 1) % len(SYNTHESIS_ENDPOINTS)
+        logger.warning("Speech host %s refused the connection; switching to %s",
+                       synthesis_host(), urlsplit(SYNTHESIS_ENDPOINTS[new]).hostname)
+        _use_endpoint(new)
+        return True
+
+
+def _parse_http_date(date: str) -> float | None:
+    """
+    RFC 2616 date → Unix time, in any locale.
+
+    edge_tts parses the server's Date header (used to correct a skewed clock
+    after a 403) with strptime, whose day and month names follow the process
+    locale: under a German or Portuguese locale, which Qt applies on Linux,
+    "Mon, 12 Oct 2026 …" fails and the correction never happens.
+    """
+    try:
+        parsed = parsedate_to_datetime(date)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+_use_endpoint(0)
+edge_tts.drm.DRM.parse_rfc2616_date = staticmethod(_parse_http_date)
 
 
 def build_ssl_context() -> ssl.SSLContext:

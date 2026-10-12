@@ -42,9 +42,10 @@ from app.services.tts_quality import (
 )
 from app.services.tts_service import (
     DEFAULT_CONNECT_TIMEOUT_S,
-    SPEECH_HOST,
     build_communicate,
     list_voices,
+    synthesis_host,
+    synthesis_refused,
     system_proxy,
 )
 from app.utils.mp3_duration import mp3_duration_seconds
@@ -1059,7 +1060,7 @@ async def _service_reachable() -> bool:
         return True
     try:
         _reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(SPEECH_HOST, 443),
+            asyncio.open_connection(synthesis_host(), 443),
             _OUTAGE_PROBE_TIMEOUT_S,
         )
     except (OSError, asyncio.TimeoutError):
@@ -2660,7 +2661,7 @@ class TTSWorker(QThread):
         started = time.monotonic()
         logger.warning(
             "%s: cannot reach %s — waiting for the connection to return",
-            chunk_label, SPEECH_HOST,
+            chunk_label, synthesis_host(),
         )
         self.status_changed.emit("Waiting for internet connection…")
         self.stage_changed.emit(
@@ -2863,6 +2864,12 @@ class TTSWorker(QThread):
         chunk_label: str,
     ) -> _AttemptFailure:
         msg = str(exc).lower()
+
+        # The host refused us outright: the next attempt goes to the other
+        # synthesis endpoint (the legacy one began refusing everyone).
+        if isinstance(exc, aiohttp.WSServerHandshakeError) and exc.status in (401, 403):
+            refused = getattr(getattr(exc, "request_info", None), "url", None)
+            synthesis_refused(getattr(refused, "host", None))
 
         if isinstance(exc, asyncio.TimeoutError) or isinstance(
             exc, (aiohttp.ServerTimeoutError, aiohttp.SocketTimeoutError)
