@@ -1,18 +1,18 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# build_windows.ps1 — build the Windows portable release zip for SetupTTS
+# build_windows.ps1 - build the Windows portable release zip for SetupTTS
 #
 # Run this from the project root in PowerShell:
 #   .\build_windows.ps1
 #
 # Requirements:
-#   - Python 3.11 or 3.12 64-bit  (python.org — add to PATH during install)
+#   - Python 3.11 or 3.12 64-bit  (python.org - add to PATH during install)
 #   - pip install -r requirements.txt pyinstaller
 #
 # Output:
 #   releases\SetupTTS-Windows-<version>.zip   single self-contained EXE
 #
 # This script builds the PORTABLE release using setuptts_portable.spec
-# (onefile mode).  The resulting EXE is fully self-contained — users
+# (onefile mode).  The resulting EXE is fully self-contained - users
 # extract the zip and double-click SetupTTS.exe.  No folder management needed.
 #
 # For the guided installer, use GitHub Actions (build.yml) which also runs
@@ -78,7 +78,7 @@ if (-not (Test-Path "$($tmpDir.FullName)\$AppName.exe")) {
     throw "$AppName.exe missing after extraction"
 }
 Remove-Item -Recurse -Force $tmpDir.FullName
-Write-Host "       Zip verified — $AppName.exe present after extraction"
+Write-Host "       Zip verified - $AppName.exe present after extraction"
 
 Write-Host ""
 Write-Host "=== Build complete ===" -ForegroundColor Green

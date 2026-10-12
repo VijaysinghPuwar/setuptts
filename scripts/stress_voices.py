@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import resource
 import sys
 import time
 from pathlib import Path
@@ -198,6 +197,29 @@ def _cases(sources: set[str], long_chars: int) -> list[dict]:
 # ── Running ────────────────────────────────────────────────────────────── #
 
 def _rss_mb() -> float:
+    """Peak memory of this process, in MB."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class _Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        *((n, ctypes.c_size_t) for n in (
+                            "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                            "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                            "PagefileUsage", "PeakPagefileUsage"))]
+
+        c = _Counters()
+        c.cb = ctypes.sizeof(c)
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        k32.K32GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb)
+        return c.PeakWorkingSetSize / (1024 * 1024)
+    import resource
+
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
 

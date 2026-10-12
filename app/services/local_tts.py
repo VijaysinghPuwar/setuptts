@@ -9,11 +9,16 @@ writer serve both.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Protocol
 
 from app.services import piper_tts, system_tts
+from app.utils.file_ops import replace_with_retry
+from app.utils.output_paths import next_free_path
+
+logger = logging.getLogger(__name__)
 
 MP3_BITRATE_KBPS = 64
 
@@ -124,7 +129,19 @@ class Mp3Writer:
         self._fh.flush()
         os.fsync(self._fh.fileno())
         self._fh.close()
-        os.replace(self._part, self.path)
+        try:
+            replace_with_retry(self._part, self.path)
+        except PermissionError:
+            # The file being replaced is open elsewhere (a media player, or
+            # Explorer's preview pane on Windows).  The .part was written in
+            # the same folder, so the folder is writable: keep the finished
+            # audio under the next free name rather than throwing it away.
+            if not self.path.exists():
+                raise
+            alt = next_free_path(self.path)
+            replace_with_retry(self._part, alt)
+            logger.warning("%s is in use; saved as %s instead", self.path, alt.name)
+            self.path = alt
         self._done = True
         return self.path
 

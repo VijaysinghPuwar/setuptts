@@ -27,7 +27,7 @@ from app import APP_NAME, APP_VERSION
 from app.config.settings import AppSettings
 from app.utils.app_logging import log_file_path
 from app.utils.diagnostics import build_kind, environment_text
-from app.utils.paths import AppPaths, open_in_file_manager
+from app.utils.paths import AppPaths, default_output_dir, open_in_file_manager
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ class SettingsDialog(QDialog):
         dir_row = QHBoxLayout()
         dir_row.setSpacing(6)
         self._output_dir_edit = QLineEdit()
-        self._output_dir_edit.setPlaceholderText(str(Path.home() / "Desktop"))
+        self._output_dir_edit.setPlaceholderText(default_output_dir())
         self._output_dir_edit.setAccessibleName("Default save folder")
         dir_row.addWidget(self._output_dir_edit, 1)
         browse_btn = QPushButton("Browse…")
@@ -207,7 +207,7 @@ class SettingsDialog(QDialog):
         self._log_file_label.set_path(str(self._log_file_path()))
 
     def _browse_output_dir(self) -> None:
-        current = self._output_dir_edit.text() or str(Path.home() / "Desktop")
+        current = self._output_dir_edit.text() or default_output_dir()
         path = QFileDialog.getExistingDirectory(self, "Select Default Output Folder", current)
         if path:
             self._output_dir_edit.setText(path)

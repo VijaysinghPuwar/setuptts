@@ -116,7 +116,29 @@ def build_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-def system_proxy() -> str | None:
+_BYPASS_TTL_S = 300.0
+_bypass_cache: tuple[tuple, float, bool] | None = None
+
+
+def _bypasses_proxy(proxies: dict, host: str) -> bool:
+    """
+    urllib.request.proxy_bypass(host), remembered for a few minutes.
+
+    On Windows, with a proxy bypass list set, the check does a DNS and a
+    reverse-DNS lookup — and it runs once per chunk inside the event loop.
+    """
+    global _bypass_cache
+    check = urllib.request.proxy_bypass
+    key = (tuple(sorted(proxies.items())), host, check)
+    now = time.monotonic()
+    if _bypass_cache is not None and _bypass_cache[0] == key and now - _bypass_cache[1] < _BYPASS_TTL_S:
+        return _bypass_cache[2]
+    result = bool(check(host))
+    _bypass_cache = (key, now, result)
+    return result
+
+
+def system_proxy(host: str | None = None) -> str | None:
     """
     The HTTP proxy the system is set to use, or None.
 
@@ -129,7 +151,7 @@ def system_proxy() -> str | None:
         return None
     try:
         proxies = urllib.request.getproxies()
-        if proxies and urllib.request.proxy_bypass(SPEECH_HOST):
+        if proxies and _bypasses_proxy(proxies, host or synthesis_host()):
             return None
     except Exception:  # noqa: BLE001 - a broken proxy setting must not stop the app
         logger.warning("Could not read the system proxy setting", exc_info=True)
@@ -241,7 +263,7 @@ async def list_voices(*, force_refresh: bool = False) -> list[dict]:
     ):
         return list(_VOICE_CACHE)
 
-    voices = await edge_tts.list_voices(proxy=system_proxy())
+    voices = await edge_tts.list_voices(proxy=system_proxy(SPEECH_HOST))
     _VOICE_CACHE = list(voices)
     _VOICE_CACHE_AT = now
     return list(voices)

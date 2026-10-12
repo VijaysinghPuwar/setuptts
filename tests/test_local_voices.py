@@ -566,9 +566,8 @@ def test_piper_voice_cache_is_bounded(monkeypatch, tmp_path):
     import types
 
     loads = []
-    fake = types.SimpleNamespace(PiperVoice=types.SimpleNamespace(
-        load=lambda path, download_dir=None, **_kw: loads.append(path) or types.SimpleNamespace()))
-    monkeypatch.setitem(sys.modules, "piper", fake)
+    monkeypatch.setattr(piper_tts, "_open_voice",
+                        lambda path: loads.append(path) or types.SimpleNamespace())
     monkeypatch.setattr(piper_tts, "_LOADED", piper_tts.OrderedDict())
     monkeypatch.setattr(piper_tts, "user_dir", lambda: tmp_path)
     monkeypatch.setattr(piper_tts, "_MAX_LOADED", 2)

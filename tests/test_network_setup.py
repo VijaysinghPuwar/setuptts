@@ -78,7 +78,7 @@ def test_bypassed_host_goes_direct(monkeypatch, no_env_proxy):
     monkeypatch.setattr(urllib.request, "getproxies",
                         lambda: {"https": "http://10.0.0.1:8080"})
     monkeypatch.setattr(urllib.request, "proxy_bypass",
-                        lambda host: host == tts_service.SPEECH_HOST)
+                        lambda host: host == tts_service.synthesis_host())
     assert tts_service.system_proxy() is None
 
 
@@ -110,7 +110,7 @@ def test_voice_list_request_uses_the_proxy(monkeypatch):
         return [{"ShortName": "en-US-AvaNeural"}]
 
     monkeypatch.setattr(tts_service.edge_tts, "list_voices", fake_list_voices)
-    monkeypatch.setattr(tts_service, "system_proxy", lambda: "http://10.0.0.1:8080")
+    monkeypatch.setattr(tts_service, "system_proxy", lambda host=None: "http://10.0.0.1:8080")
     asyncio.run(tts_service.list_voices(force_refresh=True))
     assert seen["proxy"] == "http://10.0.0.1:8080"
 

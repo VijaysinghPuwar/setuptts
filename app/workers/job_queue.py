@@ -377,6 +377,10 @@ class JobQueue(QObject):
             worker = item.worker
         else:
             return
+        if output_path and output_path != item.output_path:
+            # The worker saved under another name (the target was in use).
+            item.output_path = output_path
+            item.filename = Path(output_path).name
         item.audio_seconds = getattr(worker, "audio_duration_seconds", None)
         item.status      = "completed"
         item.status_text = "Completed"

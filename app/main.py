@@ -74,9 +74,6 @@ def main() -> None:
         from app.selftest import run as run_selftest
         sys.exit(run_selftest(sys.argv))
 
-    # Required before QApplication on some platforms
-    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
-
     # On macOS, prevent the app icon from bouncing endlessly in the Dock
     if sys.platform == "darwin":
         os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
@@ -98,6 +95,15 @@ def main() -> None:
     from app.utils.single_instance import SingleInstance
     instance = SingleInstance(paths.data_dir)
     if not instance.acquire():
+        if sys.platform == "win32":
+            # Only the process the user just launched may take the foreground;
+            # without passing that right on, Windows refuses the running
+            # window's request and merely flashes its taskbar button.
+            try:
+                import ctypes
+                ctypes.windll.user32.AllowSetForegroundWindow(-1)   # ASFW_ANY
+            except Exception:  # noqa: BLE001
+                pass
         instance.notify_running_instance()
         sys.exit(0)
 

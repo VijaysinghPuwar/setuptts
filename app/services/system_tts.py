@@ -145,6 +145,7 @@ foreach ($path in @(
 # start-up cost is paid once, not per chunk.
 _WIN_SERVE_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $voice = New-Object -ComObject SAPI.SpVoice
 $current = ''
 [Console]::Out.WriteLine('READY'); [Console]::Out.Flush()

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from app.utils.file_ops import replace_with_retry
 from app.utils.paths import AppPaths, resource_path
 
 logger = logging.getLogger(__name__)
@@ -213,7 +214,7 @@ def fetch_catalog(*, force_refresh: bool = False) -> list[CatalogVoice]:
             raw = json.loads(body.decode("utf-8"))
             tmp = cache.with_name(cache.name + ".tmp")
             tmp.write_bytes(body)
-            tmp.replace(cache)
+            replace_with_retry(tmp, cache)
         except Exception:
             if cache.exists():
                 logger.warning("Voice catalog refresh failed; using cached copy", exc_info=True)
@@ -293,14 +294,21 @@ def download_voice(
                 raise OSError(f"Download of {final.name} is corrupted (checksum mismatch)")
             staged.append((part, final))
         for part, final in staged:
-            os.replace(part, final)
+            # Defender scans a fresh 60-110 MB model for a moment after it is
+            # written; a rename during the scan is a sharing violation.
+            replace_with_retry(part, final, attempts=8)
         staged.clear()
         return dest / f"{voice.key}.onnx"
     finally:
-        for part, _ in staged:
-            part.unlink(missing_ok=True)
-        for rel in voice.files:
-            (dest / (Path(rel).name + ".part")).unlink(missing_ok=True)
+        # Cleanup must never mask the real error (a .part still being scanned
+        # can't be deleted yet on Windows).
+        leftovers = [part for part, _ in staged]
+        leftovers += [dest / (Path(rel).name + ".part") for rel in voice.files]
+        for part in leftovers:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("Could not remove %s", part, exc_info=True)
 
 
 def remove_voice(key: str) -> bool:
@@ -435,19 +443,34 @@ def _windows_short_path(path: Path) -> Path | None:
         return None
 
 
-def _configure_session(voice, model: str) -> None:
-    """Re-open the model with threads sized for parallel runs."""
-    try:
-        import onnxruntime
+def _open_voice(model: str):
+    """
+    Load a voice model with one onnxruntime session sized for parallel runs.
 
-        opts = onnxruntime.SessionOptions()
+    PiperVoice.load builds a default session (every core) that would have to
+    be replaced by a tuned one — loading the model twice, which doubled load
+    time and briefly memory while holding _LOADED_LOCK.
+    """
+    import onnxruntime
+    from piper import PiperVoice
+    from piper.config import PiperConfig
+
+    with open(f"{model}.json", encoding="utf-8") as fh:
+        config = PiperConfig.from_dict(json.load(fh))
+    opts = onnxruntime.SessionOptions()
+    if _THREADS_PER_RUN:
         opts.intra_op_num_threads = _THREADS_PER_RUN
         opts.inter_op_num_threads = 1
-        voice.session = onnxruntime.InferenceSession(
-            model, sess_options=opts, providers=["CPUExecutionProvider"],
-        )
-    except Exception:  # noqa: BLE001 - the default session still works
-        logger.warning("Could not tune the offline voice session", exc_info=True)
+    # Idle worker threads otherwise busy-wait for the next run: about 30% more
+    # CPU (and heat, fan, battery) for no measurable gain in speed.
+    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    session = onnxruntime.InferenceSession(
+        model, sess_options=opts, providers=["CPUExecutionProvider"],
+    )
+    return PiperVoice(
+        session=session, config=config,
+        espeak_data_dir=_espeak_data_dir(), download_dir=user_dir(),
+    )
 
 
 def _load(path: Path):
@@ -455,12 +478,7 @@ def _load(path: Path):
     with _LOADED_LOCK:
         voice = _LOADED.get(key)
         if voice is None:
-            from piper import PiperVoice
-            voice = PiperVoice.load(
-                key, download_dir=str(user_dir()), espeak_data_dir=_espeak_data_dir(),
-            )
-            if _THREADS_PER_RUN:
-                _configure_session(voice, key)
+            voice = _open_voice(key)
             # At most _PARALLEL_RUNS runs of one model at a time, across every
             # job and preview using it (see PiperSynthesizer.synthesize).
             voice.setuptts_run_lock = threading.BoundedSemaphore(_PARALLEL_RUNS)
