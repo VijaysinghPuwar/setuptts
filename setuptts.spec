@@ -231,7 +231,9 @@ if sys.platform != "win32":
             "NSRequiresAquaSystemAppearance": False,
             "LSMinimumSystemVersion":    "15.0",   # PySide6 6.10+ (shiboken) needs macOS 15 — CI verifies against the bundled binaries
             # App Nap throttles a hidden app's timers and network: a job left
-            # running behind other windows would slow down or stall.
+            # running behind other windows would slow down or stall.  Recent
+            # macOS ignores this key; app/utils/power.py claims an activity
+            # while a job runs, which is what actually keeps it at speed.
             "NSAppSleepDisabled":        True,
             "NSHumanReadableCopyright":  "© 2025–2026 SetupTTS",
         },
