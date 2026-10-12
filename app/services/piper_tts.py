@@ -628,6 +628,39 @@ def _split_clauses(phonemes: list[str], limit: int = _CLAUSE_SPLIT_PHONEMES) -> 
     return [p for p in pieces if p]
 
 
+def _known_phonemes(voice, phonemes: list[str]) -> list[str]:
+    """
+    Drop phonemes the voice's model has no id for, before Piper does.
+
+    espeak-ng marks syllabic consonants with U+0329 (the "n̩" of "button");
+    Ryan (high) and other voices have no id for it.  Piper skips such a
+    phoneme anyway, but logs a warning for every one — 290 in a single book,
+    burying real warnings.  The ids passed to the model are identical; each
+    unknown phoneme is logged once per voice instead.
+    """
+    known = getattr(voice, "setuptts_known_phonemes", None)
+    if known is None:
+        id_map = getattr(voice.config, "phoneme_id_map", None)
+        if not id_map:
+            return phonemes
+        known = frozenset(id_map)
+        # Skipped set first: the pool's other thread may see the known set
+        # as soon as it is assigned.
+        voice.setuptts_skipped_phonemes = set()
+        voice.setuptts_known_phonemes = known
+    if all(p in known for p in phonemes):
+        return phonemes
+    kept = []
+    for p in phonemes:
+        if p in known:
+            kept.append(p)
+        elif p not in voice.setuptts_skipped_phonemes:
+            voice.setuptts_skipped_phonemes.add(p)
+            logger.info("Offline voice has no sound for phoneme %r (U+%s); skipping it, "
+                        "as Piper would", p, "+".join(f"{ord(c):04X}" for c in p))
+    return kept
+
+
 class PiperSynthesizer:
     """Same interface as SystemSynthesizer: synthesize / cancel / close."""
 
@@ -690,7 +723,7 @@ class PiperSynthesizer:
             if self._cancelled:
                 raise PiperCancelled("cancelled")
             voice, run_lock = self._voice, self._run_lock
-            ids = voice.phonemes_to_ids(phonemes)
+            ids = voice.phonemes_to_ids(_known_phonemes(voice, phonemes))
             # Runs per model are capped across all jobs and previews:
             # onnxruntime keeps the peak working memory of every concurrent
             # run (unbounded, two jobs and a preview reached 1.2 GB).
