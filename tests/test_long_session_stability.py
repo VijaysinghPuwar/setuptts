@@ -389,6 +389,67 @@ def test_keep_awake_really_holds_a_macos_assertion(monkeypatch):
     assert proc.poll() is not None
 
 
+@pytest.fixture
+def fake_full_speed(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(power, "_speed_holders", 0)
+    monkeypatch.setattr(power, "_speed_token", None)
+    monkeypatch.setattr(power, "_begin_full_speed", lambda: calls.append("begin") or "token")
+    monkeypatch.setattr(power, "_end_full_speed", lambda token: calls.append(f"end:{token}"))
+    monkeypatch.setattr(power, "_acquire_shared", lambda: None)
+    monkeypatch.setattr(power, "_release_shared", lambda: None)
+    monkeypatch.setattr(power, "_set_windows_state", lambda _f: True)
+    return calls
+
+
+def test_full_speed_claim_is_shared_across_concurrent_jobs(fake_full_speed):
+    """Two jobs ran side by side; ending the first must not let App Nap
+    throttle the second."""
+    with power.keep_awake():
+        with power.keep_awake():
+            assert fake_full_speed == ["begin"]
+        assert fake_full_speed == ["begin"], "released while a job still runs"
+    assert fake_full_speed == ["begin", "end:token"]
+    assert power._speed_holders == 0 and power._speed_token is None
+
+
+def test_full_speed_claim_released_on_error(fake_full_speed):
+    with pytest.raises(RuntimeError):
+        with power.keep_awake():
+            raise RuntimeError("job failed")
+    assert fake_full_speed == ["begin", "end:token"]
+
+
+def test_full_speed_failure_never_breaks_a_job(monkeypatch, fake_full_speed):
+    def boom():
+        raise OSError("no objc")
+
+    monkeypatch.setattr(power, "_begin_full_speed", boom)
+    with power.keep_awake():
+        pass
+    assert power._speed_holders == 0 and power._speed_token is None
+    assert fake_full_speed == []
+
+
+@pytest.mark.skipif(power.sys.platform != "darwin", reason="macOS App Nap")
+def test_keep_awake_really_begins_a_macos_activity(monkeypatch):
+    """NSAppSleepDisabled in Info.plist stopped preventing App Nap: a hidden
+    1.7.x app was napped within ~70 s and offline jobs ran 3-4x slower."""
+    monkeypatch.setattr(power, "_speed_holders", 0)
+    monkeypatch.setattr(power, "_speed_token", None)
+    with power.keep_awake():
+        token = power._speed_token
+        assert isinstance(token, power._MacActivity) and token._token
+    assert token._token is None
+    assert power._speed_token is None
+
+
+@pytest.mark.skipif(power.sys.platform != "win32", reason="Windows power throttling")
+def test_windows_power_throttling_opt_out_is_accepted():
+    assert power._set_windows_throttling(True)
+    assert power._set_windows_throttling(False)
+
+
 def test_short_unsplittable_chunk_gets_all_its_retries(fake_net, tmp_path):
     """A chapter's last lines (too short to split) timed out twice and the job
     failed after 2 of 5 attempts, because the early switch to smaller
