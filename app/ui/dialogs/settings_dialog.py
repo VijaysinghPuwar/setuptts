@@ -1,6 +1,7 @@
 """Settings dialog."""
 
 import logging
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
@@ -124,6 +125,26 @@ class SettingsDialog(QDialog):
             "recommended voice instead of asking first."
         ))
 
+        # ── Graphics card (Windows only) ───────────────────────────── #
+        self._gpu_status_label: QLabel | None = None
+        if sys.platform == "win32":
+            root.addWidget(self._section_title("Graphics card"))
+            root.addWidget(self._note(
+                "Run offline voices on an NVIDIA graphics card — often several "
+                "times faster."
+            ))
+            self._gpu_status_label = QLabel()
+            self._gpu_status_label.setObjectName("dialogFieldLabel")
+            self._gpu_status_label.setWordWrap(True)
+            root.addWidget(self._gpu_status_label)
+            gpu_btn = QPushButton("GPU Settings…")
+            gpu_btn.clicked.connect(self._open_gpu_dialog)
+            gpu_row = QHBoxLayout()
+            gpu_row.addWidget(gpu_btn)
+            gpu_row.addStretch()
+            root.addLayout(gpu_row)
+            self._refresh_gpu_status()
+
         # ── Logs ───────────────────────────────────────────────────── #
         root.addWidget(self._section_title("Logs & Troubleshooting"))
         root.addWidget(self._note(
@@ -219,6 +240,21 @@ class SettingsDialog(QDialog):
         self.accept()
 
     # ------------------------------------------------------------------ #
+    # Graphics card                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _refresh_gpu_status(self) -> None:
+        if self._gpu_status_label is not None:
+            self._gpu_status_label.setText(gpu_status_text(self._settings))
+
+    def _open_gpu_dialog(self) -> None:
+        from app.ui.dialogs.gpu_dialog import GpuDialog
+
+        dialog = GpuDialog(self._settings, self)
+        dialog.exec()
+        self._refresh_gpu_status()
+
+    # ------------------------------------------------------------------ #
     # Log shortcuts                                                        #
     # ------------------------------------------------------------------ #
 
@@ -282,6 +318,36 @@ class SettingsDialog(QDialog):
         lbl.setWordWrap(True)
         lbl.setObjectName("metaLabel")
         return lbl
+
+
+def gpu_status_text(settings: AppSettings) -> str:
+    """One-line GPU support status, cheap enough for opening Settings (no nvidia-smi)."""
+    from app.services import gpu_accel
+
+    try:
+        mode = settings.gpu_mode
+        if mode == "cpu":
+            return "Processor"
+        installed = gpu_accel.pack_installed()
+        if not installed:
+            # Nothing downloaded (or no NVIDIA card at all): the processor
+            # is what runs, and that is not a problem worth flagging.
+            return "Processor"
+        check = gpu_accel.load_check()
+        use, _why = gpu_accel.decide(mode, installed, check)
+        if mode == "gpu":
+            text = "Graphics card"
+        elif use:
+            name = str((check or {}).get("gpu_name") or "NVIDIA graphics card")
+            text = f"Automatic — graphics card ({name})"
+        else:
+            text = "Automatic — processor"
+        if use and gpu_accel.failure():
+            text += " (stopped working this session; using the processor)"
+        return text
+    except Exception:  # noqa: BLE001 - never break Settings over this
+        logger.warning("Could not read GPU support status", exc_info=True)
+        return "Unknown"
 
 
 # ---------------------------------------------------------------------- #

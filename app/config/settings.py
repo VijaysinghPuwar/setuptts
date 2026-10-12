@@ -29,7 +29,12 @@ _DEFAULTS: dict[str, Any] = {
     "window_y": None,
     "show_history": True,
     "history_panel_height": 200,
+    # Windows + NVIDIA, offline voices: "auto" (the faster of card and
+    # processor, from the speed check) | "gpu" | "cpu".
+    "gpu_mode": "auto",
 }
+
+GPU_MODES = ("auto", "gpu", "cpu")
 
 
 #: Allowed ranges for numeric settings; out-of-range values are clamped.
@@ -233,6 +238,15 @@ class AppSettings:
     @auto_switch_recommended_voice.setter
     def auto_switch_recommended_voice(self, value: bool) -> None:
         self._data["auto_switch_recommended_voice"] = bool(value)
+
+    @property
+    def gpu_mode(self) -> str:
+        mode = self._data.get("gpu_mode", "auto")
+        return mode if mode in GPU_MODES else "auto"
+
+    @gpu_mode.setter
+    def gpu_mode(self, value: str) -> None:
+        self._data["gpu_mode"] = value if value in GPU_MODES else "auto"
 
     def rate_string(self) -> str:
         """Return rate as edge_tts expects: '+5%' or '-10%'."""

@@ -74,6 +74,11 @@ def main() -> None:
         from app.selftest import run as run_selftest
         sys.exit(run_selftest(sys.argv))
 
+    # GPU speed check, run in its own process by the GPU support dialog.
+    if "--gpu-check" in sys.argv:
+        from app.gpu_check import run as run_gpu_check
+        sys.exit(run_gpu_check(sys.argv))
+
     # On macOS, prevent the app icon from bouncing endlessly in the Dock
     if sys.platform == "darwin":
         os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
@@ -116,6 +121,14 @@ def main() -> None:
 
     # Load settings
     settings = AppSettings(paths)
+
+    # Windows + NVIDIA: run offline voices on the graphics card when that is
+    # chosen, or (automatic) when the speed check found it faster than the
+    # processor.  Must run before anything imports onnxruntime; a no-op on
+    # macOS and Linux.
+    if sys.platform == "win32":
+        from app.services import gpu_accel
+        gpu_accel.startup(settings.gpu_mode)
 
     # Set app-wide icon (taskbar, dock, dialogs)
     icon_path = paths.icon_path
