@@ -474,6 +474,7 @@ def _open_voice(model: str, gpu: bool = False):
     if gpu:
         from app.services import gpu_accel
 
+        gpu_accel.ensure_cuda_loaded()
         providers = [("CUDAExecutionProvider", gpu_accel.cuda_provider_options()),
                      "CPUExecutionProvider"]
     else:
@@ -531,13 +532,16 @@ def _load(path: Path, gpu: bool | None = None):
                     raise
                 from app.services import gpu_accel
 
-                gpu_accel.mark_failed(f"could not load {path.stem}: {exc}")
                 key = _cache_key(path, False)
                 cached = _LOADED.get(key)
+                # The processor loading the same model proves the card (not
+                # the model file) was at fault; if it fails too, that error
+                # is the one to report and the card stays in use.
+                voice = cached if cached is not None else _open_voice(str(path))
+                gpu_accel.mark_failed(f"could not load {path.stem}: {exc}")
                 if cached is not None:
                     _LOADED.move_to_end(key)
                     return cached
-                voice = _open_voice(str(path))
                 want_gpu = False
             voice.setuptts_on_gpu = want_gpu
             # At most _PARALLEL_RUNS runs of one model at a time, across every
@@ -645,6 +649,7 @@ class PiperSynthesizer:
         self._path = path
         self._forced_device = gpu is not None
         self._swap_lock = threading.Lock()
+        self._cpu = None
         self.sample_rate = int(self._voice.config.sample_rate)
         self._run_lock = getattr(self._voice, "setuptts_run_lock", None) or threading.Lock()
         self._cancelled = False
@@ -699,11 +704,14 @@ class PiperSynthesizer:
             except Exception as exc:  # noqa: BLE001
                 if not getattr(voice, "setuptts_on_gpu", False) or self._forced_device:
                     raise
-                voice, run_lock = self._fall_back_to_cpu(voice, exc)
-                with run_lock:
+                # Retry on the processor; only if that works was the card at
+                # fault (a bad model fails on both and is reported as such).
+                cpu_voice, cpu_lock = self._cpu_voice()
+                with cpu_lock:
                     if self._cancelled:
                         raise PiperCancelled("cancelled")
-                    audio = voice.phoneme_ids_to_audio(ids, cfg)
+                    audio = cpu_voice.phoneme_ids_to_audio(ids, cfg)
+                self._switch_to_cpu(voice, cpu_voice, cpu_lock, exc)
             if isinstance(audio, tuple):
                 audio = audio[0]
             audio = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -730,18 +738,26 @@ class PiperSynthesizer:
     def on_gpu(self) -> bool:
         return bool(getattr(self._voice, "setuptts_on_gpu", False))
 
-    def _fall_back_to_cpu(self, failed_voice, exc: BaseException):
-        """The card failed mid-job: carry on with the same voice on the processor."""
+    def _cpu_voice(self):
+        """The same voice on the processor (loaded once, for a mid-job fallback)."""
+        with self._swap_lock:
+            if self._cpu is None:
+                self._cpu = _load(self._path, False)
+            return self._cpu, (getattr(self._cpu, "setuptts_run_lock", None) or threading.Lock())
+
+    def _switch_to_cpu(self, failed_voice, cpu_voice, cpu_lock, exc: BaseException) -> None:
+        """The card failed where the processor worked: finish the job on the processor."""
         with self._swap_lock:
             if self._voice is failed_voice:
                 from app.services import gpu_accel
 
                 gpu_accel.mark_failed(str(exc) or type(exc).__name__)
                 _evict(self._path, True)
-                self._voice = _load(self._path, False)
-                self._run_lock = (getattr(self._voice, "setuptts_run_lock", None)
-                                  or threading.Lock())
-            return self._voice, self._run_lock
+                # (render reads _voice then _run_lock without the lock; a
+                # thread catching the pair mid-swap at worst runs once more
+                # on the card and lands here again, or runs on the processor
+                # under the card's semaphore — both harmless.)
+                self._voice, self._run_lock = cpu_voice, cpu_lock
 
     def cancel(self) -> None:
         self._cancelled = True

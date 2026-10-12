@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 
@@ -492,6 +493,14 @@ class GpuDialog(QDialog):
             proc.errorOccurred.disconnect()
         except (RuntimeError, TypeError):
             pass
+        # The portable build is a launcher that unpacks and starts the real
+        # app as a child; kill the whole tree so no check keeps running.
+        pid = proc.processId()
+        if sys.platform == "win32" and pid:
+            import subprocess
+
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                           capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         proc.kill()
         proc.waitForFinished(2_000)
         self._end_check()

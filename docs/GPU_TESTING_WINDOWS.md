@@ -272,8 +272,15 @@ must work normally on the processor.
   - `decide()` maps the mode, the pack and `check.json` to a choice and a
     reason.
   - `startup()` logs the `Offline voices: ...` line.
-  - `activate()` adds the DLL folders and `PATH`, preloads `_PRELOAD_DLLS`,
-    and installs the `_RedirectFinder` import hook.
+  - `activate()` adds the DLL folders and `PATH`, sets
+    `CUDA_DEVICE_ORDER=PCI_BUS_ID`, and installs the `_RedirectFinder` import
+    hook. `startup()` then imports onnxruntime and undoes everything
+    (`_deactivate()`) if that fails, so a damaged pack falls back to the
+    bundled CPU build.
+  - `ensure_cuda_loaded()` preloads `_PRELOAD_DLLS` by full path the first
+    time a voice goes on the card (not at launch). `cuda_provider_loads()`
+    (reported by `--gpu-check` as `cuda_provider_loads`) tells a missing DLL
+    apart from "no device".
   - `requirement_problem()` checks the driver and compute capability.
   - `download_pack()` downloads and unpacks the pack.
 - `app/services/piper_tts.py`:

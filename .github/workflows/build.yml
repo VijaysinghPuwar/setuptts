@@ -336,6 +336,7 @@ jobs:
           }
           if ($r.onnxruntime -ne "1.30.0") { $fail += "onnxruntime version is '$($r.onnxruntime)', expected 1.30.0" }
           if ("$($r.onnxruntime_file)" -notmatch "gpu_runtime") { $fail += "onnxruntime was loaded from '$($r.onnxruntime_file)', not the GPU pack" }
+          if ($r.cuda_provider_loads -ne $true) { $fail += "the CUDA provider DLL or a CUDA/cuDNN library it needs did not load: $($r.error)" }
           if (!($r.cpu_chars_per_s -gt 0)) { $fail += "no CPU benchmark through the GPU build of onnxruntime" }
           if ("$($r.error) $($r.detail)" -match "ImportError|ModuleNotFoundError|No module named|DLL load failed") {
             $fail += "import failure in the frozen app: $($r.error)"
@@ -346,6 +347,28 @@ jobs:
           foreach ($f in $fail) { Write-Host "::error::$f" }
           if ($fail.Count) { exit 1 }
           Write-Host "GPU pack import OK; verdict without a GPU: $($r.error)"
+
+      # The real launch path with "Graphics card" chosen: startup() wires the
+      # pack in, the offline voice tries the card (none here), and must still
+      # speak on the processor with the card's failure recorded.
+      - name: Self-test onedir build with GPU support switched on (no card → processor)
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $out = "$pwd\selftest-gpu-startup.json"
+          $p = Start-Process -FilePath "dist\SetupTTS\SetupTTS.exe" `
+                 -ArgumentList @("--selftest", "`"$out`"", "--bundled-voice", "--gpu-startup") -Wait -PassThru
+          if (!(Test-Path $out)) { Write-Host "::error::no self-test output (exit $($p.ExitCode))"; exit 1 }
+          Get-Content $out
+          $r = Get-Content $out -Raw | ConvertFrom-Json
+          $fail = @()
+          if (!$r.ok -or $p.ExitCode -ne 0) { $fail += "self-test failed with GPU support switched on" }
+          if ($r.gpu_startup.activated -ne $true) { $fail += "startup() did not switch the GPU build in: $($r.gpu_startup.reason)" }
+          if (!$r.checks.offline_voice.ok) { $fail += "offline voice failed: $($r.checks.offline_voice.error)" }
+          if (!$r.gpu_startup.failure_after_voice) { $fail += "no card here, yet no GPU failure was recorded (did the voice run on the card?)" }
+          foreach ($f in $fail) { Write-Host "::error::$f" }
+          if ($fail.Count) { exit 1 }
+          Write-Host "Fell back to the processor as expected: $($r.gpu_startup.failure_after_voice)"
 
       - name: Remove GPU support pack
         if: always()

@@ -80,6 +80,12 @@ def check(argv: list[str]) -> dict:
     if "CUDAExecutionProvider" not in result["providers_available"]:
         result["error"] = "The downloaded GPU runtime has no CUDA provider."
         return result
+    # Loads without a card: separates "a DLL is missing" from "no device".
+    loads, why = gpu_accel.cuda_provider_loads()
+    result["cuda_provider_loads"] = loads
+    if not loads:
+        result["error"] = f"The CUDA libraries in GPU support did not load: {why}"
+        return result
 
     from app.services import piper_tts
 

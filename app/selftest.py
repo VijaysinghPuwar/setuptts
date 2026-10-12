@@ -30,6 +30,11 @@ def run(argv: list[str]) -> int:
         else Path("setuptts-selftest.json")
     network = "--network" in argv
     require_bundled = "--bundled-voice" in argv
+    # CI on Windows with GPU support downloaded but no graphics card: start
+    # up exactly as the app does with "Graphics card" chosen, then the
+    # offline-voice check must still speak — on the processor, with the
+    # card's failure recorded.
+    gpu_startup = "--gpu-startup" in argv
 
     results: dict = {"checks": {}, "ok": False}
 
@@ -42,6 +47,11 @@ def run(argv: list[str]) -> int:
         except Exception as exc:  # noqa: BLE001 — every failure is reported
             results["checks"][name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
                                        "trace": traceback.format_exc(limit=6)}
+
+    if gpu_startup:
+        from app.services import gpu_accel
+        results["gpu_startup"] = {"activated": gpu_accel.startup("gpu"),
+                                  "reason": gpu_accel.reason()}
 
     from app import APP_VERSION
     results["version"] = APP_VERSION
@@ -122,6 +132,9 @@ def run(argv: list[str]) -> int:
             out.unlink(missing_ok=True)
         if not seconds or seconds < 1.5:
             raise RuntimeError(f"implausible duration {seconds}")
+        if gpu_startup:
+            from app.services import gpu_accel
+            results["gpu_startup"]["failure_after_voice"] = gpu_accel.failure()
         return f"{piper_tts.BUNDLED_VOICE}: {seconds:.1f} s"
 
     def system_voices():

@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from app.utils.file_ops import replace_with_retry
 from app.utils.paths import AppPaths
 
 logger = logging.getLogger(__name__)
@@ -232,11 +233,30 @@ def _marker() -> Path:
     return pack_dir() / ".complete"
 
 
+#: Files without which the pack can't work; one quarantined by antivirus or
+#: deleted by hand must not count as installed.
+_KEY_FILES = (
+    "onnxruntime/__init__.py",
+    "onnxruntime/capi/onnxruntime_pybind11_state.pyd",
+    "onnxruntime/capi/onnxruntime.dll",
+    "onnxruntime/capi/onnxruntime_providers_shared.dll",
+    "onnxruntime/capi/onnxruntime_providers_cuda.dll",
+)
+
+
 def pack_installed() -> bool:
+    """GPU support is fully in place: this release's wheels, key files present."""
     # A removal waiting for the next start already counts as removed.
     if (runtime_root() / ".remove").exists():
         return False
-    return _marker().is_file() and (pack_dir() / "onnxruntime" / "__init__.py").is_file()
+    try:
+        manifest = json.loads(_marker().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(manifest, dict) or \
+            manifest.get("wheels") != [w.filename for w in WHEELS]:
+        return False
+    return all((pack_dir() / f).is_file() for f in _KEY_FILES)
 
 
 def pack_size_on_disk() -> int:
@@ -309,7 +329,7 @@ def _fetch(wheel: _Wheel, dest: Path, report: Callable[[int], None],
         part.unlink(missing_ok=True)
         raise OSError(f"Download of {wheel.filename} is corrupted (checksum mismatch). "
                       "Try again.")
-    os.replace(part, dest)
+    replace_with_retry(part, dest, attempts=8)
 
 
 def _wanted(wheel: _Wheel, name: str) -> bool:
@@ -385,8 +405,6 @@ def download_pack(
         if progress:
             progress(base, DOWNLOAD_BYTES)
 
-    for flag in staging.glob(".done-*"):
-        flag.unlink(missing_ok=True)
     (staging / ".complete").write_text(
         json.dumps({"id": PACK_ID, "wheels": [w.filename for w in WHEELS],
                     "installed": time.strftime("%Y-%m-%d %H:%M:%S")}),
@@ -398,7 +416,12 @@ def download_pack(
         if final.exists():
             raise OSError(f"Could not replace the old GPU support folder ({final}). "
                           "Restart SetupTTS and try again.")
-    os.replace(staging, final)
+    # Defender scans ~2.9 GB of fresh DLLs; a folder rename while any file
+    # in it is open fails, so ride that out.  Until it succeeds the per-wheel
+    # flags stay, and a retry only redoes this step.
+    replace_with_retry(staging, final, attempts=30)
+    for flag in final.glob(".done-*"):
+        flag.unlink(missing_ok=True)
     shutil.rmtree(downloads, ignore_errors=True)
     logger.info("GPU support installed at %s", final)
     return final
@@ -423,10 +446,27 @@ def remove_pack() -> bool:
 
 
 def _apply_pending_removal() -> None:
+    """Finish a removal scheduled last session; the marker goes last, so a
+    file still locked now is retried at the next start instead of orphaned."""
     root = runtime_root()
-    if (root / ".remove").exists():
-        shutil.rmtree(root, ignore_errors=True)
-        logger.info("Removed GPU support (scheduled at last session)")
+    marker = root / ".remove"
+    if not marker.exists():
+        return
+    for child in root.iterdir():
+        if child == marker:
+            continue
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            try:
+                child.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if [c for c in root.iterdir() if c != marker]:
+        logger.warning("GPU support could not be fully removed yet; will retry at next start")
+        return
+    shutil.rmtree(root, ignore_errors=True)
+    logger.info("Removed GPU support (scheduled at last session)")
 
 
 # ══════════════════════════════════════════════════════════════════════ #
@@ -499,6 +539,9 @@ class _State:
         self.failed: str | None = None  # the card stopped working; CPU from now on
         self.device = ""
         self.reason = ""
+        self.dll_dirs: list[Path] = []
+        self.cuda_loaded = False
+        self.finder: _RedirectFinder | None = None
 
 
 _STATE = _State()
@@ -513,6 +556,10 @@ def activate(*, directory: Path | None = None, package: str = "onnxruntime") -> 
     Make ``import onnxruntime`` load the downloaded GPU build.  Must run
     before anything imports onnxruntime; returns False (and changes nothing)
     when that already happened or the files are missing.
+
+    Only puts the NVIDIA folders on the DLL search path: the ~1.7 GB of CUDA
+    and cuDNN libraries load on first use (:func:`ensure_cuda_loaded`), not
+    at every launch.  onnxruntime itself doesn't need them to import.
     """
     base = directory or pack_dir()
     with _STATE.lock:
@@ -524,8 +571,6 @@ def activate(*, directory: Path | None = None, package: str = "onnxruntime") -> 
         if not (base / package / "__init__.py").is_file():
             return False
         if sys.platform == "win32":
-            import ctypes
-
             dirs = _dll_dirs(base)
             for d in dirs:
                 try:
@@ -536,20 +581,71 @@ def activate(*, directory: Path | None = None, package: str = "onnxruntime") -> 
             # searches PATH rather than add_dll_directory's list.
             os.environ["PATH"] = os.pathsep.join(
                 [str(d) for d in dirs] + [os.environ.get("PATH", "")])
-            for name in _PRELOAD_DLLS:
-                hit = next((d / name for d in dirs if (d / name).is_file()), None)
-                if hit is None:
-                    logger.warning("GPU support: %s not found", name)
-                    continue
-                try:
-                    ctypes.WinDLL(str(hit))
-                except OSError:
-                    logger.warning("GPU support: could not load %s", hit, exc_info=True)
-        sys.meta_path.insert(0, _RedirectFinder(package, base))
+            # Number cards the way nvidia-smi lists them, so the card named in
+            # Settings and checked for requirements is device 0.
+            os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+            _STATE.dll_dirs = dirs
+        finder = _RedirectFinder(package, base)
+        sys.meta_path.insert(0, finder)
+        _STATE.finder = finder
         _STATE.activated = True
         _STATE.failed = None
         logger.info("GPU support activated from %s", base)
         return True
+
+
+def _deactivate(package: str = "onnxruntime") -> None:
+    """Undo :func:`activate` after the GPU build failed to import."""
+    with _STATE.lock:
+        if _STATE.finder is not None and _STATE.finder in sys.meta_path:
+            sys.meta_path.remove(_STATE.finder)
+        _STATE.finder = None
+        for name in [m for m in sys.modules if m == package or m.startswith(package + ".")]:
+            del sys.modules[name]
+        _STATE.activated = False
+
+
+def ensure_cuda_loaded() -> None:
+    """
+    Load the CUDA and cuDNN libraries, by full path, before the first model
+    is put on the card.  Once per session; called from a worker thread.
+    """
+    if sys.platform != "win32":
+        return
+    with _STATE.lock:
+        if _STATE.cuda_loaded:
+            return
+        _STATE.cuda_loaded = True
+        dirs = list(_STATE.dll_dirs)
+    import ctypes
+
+    for name in _PRELOAD_DLLS:
+        hit = next((d / name for d in dirs if (d / name).is_file()), None)
+        if hit is None:
+            logger.warning("GPU support: %s not found", name)
+            continue
+        try:
+            ctypes.WinDLL(str(hit))
+        except OSError:
+            logger.warning("GPU support: could not load %s", hit, exc_info=True)
+
+
+def cuda_provider_loads() -> tuple[bool, str]:
+    """
+    Whether onnxruntime's CUDA provider DLL and everything it links against
+    load (needs no card) — tells "a DLL is missing" apart from "no device".
+    """
+    if sys.platform != "win32":
+        return False, "not Windows"
+    ensure_cuda_loaded()
+    import ctypes
+
+    dll = pack_dir() / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll"
+    try:
+        ctypes.WinDLL(str(dll))
+    except OSError as exc:
+        return False, str(exc)
+    return True, ""
 
 
 def decide(mode: str, installed: bool, check: dict | None) -> tuple[bool, str]:
@@ -596,10 +692,24 @@ def startup(mode: str) -> bool:
     try:
         _apply_pending_removal()
         check = load_check()
-        use, why = decide(mode, pack_installed(), check)
+        installed = pack_installed()
+        use, why = decide(mode, installed, check)
+        if use and sys.version_info[:2] != PYTHON_TAG:
+            use, why = False, "this build of SetupTTS can't use the downloaded GPU support"
         _STATE.reason = why
         logger.info("Offline voices: %s (%s)", "graphics card" if use else "processor", why)
         if not use or not activate():
+            return False
+        # Import it now: a pack that is damaged (a file quarantined by
+        # antivirus) or doesn't fit this build must not leave every offline
+        # voice unable to load — undo, and the bundled CPU build is used.
+        try:
+            import onnxruntime  # noqa: F401
+        except Exception as exc:  # noqa: BLE001
+            _deactivate()
+            _STATE.reason = f"GPU support failed to load ({exc})"
+            mark_failed(_STATE.reason)
+            logger.warning("GPU support failed to load; using the processor", exc_info=True)
             return False
         _STATE.device = str((check or {}).get("gpu_name") or "NVIDIA GPU")
         return True

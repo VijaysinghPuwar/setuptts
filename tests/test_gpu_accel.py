@@ -36,19 +36,23 @@ def _isolated(monkeypatch, tmp_path):
     """Temporary app-data folder; GPU state, meta_path and modules restored."""
     data = tmp_path / "appdata"
     monkeypatch.setenv("SETUPTTS_DATA_DIR", str(data))
-    state = (gpu_accel._STATE.activated, gpu_accel._STATE.failed, gpu_accel._STATE.device,
-             gpu_accel._STATE.reason)
-    gpu_accel._STATE.activated = False
-    gpu_accel._STATE.failed = None
-    gpu_accel._STATE.device = ""
-    gpu_accel._STATE.reason = ""
+    fields = ("activated", "failed", "device", "reason", "dll_dirs", "cuda_loaded", "finder")
+    st = gpu_accel._STATE
+    state = {f: getattr(st, f) for f in fields}
+    st.activated, st.failed, st.device, st.reason = False, None, "", ""
+    st.dll_dirs, st.cuda_loaded, st.finder = [], False, None
     meta_path = list(sys.meta_path)
+    # startup()'s failure path drops onnxruntime* from sys.modules; put the
+    # real (CPU) modules back so later tests don't re-import native code.
+    ort_modules = {m: mod for m, mod in sys.modules.items()
+                   if m == "onnxruntime" or m.startswith("onnxruntime.")}
     yield data
     sys.meta_path[:] = meta_path
     for name in [m for m in sys.modules if m.split(".")[0].startswith("fakeortpkg")]:
         del sys.modules[name]
-    (gpu_accel._STATE.activated, gpu_accel._STATE.failed, gpu_accel._STATE.device,
-     gpu_accel._STATE.reason) = state
+    sys.modules.update(ort_modules)
+    for f, v in state.items():
+        setattr(st, f, v)
 
 
 @pytest.fixture
@@ -315,17 +319,22 @@ def test_open_voice_cpu_uses_only_cpu_provider(monkeypatch, tmp_path):
     monkeypatch.setattr(piper, "PiperVoice", FakeVoice)
     monkeypatch.setattr(piper.config.PiperConfig, "from_dict",
                         staticmethod(lambda d: types.SimpleNamespace(raw=d)))
+    cuda_loads = []
+    monkeypatch.setattr(gpu_accel, "ensure_cuda_loaded",
+                        lambda: cuda_loads.append(len(sessions)))
     model = tmp_path / "m.onnx"
     (tmp_path / "m.onnx.json").write_text("{}", encoding="utf-8")
 
     voice = piper_tts._open_voice(str(model))
     assert sessions == [(str(model), ["CPUExecutionProvider"])]
+    assert cuda_loads == []      # the CPU path never touches CUDA
     assert isinstance(voice, FakeVoice)
     assert disabled == []        # the CPU session keeps onnxruntime's defaults
 
     # The GPU path asks for CUDA first with the tuned options …
     sessions.clear()
     piper_tts._open_voice(str(model), gpu=True)
+    assert cuda_loads == [0]     # CUDA libraries loaded before the session
     providers = sessions[0][1]
     assert providers[0][0] == "CUDAExecutionProvider"
     assert providers[0][1]["cudnn_conv_algo_search"] == "HEURISTIC"
@@ -443,6 +452,10 @@ def zip_bytes(members: dict[str, bytes]) -> bytes:
 ORT_ZIP = zip_bytes({
     "onnxruntime/__init__.py": b"__version__ = '1.30.0'\n",
     "onnxruntime/capi/x.dll": b"ort-dll" * 50,
+    "onnxruntime/capi/onnxruntime_pybind11_state.pyd": b"pyd",
+    "onnxruntime/capi/onnxruntime.dll": b"dll",
+    "onnxruntime/capi/onnxruntime_providers_shared.dll": b"dll",
+    "onnxruntime/capi/onnxruntime_providers_cuda.dll": b"dll",
     "onnxruntime_gpu-1.30.0.dist-info/METADATA": b"meta",
 })
 NV_ZIP = zip_bytes({
@@ -794,12 +807,17 @@ def test_check_recommends(result, expected):
 # ------------------------------------------------------------------ #
 
 @pytest.fixture
-def win(monkeypatch):
+def win(monkeypatch, python_ok):
     monkeypatch.setattr(gpu_accel, "SUPPORTED", True)
     calls = []
 
     def fake_activate(**kw):
+        # Like the real one, minus the import redirect: the (already
+        # imported) CPU onnxruntime then satisfies startup's import.
         calls.append(kw)
+        finder = gpu_accel._RedirectFinder("fakeortpkg-none", Path("/nonexistent"))
+        sys.meta_path.insert(0, finder)
+        gpu_accel._STATE.finder = finder
         gpu_accel._STATE.activated = True
         return True
 
@@ -809,9 +827,11 @@ def win(monkeypatch):
 
 def install_fake_pack():
     d = gpu_accel.pack_dir()
-    (d / "onnxruntime").mkdir(parents=True)
-    (d / "onnxruntime" / "__init__.py").write_text("")
-    (d / ".complete").write_text("{}")
+    for f in gpu_accel._KEY_FILES:
+        (d / f).parent.mkdir(parents=True, exist_ok=True)
+        (d / f).write_text("")
+    (d / ".complete").write_text(json.dumps({"id": gpu_accel.PACK_ID,
+                                             "wheels": [w.filename for w in gpu_accel.WHEELS]}))
 
 
 MIN = gpu_accel.MIN_SPEEDUP
@@ -957,13 +977,16 @@ class FakeVoice:
 def piper_env(monkeypatch, tmp_path, fresh_cache):
     """Fake voices: one per (path, device); GPU support 'active'."""
     env = types.SimpleNamespace(opened=[], gpu_open_error=None, gpu_run_error=None,
+                                cpu_open_error=None, cpu_run_error=None,
                                 path=tmp_path / "en_US-test-medium.onnx", cache=fresh_cache)
 
     def fake_open(model, gpu=False):
         env.opened.append((model, gpu))
         if gpu and env.gpu_open_error is not None:
             raise env.gpu_open_error
-        return FakeVoice(gpu, env.gpu_run_error if gpu else None)
+        if not gpu and env.cpu_open_error is not None:
+            raise env.cpu_open_error
+        return FakeVoice(gpu, env.gpu_run_error if gpu else env.cpu_run_error)
 
     monkeypatch.setattr(piper_tts, "_open_voice", fake_open)
     monkeypatch.setattr(piper_tts, "_wants_gpu", lambda: gpu_accel.failure() is None)
@@ -990,6 +1013,27 @@ def test_load_gpu_failure_falls_back_to_cpu(piper_env, monkeypatch):
     assert gpu_accel.failure() is not None
     assert list(piper_env.cache) == [str(piper_env.path)]
     assert piper_env.opened == [(str(piper_env.path), True), (str(piper_env.path), False)]
+
+
+def test_load_gpu_and_cpu_both_fail_gpu_not_blamed(piper_env, monkeypatch):
+    # A broken model fails everywhere: that is not the card's fault.
+    piper_env.gpu_open_error = RuntimeError("gpu: bad model")
+    piper_env.cpu_open_error = RuntimeError("cpu: bad model")
+    monkeypatch.setattr(gpu_accel, "mark_failed", lambda r: pytest.fail("must not mark"))
+    with pytest.raises(RuntimeError, match="cpu: bad model"):
+        piper_tts._load(piper_env.path)
+    assert gpu_accel.failure() is None
+    assert not piper_env.cache
+
+
+def test_load_gpu_failure_reuses_cached_cpu_voice(piper_env):
+    cpu = piper_tts._load(piper_env.path, gpu=False)
+    lock = cpu.setuptts_run_lock
+    piper_env.gpu_open_error = piper_tts.GpuUnavailable("no CUDA")
+    assert piper_tts._load(piper_env.path) is cpu
+    # The cached voice keeps its run limiter (jobs already hold it).
+    assert cpu.setuptts_run_lock is lock
+    assert gpu_accel.failure() is not None
 
 
 def test_load_forced_gpu_failure_propagates(piper_env, monkeypatch):
@@ -1032,6 +1076,20 @@ def test_synth_fallback_with_parallel_runs(piper_env, monkeypatch):
     assert not synth.on_gpu
     # Only one CPU voice was loaded even though several sentences failed.
     assert [o for o in piper_env.opened if not o[1]] == [(str(piper_env.path), False)]
+
+
+def test_synth_cpu_retry_also_fails_keeps_gpu(piper_env, monkeypatch):
+    # The same sentence fails on the processor too: a model/input problem,
+    # so the card is not blamed and stays in use.
+    piper_env.gpu_run_error = RuntimeError("gpu: bad input")
+    piper_env.cpu_run_error = RuntimeError("cpu: bad input")
+    monkeypatch.setattr(gpu_accel, "mark_failed", lambda r: pytest.fail("must not mark"))
+    synth = piper_tts.PiperSynthesizer("piper:en_US-test-medium")
+    with pytest.raises(RuntimeError, match="cpu: bad input"):
+        synth.synthesize("Hello.", "+0%")
+    assert gpu_accel.failure() is None
+    assert synth.on_gpu
+    assert f"{piper_env.path}#gpu" in piper_env.cache
 
 
 def test_synth_forced_gpu_error_propagates(piper_env, monkeypatch):
@@ -1157,6 +1215,7 @@ def check_env(monkeypatch, python_ok):
     monkeypatch.setattr(gpu_accel, "activate", lambda **k: True)
     monkeypatch.setattr(onnxruntime, "get_available_providers",
                         lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    monkeypatch.setattr(gpu_accel, "cuda_provider_loads", lambda: (True, ""))
     monkeypatch.setattr(piper_tts, "installed_keys", lambda: {piper_tts.BUNDLED_VOICE, "de_DE-x-low"})
     env = types.SimpleNamespace(cpu={"chars_per_s": 100.0, "audio_s": 10.0, "on_gpu": False},
                                 gpu={"chars_per_s": 400.0, "audio_s": 10.2, "on_gpu": True},
@@ -1206,6 +1265,19 @@ def test_check_gpu_errors(check_env):
     check_env.gpu["on_gpu"] = True
     check_env.gpu["audio_s"] = 3.0
     assert "unexpected audio" in gpu_check.check(["--gpu-check", "x"])["error"]
+
+
+def test_check_cuda_libraries_do_not_load(check_env, monkeypatch):
+    monkeypatch.setattr(gpu_accel, "cuda_provider_loads",
+                        lambda: (False, "cudnn64_9.dll: The specified module could not be found"))
+    result = gpu_check.check(["--gpu-check", "x"])
+    assert result["cuda_provider_loads"] is False
+    assert result["error"].startswith("The CUDA libraries in GPU support did not load: cudnn64_9.dll")
+    assert check_env.calls == []                       # no voice was run
+
+
+def test_check_records_cuda_provider_loads(check_env):
+    assert gpu_check.check(["--gpu-check", "x"])["cuda_provider_loads"] is True
 
 
 def test_check_no_cuda_provider(check_env, monkeypatch):
@@ -1376,3 +1448,254 @@ def test_gpu_check_without_nvidia(no_nvidia):
     assert result["error"] == "No NVIDIA graphics card was found on this PC."
     assert result["gpu_name"] == ""
     assert sys.meta_path == before
+
+
+# ------------------------------------------------------------------ #
+# 14. Pack integrity, rename retry, partial removal                   #
+# ------------------------------------------------------------------ #
+
+def test_pack_installed_needs_every_key_file():
+    install_fake_pack()
+    assert gpu_accel.pack_installed()
+    for f in gpu_accel._KEY_FILES:
+        key = gpu_accel.pack_dir() / f
+        key.unlink()
+        assert not gpu_accel.pack_installed(), f
+        key.write_text("")
+    assert gpu_accel.pack_installed()
+
+
+@pytest.mark.parametrize("manifest", [
+    "",                                        # empty
+    "{not json",
+    "[1, 2]",
+    json.dumps({"id": gpu_accel.PACK_ID}),    # no wheel list
+    json.dumps({"wheels": ["onnxruntime_gpu-1.29.0-cp312-cp312-win_amd64.whl"]}),
+    json.dumps({"wheels": [w.filename for w in gpu_accel.WHEELS][:-1]}),   # one missing
+    json.dumps({"wheels": [w.filename for w in reversed(gpu_accel.WHEELS)]}),
+])
+def test_pack_installed_rejects_bad_manifest(manifest):
+    install_fake_pack()
+    (gpu_accel.pack_dir() / ".complete").write_text(manifest)
+    assert not gpu_accel.pack_installed()
+
+
+def test_pack_installed_missing_manifest():
+    install_fake_pack()
+    (gpu_accel.pack_dir() / ".complete").unlink()
+    assert not gpu_accel.pack_installed()
+
+
+def test_download_rename_failure_resumes_without_redownload(pack_env, monkeypatch):
+    real = gpu_accel.replace_with_retry
+    failures = {"left": 1}
+
+    def flaky(src, dst, *a, **k):
+        if Path(src).is_dir() and failures["left"]:
+            failures["left"] -= 1
+            raise PermissionError(13, "Access is denied", str(src))
+        return real(src, dst, *a, **k)
+
+    monkeypatch.setattr(gpu_accel, "replace_with_retry", flaky)
+    with pytest.raises(PermissionError):
+        gpu_accel.download_pack()
+    assert not gpu_accel.pack_installed()
+    staging = pack_env.root / f"{gpu_accel.PACK_ID}.staging"
+    assert len(list(staging.glob(".done-*"))) == 2       # flags kept
+
+    pack_env.server.requests.clear()
+    gpu_accel.download_pack()
+    assert pack_env.server.requests == []                # nothing downloaded again
+    assert gpu_accel.pack_installed()
+    assert not list(gpu_accel.pack_dir().glob(".done-*"))
+    assert not staging.exists()
+
+
+def test_download_dir_rename_uses_generous_retries(pack_env, monkeypatch):
+    calls = []
+    real = gpu_accel.replace_with_retry
+    monkeypatch.setattr(gpu_accel, "replace_with_retry",
+                        lambda src, dst, **k: calls.append((Path(src).is_dir(), k)) or real(src, dst, **k))
+    gpu_accel.download_pack()
+    assert (True, {"attempts": 30}) in calls
+    assert sum(1 for is_dir, _ in calls if not is_dir) == 2   # each .part → wheel
+
+
+def test_pending_removal_keeps_marker_while_something_is_locked(pack_env, monkeypatch):
+    gpu_accel.download_pack()
+    gpu_accel.save_check({"ok": True, "speedup": 3})
+    (pack_env.root / ".remove").write_text("1")
+    locked = gpu_accel._check_path()
+    real_unlink = Path.unlink
+
+    def unlink(self, *a, **k):
+        if self == locked:
+            raise PermissionError(13, "in use", str(self))
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    gpu_accel._apply_pending_removal()
+    assert locked.exists()
+    assert (pack_env.root / ".remove").exists()        # retried next start
+    assert not gpu_accel.pack_dir().exists()           # the rest is gone
+    assert not gpu_accel.pack_installed()
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)   # next start: unlocked
+    gpu_accel._apply_pending_removal()
+    assert not pack_env.root.exists()
+
+
+def test_pending_removal_keeps_marker_when_a_folder_is_locked(pack_env, monkeypatch):
+    gpu_accel.download_pack()
+    (pack_env.root / ".remove").write_text("1")
+    monkeypatch.setattr(shutil, "rmtree", lambda *a, **k: None)   # a DLL in use
+    gpu_accel._apply_pending_removal()
+    assert (pack_env.root / ".remove").exists()
+    assert gpu_accel.pack_dir().exists()
+    assert not gpu_accel.pack_installed()
+
+
+# ------------------------------------------------------------------ #
+# 15. startup importing the GPU build; activate/deactivate details   #
+# ------------------------------------------------------------------ #
+
+def test_startup_import_failure_undoes_activation(win, monkeypatch):
+    install_fake_pack()
+    monkeypatch.setitem(sys.modules, "onnxruntime", None)   # import raises ImportError
+    assert gpu_accel.startup("gpu") is False
+    assert win == [{}]
+    assert gpu_accel._STATE.finder is None
+    assert not any(isinstance(f, gpu_accel._RedirectFinder) for f in sys.meta_path)
+    assert not gpu_accel.activated() and not gpu_accel.active()
+    assert gpu_accel.reason().startswith("GPU support failed to load")
+    assert gpu_accel.failure() and gpu_accel.failure().startswith("GPU support failed to load")
+    assert gpu_accel.device_name() == ""
+
+
+def test_startup_import_ok_keeps_finder(win):
+    install_fake_pack()
+    assert gpu_accel.startup("gpu") is True
+    assert gpu_accel._STATE.finder in sys.meta_path
+    assert gpu_accel.failure() is None
+
+
+def test_startup_wrong_python_never_activates(win, monkeypatch):
+    install_fake_pack()
+    monkeypatch.setattr(gpu_accel, "PYTHON_TAG", (3, 0))
+    assert gpu_accel.startup("gpu") is False
+    assert win == []
+    assert "can't use the downloaded GPU support" in gpu_accel.reason()
+
+
+def test_deactivate_removes_finder_and_modules(tmp_path):
+    import importlib
+
+    make_fake_package(tmp_path, "gpu-build")
+    importlib.invalidate_caches()
+    assert gpu_accel.activate(directory=tmp_path, package="fakeortpkg")
+    finder = gpu_accel._STATE.finder
+    assert finder is sys.meta_path[0]
+    importlib.import_module("fakeortpkg.sub.mod")
+    gpu_accel._deactivate("fakeortpkg")
+    assert finder not in sys.meta_path
+    assert gpu_accel._STATE.finder is None
+    assert not gpu_accel.activated()
+    assert not [m for m in sys.modules if m.startswith("fakeortpkg")]
+    gpu_accel._deactivate("fakeortpkg")      # idempotent
+
+
+def test_activate_off_windows_records_no_dll_dirs(tmp_path, monkeypatch):
+    make_fake_package(tmp_path, "gpu-build")
+    (tmp_path / "nvidia" / "bin").mkdir(parents=True)
+    (tmp_path / "nvidia" / "bin" / "a.dll").write_bytes(b"x")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    path_before = __import__("os").environ.get("PATH")
+    assert gpu_accel.activate(directory=tmp_path, package="fakeortpkg")
+    assert gpu_accel._STATE.dll_dirs == []
+    assert "CUDA_DEVICE_ORDER" not in __import__("os").environ
+    assert __import__("os").environ.get("PATH") == path_before
+
+
+def test_ensure_cuda_loaded_and_provider_check_off_windows(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    gpu_accel.ensure_cuda_loaded()
+    assert gpu_accel._STATE.cuda_loaded is False
+    assert gpu_accel.cuda_provider_loads() == (False, "not Windows")
+
+
+def test_ensure_cuda_loaded_once_per_session(monkeypatch, tmp_path):
+    import ctypes
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    d = tmp_path / "bin"
+    d.mkdir()
+    for name in gpu_accel._PRELOAD_DLLS[:2]:
+        (d / name).write_bytes(b"x")
+    gpu_accel._STATE.dll_dirs = [d]
+    loaded = []
+
+    def windll(path):
+        loaded.append(Path(path).name)
+        if len(loaded) == 2:
+            raise OSError("bad image")      # one failing DLL is only logged
+        return object()
+
+    monkeypatch.setattr(ctypes, "WinDLL", windll, raising=False)
+    gpu_accel.ensure_cuda_loaded()
+    assert loaded == list(gpu_accel._PRELOAD_DLLS[:2])   # missing ones skipped
+    gpu_accel.ensure_cuda_loaded()
+    assert len(loaded) == 2                               # once only
+    assert gpu_accel._STATE.cuda_loaded
+
+
+# ------------------------------------------------------------------ #
+# 16. selftest --gpu-startup                                          #
+# ------------------------------------------------------------------ #
+
+def test_selftest_gpu_startup(monkeypatch, tmp_path):
+    from app import selftest
+    from app.services import local_tts, system_tts
+    from app.utils import mp3_duration
+
+    calls = []
+
+    def fake_startup(mode):
+        calls.append(mode)
+        gpu_accel._STATE.reason = "the graphics card was chosen in Settings"
+        return False
+
+    monkeypatch.setattr(gpu_accel, "startup", fake_startup)
+    # Keep the other checks cheap and offline.
+    model = tmp_path / "v.onnx"
+    monkeypatch.setattr(piper_tts, "piper_available", lambda: True)
+    monkeypatch.setattr(piper_tts, "model_path", lambda key: model)
+
+    def fake_mp3(short, text, rate, out, **kw):
+        gpu_accel.mark_failed("CUDA error: no device")
+        Path(out).write_bytes(b"x")
+        return 3.0
+
+    monkeypatch.setattr(local_tts, "synthesize_to_mp3", fake_mp3)
+    monkeypatch.setattr(mp3_duration, "mp3_duration_seconds", lambda p: 3.0)
+    monkeypatch.setattr(system_tts, "list_system_voices", lambda: [])
+    out = tmp_path / "selftest.json"
+    selftest.run(["SetupTTS", "--selftest", str(out), "--gpu-startup"])
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert calls == ["gpu"]
+    assert data["gpu_startup"]["activated"] is False
+    assert data["gpu_startup"]["reason"] == "the graphics card was chosen in Settings"
+    assert data["checks"]["offline_voice"]["ok"], data["checks"]["offline_voice"]
+    assert data["gpu_startup"]["failure_after_voice"] == "CUDA error: no device"
+
+
+def test_selftest_without_flag_never_starts_gpu(monkeypatch, tmp_path):
+    from app import selftest
+    from app.services import system_tts
+
+    monkeypatch.setattr(gpu_accel, "startup", lambda mode: pytest.fail("must not start"))
+    monkeypatch.setattr(piper_tts, "model_path", lambda key: None)
+    monkeypatch.setattr(system_tts, "list_system_voices", lambda: [])
+    out = tmp_path / "selftest.json"
+    selftest.run(["SetupTTS", "--selftest", str(out)])
+    assert "gpu_startup" not in json.loads(out.read_text(encoding="utf-8"))
