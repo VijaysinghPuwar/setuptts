@@ -22,9 +22,9 @@ from pathlib import Path
 # a Windows drive or a FAT-formatted player.
 _ILLEGAL_CHARS = set('<>:"/\\|?*')
 _RESERVED_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    *(f"COM{i}" for i in (*range(1, 10), "¹", "²", "³")),
+    *(f"LPT{i}" for i in (*range(1, 10), "¹", "²", "³")),
 }
 # Without the long-paths opt-in, Win32 file APIs fail past MAX_PATH (260).
 # The staged/temp files the worker writes beside the output add a suffix, so

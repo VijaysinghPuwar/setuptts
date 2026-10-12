@@ -27,13 +27,14 @@ import json
 import logging
 import os
 import shutil
-import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+
+from app.utils.file_ops import replace_with_retry as _replace_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -1084,26 +1085,6 @@ def _text_hash(text: str) -> str:
 #: audiobook can hold hours of generated audio; a week was short enough to
 #: throw that away while the Resume button still offered it.
 RESUMABLE_MAX_AGE_DAYS = 60
-
-
-def _replace_with_retry(src: Path, dst: Path, attempts: int = 5) -> None:
-    """
-    os.replace that rides out a brief Windows file lock.
-
-    On Windows, antivirus scanners, search indexers and sync clients open new
-    files for a moment after they are written, and a rename during that window
-    fails with a sharing violation.  A few short retries turn that transient
-    failure into a non-event; a file genuinely open in a media player still
-    fails and is reported.
-    """
-    for attempt in range(attempts):
-        try:
-            src.replace(dst)
-            return
-        except PermissionError:
-            if sys.platform != "win32" or attempt == attempts - 1:
-                raise
-            time.sleep(0.2 * (attempt + 1))
 
 
 def cleanup_stale_staging(

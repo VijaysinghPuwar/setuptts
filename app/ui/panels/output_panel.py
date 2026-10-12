@@ -105,7 +105,7 @@ from app.utils.output_paths import (
     next_free_path,
     normalise_filename,
 )
-from app.utils.paths import AppPaths, open_in_file_manager
+from app.utils.paths import AppPaths, default_output_dir, open_in_file_manager
 from app.workers.job_queue import JobItem, JobQueue
 from app.workers.chunk_store import ResumeCandidate, ChunkStore
 from app.workers.preview_worker import PreviewWorker
@@ -218,7 +218,7 @@ class OutputPanel(QWidget):
         return str(Path(folder) / normalise_filename(self._filename_edit.text()))
 
     def _output_folder(self) -> str:
-        return self._folder_edit.text().strip() or str(Path.home() / "Desktop")
+        return self._folder_edit.text().strip() or default_output_dir()
 
     # ---- Lifecycle / queue state (used by MainWindow) -----------------
 
@@ -803,7 +803,7 @@ class OutputPanel(QWidget):
         # valueChanged does not fire when the saved rate equals the slider's
         # initial value, so sync the label and Reset button explicitly.
         self._on_rate_changed(self._rate_slider.value())
-        folder = self._settings.output_dir or str(Path.home() / "Desktop")
+        folder = self._settings.output_dir or default_output_dir()
         self._set_folder_text(folder)
         idx = self._gender_combo.findText(self._settings.gender_filter)
         if idx >= 0:
@@ -1235,7 +1235,7 @@ class OutputPanel(QWidget):
 
     def apply_default_folder(self) -> None:
         """Show the default save folder from Settings in the sidebar."""
-        folder = self._settings.output_dir or str(Path.home() / "Desktop")
+        folder = self._settings.output_dir or default_output_dir()
         self._set_folder_text(folder)
         logger.info("Default save folder changed in Settings: %s", folder)
 
@@ -1248,7 +1248,7 @@ class OutputPanel(QWidget):
         self._folder_edit.setCursorPosition(len(folder))
 
     def _browse_folder(self) -> None:
-        current = self._folder_edit.text() or str(Path.home() / "Desktop")
+        current = self._folder_edit.text() or default_output_dir()
         folder = QFileDialog.getExistingDirectory(self, "Choose Save Location", current)
         if folder:
             self._set_folder_text(folder)

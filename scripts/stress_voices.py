@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import resource
+import re
 import sys
 import time
 from pathlib import Path
@@ -129,12 +129,16 @@ def _book_cases(sources: set[str], path: str, size: int, rate: str) -> list[dict
         voices += [("piper", v["ShortName"]) for v in piper_tts.list_piper_voices()
                    if v["Locale"].startswith("en")]
     if "system" in sources:
-        installed = {v["ShortName"] for v in list_system_voices()}
+        listed = list_system_voices()
+        installed = {v["ShortName"] for v in listed}
         for name in _BOOK_SYSTEM:
             match = next((s for s in installed
                           if s == f"system:{name}" or s.startswith(f"system:{name} (")), None)
             if match:
                 voices.append(("system", match))
+        if sys.platform == "win32":
+            voices += [("system", v["ShortName"]) for v in listed
+                       if (v.get("Locale") or "").startswith("en")]
     return [{"source": src, "voice": v, "kind": f"book:{seg}", "text": text, "rate": rate}
             for src, v in voices for seg, text in segments.items()]
 
@@ -162,16 +166,26 @@ def _cases(sources: set[str], long_chars: int) -> list[dict]:
                 _long_english(long_chars))
 
     if "system" in sources:
-        installed = {v["ShortName"] for v in list_system_voices()}
+        listed = list_system_voices()
+        installed = {v["ShortName"] for v in listed}
         for name, lang in _SYSTEM:
             short = f"system:{name}"
             if short in installed:
                 add("system", short, f"lang:{lang}", _SAMPLES[lang])
-        for kind, text in _HOSTILE.items():
-            add("system", "system:Samantha", f"hostile:{kind}", text)
-        add("system", "system:Samantha", "rate:+100%", _SAMPLES["en"], "+100%")
-        if long_chars:
-            add("system", "system:Samantha", f"long:{long_chars}", _long_english(long_chars))
+        if sys.platform == "win32":
+            # Windows voices are named by registry token: try every one.
+            for v in listed:
+                lang = (v.get("Locale") or "")[:2]
+                if lang in _SAMPLES:
+                    add("system", v["ShortName"], f"lang:{lang}", _SAMPLES[lang])
+        main = "system:Samantha" if "system:Samantha" in installed else next(
+            (v["ShortName"] for v in listed if (v.get("Locale") or "").startswith("en")), None)
+        if main:
+            for kind, text in _HOSTILE.items():
+                add("system", main, f"hostile:{kind}", text)
+            add("system", main, "rate:+100%", _SAMPLES["en"], "+100%")
+            if long_chars:
+                add("system", main, f"long:{long_chars}", _long_english(long_chars))
 
     if "piper" in sources and piper_tts.piper_available():
         catalog = {v.key: v for v in piper_tts.fetch_catalog()}
@@ -198,6 +212,29 @@ def _cases(sources: set[str], long_chars: int) -> list[dict]:
 # ── Running ────────────────────────────────────────────────────────────── #
 
 def _rss_mb() -> float:
+    """Peak memory of this process, in MB."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class _Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        *((n, ctypes.c_size_t) for n in (
+                            "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                            "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                            "PagefileUsage", "PeakPagefileUsage"))]
+
+        c = _Counters()
+        c.cb = ctypes.sizeof(c)
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        k32.K32GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb)
+        return c.PeakWorkingSetSize / (1024 * 1024)
+    import resource
+
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
 
@@ -211,13 +248,17 @@ def _validate(case: dict, path: Path) -> tuple[bool, str, float | None]:
     duration = mp3_duration_seconds(path)
     if not duration:
         return False, "output is not a readable MP3", None
-    speakable = len("".join(build_text_profile(case["text"]).cleaned_text.split()))
+    cleaned = "".join(build_text_profile(case["text"]).cleaned_text.split())
+    speakable = len(cleaned)
+    digits = sum(ch.isdigit() for ch in cleaned)
     # Very generous bounds: catches empty/truncated audio and runaway output,
     # not voice-to-voice speed differences.  Rate scales the expectation.
     pct = int(case["rate"].rstrip("%"))
     speed = 1 + pct / 100
     lo = speakable / 60 / speed      # 60 non-space chars/s is absurdly fast
-    hi = speakable / 2 / speed + 5   # 2 chars/s is absurdly slow
+    # 2 chars/s is absurdly slow — except for digits: "79190" is spoken as
+    # "seventy-nine thousand one hundred ninety" (SAPI David: 2.0 chars/s).
+    hi = ((speakable - digits) / 2 + digits) / speed + 5
     if case["kind"] == "hostile:no_spaces":
         lo = 0.5                     # one "word": voices may spell or skip it
     if not lo <= duration <= hi:
@@ -269,7 +310,8 @@ def main() -> int:
         while pending and queue.running_count + queue.pending_count < args.parallel:
             case = pending.pop(0)
             idx = cases.index(case)
-            safe = case["voice"].replace(":", "_").replace("/", "_")
+            # Windows voice ids are registry paths: keep the last part only.
+            safe = re.sub(r"[^\w.-]+", "_", case["voice"].replace("\\", "/").rsplit("/", 1)[-1])
             out = work / "mp3" / f"{idx:03d}_{safe}_{case['kind'].replace(':', '_')}.mp3"
             out.unlink(missing_ok=True)
             case["output"] = out

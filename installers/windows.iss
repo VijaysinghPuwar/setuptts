@@ -57,6 +57,9 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; Qt 6.8+ (PySide6 6.11) needs Windows 10 1809 or later; refuse cleanly rather
+; than install an app that crashes at launch.
+MinVersion=10.0.17763
 
 WizardImageFile=compiler:WizModernImage.bmp
 WizardSmallImageFile=compiler:WizModernSmallImage.bmp

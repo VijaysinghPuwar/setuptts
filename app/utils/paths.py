@@ -7,7 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from platformdirs import user_cache_dir, user_data_dir, user_log_dir
+from platformdirs import user_cache_dir, user_data_dir, user_desktop_dir, user_log_dir
 
 from app import APP_NAME, APP_ORG
 
@@ -86,6 +86,23 @@ class AppPaths:
         return resource_path("app/assets/icons/app.png")
 
 
+def default_output_dir() -> str:
+    """
+    The user's real Desktop, where output goes until they pick a folder.
+    On Windows this asks the shell rather than assuming ``~/Desktop``:
+    OneDrive backup moves the Desktop to ``~/OneDrive/Desktop``, and
+    ``~/Desktop`` then either doesn't exist or isn't the one on screen.
+    """
+    try:
+        desktop = Path(user_desktop_dir())
+        if desktop.is_dir():
+            return str(desktop)
+    except Exception:
+        pass
+    desktop = Path.home() / "Desktop"
+    return str(desktop if desktop.is_dir() else Path.home())
+
+
 def open_in_file_manager(path: str | Path, *, reveal: bool = False) -> bool:
     """
     Open *path* with the system's default handler (a folder opens in Finder or
@@ -102,7 +119,11 @@ def open_in_file_manager(path: str | Path, *, reveal: bool = False) -> bool:
             subprocess.Popen(args)
         elif sys.platform == "win32":
             if reveal and path.is_file():
-                subprocess.Popen(["explorer", f"/select,{path}"])
+                # Explorer parses its own command line: the path must be quoted
+                # after "/select," — list2cmdline would quote the whole
+                # argument, and a path with a space or comma then opens
+                # Documents instead.  Windows paths can't contain '"'.
+                subprocess.Popen(f'explorer /select,"{path}"')
             else:
                 os.startfile(str(path))  # type: ignore[attr-defined]
         else:

@@ -3,6 +3,7 @@ Live long-form stress test: synthesise a multi-hour audiobook through the
 real speech service with exactly the worker the app uses.
 
     python scripts/stress_longform.py --hours 10 --voice en-US-AndrewNeural
+    python scripts/stress_longform.py --text-file "ch 25.txt" --repeat 20
 
 Text is a public-domain novel (Project Gutenberg), trimmed to roughly the
 character count that the voice needs for the requested length.  All app data
@@ -52,6 +53,9 @@ def main() -> int:
     ap.add_argument("--voice", default="en-US-AndrewNeural")
     ap.add_argument("--rate", default="-5%")
     ap.add_argument("--workdir", default=str(ROOT / "stress_out"))
+    ap.add_argument("--text-file", help="use this text instead of the novel")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="with --text-file: repeat the text this many times")
     args = ap.parse_args()
 
     work = Path(args.workdir).resolve()
@@ -70,9 +74,14 @@ def main() -> int:
     import logging
     log = logging.getLogger("stress")
 
-    target_chars = int(args.hours * 3600 * _CHARS_PER_AUDIO_SECOND)
-    text = _load_text(target_chars, work / "source_book.txt")
-    out_mp3 = work / f"stress_{args.voice}_{args.hours:g}h.mp3"
+    if args.text_file:
+        src = Path(args.text_file)
+        text = "\n\n".join([src.read_text(encoding="utf-8-sig").strip()] * max(1, args.repeat))
+        out_mp3 = work / f"stress_{args.voice}_{src.stem}_x{args.repeat}.mp3"
+    else:
+        target_chars = int(args.hours * 3600 * _CHARS_PER_AUDIO_SECOND)
+        text = _load_text(target_chars, work / "source_book.txt")
+        out_mp3 = work / f"stress_{args.voice}_{args.hours:g}h.mp3"
     summary_path = out_mp3.with_suffix(".json")
     log.info("Stress start: version=%s voice=%s rate=%s chars=%d target_hours=%.1f out=%s",
              APP_VERSION, args.voice, args.rate, len(text), args.hours, out_mp3)

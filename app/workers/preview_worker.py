@@ -202,7 +202,9 @@ class PreviewWorker(QThread):
             self._play_windows_fallback(path)
             return
 
-        alias = "vc_preview"
+        # One alias per preview: a device left open by an earlier preview
+        # must not make this one's "open" fail.
+        alias = f"vc_preview_{id(self):x}"
         self._mci_alias = alias
         win_path = Path(path).as_posix().replace("/", "\\")
 
@@ -211,32 +213,41 @@ class PreviewWorker(QThread):
             None, 0, None,
         )
         if ret != 0:
+            self._mci_alias = None
             self._play_windows_fallback(path)
             return
 
-        winmm.mciSendStringW(f"play {alias}", None, 0, None)
+        try:
+            if self._stop_requested:
+                return
+            winmm.mciSendStringW(f"play {alias}", None, 0, None)
 
-        # Poll until done or stop requested (max 60 s)
-        buf = ctypes.create_unicode_buffer(256)
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and not self._stop_requested:
-            winmm.mciSendStringW(
-                f"status {alias} mode", buf, 256, None
-            )
-            if buf.value not in ("playing", ""):
-                break
-            time.sleep(0.2)
-
-        # Only close if _kill_playback() hasn't already closed it.
-        # _kill_playback() clears self._mci_alias; alias is a local copy.
-        if self._mci_alias:
-            winmm.mciSendStringW(f"close {self._mci_alias}", None, 0, None)
+            # Poll until done or stop requested (max 60 s)
+            buf = ctypes.create_unicode_buffer(256)
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and not self._stop_requested:
+                winmm.mciSendStringW(
+                    f"status {alias} mode", buf, 256, None
+                )
+                if buf.value not in ("playing", ""):
+                    break
+                time.sleep(0.2)
+        finally:
+            # Always close here, on the thread that opened it.  Stop (from the
+            # GUI thread) may have come before "open" and found nothing to
+            # close; the device then played on, kept the file locked, and
+            # held the alias.  Closing twice is harmless.
             self._mci_alias = None
+            winmm.mciSendStringW(f"close {alias}", None, 0, None)
 
     def _play_windows_fallback(self, path: str) -> None:
         """Last resort: open with OS default media player."""
         try:
             os.startfile(path)  # type: ignore[attr-defined]
+            # The player opens the file on its own schedule and may hold it
+            # for as long as it is open: leave it in %TEMP% rather than pull
+            # it from under the player.
+            self._tmp_path = None
             time.sleep(8)
         except Exception as exc:
             raise RuntimeError(f"MCI and fallback both failed: {exc}") from exc

@@ -159,7 +159,7 @@ class LocalTTSWorker(QThread):
 
             self.status_changed.emit("Saving…")
             self.stage_changed.emit("local", "Writing the MP3 file")
-            writer.finish()
+            self._output_path = str(writer.finish())
             self.audio_duration_seconds = writer.duration_seconds
             elapsed = time.monotonic() - start
             self.progress.emit(100)
