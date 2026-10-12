@@ -60,3 +60,6 @@ stress_*.log
 
 # Bundled offline voice — fetched at build time by scripts/fetch_bundled_voice.py
 app/assets/piper/
+
+# Local benchmark results (scripts/local_benchmark.py)
+benchmark_results.jsonl

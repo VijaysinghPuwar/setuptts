@@ -292,6 +292,68 @@ jobs:
           $ver = if ("${{ github.event_name }}" -eq "push") { "${{ steps.ver.outputs.version }}" } else { "" }
           ./selftest.ps1 -Exe "dist\SetupTTS\SetupTTS.exe" -Out "$pwd\selftest-onedir.json" -Version $ver -Network -BundledVoice
 
+      # GPU support (optional NVIDIA download, see app/services/gpu_accel.py).
+      # The runner has no graphics card, but the riskiest part can still be
+      # tested: that the frozen app imports the downloaded onnxruntime-gpu
+      # from app data instead of the bundled CPU build, with every module it
+      # needs available.  The check then runs the voice on the processor
+      # through that build, and must end with a clean "the graphics card
+      # could not run the voice" verdict, not an import error or a crash.
+      # Not cached: the unpacked pack (~2.9 GB) is bigger than the download
+      # (~1.3 GB from PyPI's CDN), so a cache would save little time.
+      - name: Download GPU support pack
+        shell: pwsh
+        run: |
+          python scripts/gpu_pack_smoke.py
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::GPU support pack download failed"; exit 1 }
+          # Where the frozen app looks (AppPaths: %LOCALAPPDATA%\SetupTTSApp\SetupTTS).
+          $marker = Join-Path $env:LOCALAPPDATA "SetupTTSApp\SetupTTS\gpu_runtime\ort-1.30.0-cuda13\.complete"
+          if (!(Test-Path $marker)) { Write-Host "::error::GPU pack not at the app's data folder ($marker)"; exit 1 }
+
+      - name: GPU check of onedir build (onnxruntime-gpu loaded from the pack)
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $out = "$pwd\gpu-check.json"
+          $log = Join-Path $env:LOCALAPPDATA "SetupTTSApp\SetupTTS\Logs\gpu-check.log"
+          $p = Start-Process -FilePath "dist\SetupTTS\SetupTTS.exe" `
+                 -ArgumentList @("--gpu-check", "`"$out`"", "--force") -PassThru
+          $null = $p.Handle   # keeps ExitCode readable after WaitForExit
+          if (!$p.WaitForExit(900000)) {
+            Stop-Process -Id $p.Id -Force
+            Write-Host "::error::--gpu-check did not finish within 15 minutes"; exit 1
+          }
+          Write-Host "--- $log ---"
+          if (Test-Path $log) { Get-Content $log } else { Write-Host "(no log written)" }
+          Write-Host "--- $out ---"
+          if (!(Test-Path $out)) { Write-Host "::error::no --gpu-check output (exit $($p.ExitCode))"; exit 1 }
+          Get-Content $out
+          $r = Get-Content $out -Raw | ConvertFrom-Json
+          $fail = @()
+          if ($p.ExitCode -ne 0) { $fail += "--gpu-check exited with $($p.ExitCode)" }
+          if (@($r.providers_available) -notcontains "CUDAExecutionProvider") {
+            $fail += "CUDAExecutionProvider not available: the frozen app did not import onnxruntime-gpu from the GPU pack (error: $($r.error))"
+          }
+          if ($r.onnxruntime -ne "1.30.0") { $fail += "onnxruntime version is '$($r.onnxruntime)', expected 1.30.0" }
+          if ("$($r.onnxruntime_file)" -notmatch "gpu_runtime") { $fail += "onnxruntime was loaded from '$($r.onnxruntime_file)', not the GPU pack" }
+          if (!($r.cpu_chars_per_s -gt 0)) { $fail += "no CPU benchmark through the GPU build of onnxruntime" }
+          if ("$($r.error) $($r.detail)" -match "ImportError|ModuleNotFoundError|No module named|DLL load failed") {
+            $fail += "import failure in the frozen app: $($r.error)"
+          }
+          if (!$r.ok -and $r.error -notmatch "graphics card could not run the voice|did not run on the graphics card") {
+            $fail += "unexpected verdict (no GPU here, so CUDA should fail to start): $($r.error)"
+          }
+          foreach ($f in $fail) { Write-Host "::error::$f" }
+          if ($fail.Count) { exit 1 }
+          Write-Host "GPU pack import OK; verdict without a GPU: $($r.error)"
+
+      - name: Remove GPU support pack
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+            (Join-Path $env:LOCALAPPDATA "SetupTTSApp\SetupTTS\gpu_runtime")
+
       - name: Build Inno Setup installer
         shell: pwsh
         run: |

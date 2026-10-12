@@ -316,7 +316,7 @@ def remove_voice(key: str) -> bool:
     # Drop the cached model first: Windows won't delete a file that is
     # still open.
     with _LOADED_LOCK:
-        for path in [p for p in _LOADED if Path(p).stem == key]:
+        for path in [p for p in _LOADED if _key_path(p).stem == key]:
             _LOADED.pop(path, None)
     removed = False
     for p in (user_dir() / f"{key}.onnx", user_dir() / f"{key}.onnx.json"):
@@ -443,13 +443,20 @@ def _windows_short_path(path: Path) -> Path | None:
         return None
 
 
-def _open_voice(model: str):
+class GpuUnavailable(RuntimeError):
+    """The CUDA provider did not start for this model."""
+
+
+def _open_voice(model: str, gpu: bool = False):
     """
     Load a voice model with one onnxruntime session sized for parallel runs.
 
     PiperVoice.load builds a default session (every core) that would have to
     be replaced by a tuned one — loading the model twice, which doubled load
     time and briefly memory while holding _LOADED_LOCK.
+
+    *gpu* (Windows with GPU support only, see gpu_accel) runs the model on
+    the NVIDIA card, with the processor as onnxruntime's fallback provider.
     """
     import onnxruntime
     from piper import PiperVoice
@@ -464,30 +471,91 @@ def _open_voice(model: str):
     # Idle worker threads otherwise busy-wait for the next run: about 30% more
     # CPU (and heat, fan, battery) for no measurable gain in speed.
     opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
-    session = onnxruntime.InferenceSession(
-        model, sess_options=opts, providers=["CPUExecutionProvider"],
-    )
+    if gpu:
+        from app.services import gpu_accel
+
+        providers = [("CUDAExecutionProvider", gpu_accel.cuda_provider_options()),
+                     "CPUExecutionProvider"]
+    else:
+        providers = ["CPUExecutionProvider"]
+    session = onnxruntime.InferenceSession(model, sess_options=opts, providers=providers)
+    # onnxruntime quietly drops a provider that fails to start (driver too
+    # old, a DLL missing); that must not pass for running on the card.
+    if gpu and session.get_providers()[:1] != ["CUDAExecutionProvider"]:
+        raise GpuUnavailable(
+            "the NVIDIA CUDA provider did not start (providers: "
+            + ", ".join(session.get_providers()) + ")")
+    if gpu:
+        # Otherwise a CUDA failure inside run() makes onnxruntime quietly
+        # rebuild the session on the processor and retry: the voice would
+        # still count as "on the card" and never be reported as failed.
+        # Raising lets PiperSynthesizer fall back and log it.
+        session.disable_fallback()
     return PiperVoice(
         session=session, config=config,
         espeak_data_dir=_espeak_data_dir(), download_dir=user_dir(),
     )
 
 
-def _load(path: Path):
-    key = str(path)
+def _cache_key(path: Path, gpu: bool) -> str:
+    return f"{path}#gpu" if gpu else str(path)
+
+
+def _key_path(cache_key: str) -> Path:
+    return Path(cache_key[:-4] if cache_key.endswith("#gpu") else cache_key)
+
+
+def _wants_gpu() -> bool:
+    if sys.platform != "win32":
+        return False
+    from app.services import gpu_accel
+
+    return gpu_accel.active()
+
+
+def _load(path: Path, gpu: bool | None = None):
+    """
+    The loaded voice for *path*, on the card when GPU support is active
+    (*gpu* None) or as asked.  A card that fails to load the model is marked
+    failed and the processor is used instead, unless the card was asked for.
+    """
+    want_gpu = _wants_gpu() if gpu is None else gpu
+    key = _cache_key(path, want_gpu)
     with _LOADED_LOCK:
         voice = _LOADED.get(key)
         if voice is None:
-            voice = _open_voice(key)
+            try:
+                voice = _open_voice(str(path), gpu=want_gpu) if want_gpu else _open_voice(str(path))
+            except Exception as exc:  # noqa: BLE001
+                if not want_gpu or gpu is not None:
+                    raise
+                from app.services import gpu_accel
+
+                gpu_accel.mark_failed(f"could not load {path.stem}: {exc}")
+                key = _cache_key(path, False)
+                cached = _LOADED.get(key)
+                if cached is not None:
+                    _LOADED.move_to_end(key)
+                    return cached
+                voice = _open_voice(str(path))
+                want_gpu = False
+            voice.setuptts_on_gpu = want_gpu
             # At most _PARALLEL_RUNS runs of one model at a time, across every
             # job and preview using it (see PiperSynthesizer.synthesize).
             voice.setuptts_run_lock = threading.BoundedSemaphore(_PARALLEL_RUNS)
+            if want_gpu:
+                logger.info("Offline voice %s runs on the graphics card", path.stem)
             _LOADED[key] = voice
             while len(_LOADED) > _MAX_LOADED:
                 _LOADED.popitem(last=False)
         else:
             _LOADED.move_to_end(key)
         return voice
+
+
+def _evict(path: Path, gpu: bool) -> None:
+    with _LOADED_LOCK:
+        _LOADED.pop(_cache_key(path, gpu), None)
 
 
 class PiperError(RuntimeError):
@@ -559,7 +627,8 @@ def _split_clauses(phonemes: list[str], limit: int = _CLAUSE_SPLIT_PHONEMES) -> 
 class PiperSynthesizer:
     """Same interface as SystemSynthesizer: synthesize / cancel / close."""
 
-    def __init__(self, short_name: str) -> None:
+    def __init__(self, short_name: str, *, gpu: bool | None = None) -> None:
+        """*gpu*: None follows GPU support (Windows); True/False forces it (speed check)."""
         if not is_piper_voice(short_name):
             raise ValueError(f"Not a Piper voice: {short_name}")
         key = short_name[len(PIPER_PREFIX):]
@@ -570,9 +639,12 @@ class PiperSynthesizer:
                 "Download it again from Get Voices, or pick another voice."
             )
         try:
-            self._voice = _load(path)
+            self._voice = _load(path, gpu)
         except Exception as exc:  # noqa: BLE001
             raise PiperError(f"Could not load the offline voice “{display_name(key)}”: {exc}") from exc
+        self._path = path
+        self._forced_device = gpu is not None
+        self._swap_lock = threading.Lock()
         self.sample_rate = int(self._voice.config.sample_rate)
         self._run_lock = getattr(self._voice, "setuptts_run_lock", None) or threading.Lock()
         self._cancelled = False
@@ -612,14 +684,26 @@ class PiperSynthesizer:
         def render(phonemes: list[str]) -> bytes:
             if self._cancelled:
                 raise PiperCancelled("cancelled")
-            ids = self._voice.phonemes_to_ids(phonemes)
+            voice, run_lock = self._voice, self._run_lock
+            ids = voice.phonemes_to_ids(phonemes)
             # Runs per model are capped across all jobs and previews:
             # onnxruntime keeps the peak working memory of every concurrent
             # run (unbounded, two jobs and a preview reached 1.2 GB).
-            with self._run_lock:
-                if self._cancelled:
-                    raise PiperCancelled("cancelled")
-                audio = self._voice.phoneme_ids_to_audio(ids, cfg)
+            try:
+                with run_lock:
+                    if self._cancelled:
+                        raise PiperCancelled("cancelled")
+                    audio = voice.phoneme_ids_to_audio(ids, cfg)
+            except PiperCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if not getattr(voice, "setuptts_on_gpu", False) or self._forced_device:
+                    raise
+                voice, run_lock = self._fall_back_to_cpu(voice, exc)
+                with run_lock:
+                    if self._cancelled:
+                        raise PiperCancelled("cancelled")
+                    audio = voice.phoneme_ids_to_audio(ids, cfg)
             if isinstance(audio, tuple):
                 audio = audio[0]
             audio = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -642,6 +726,23 @@ class PiperSynthesizer:
             parts.append(pause)
         return b"".join(parts)
 
+    @property
+    def on_gpu(self) -> bool:
+        return bool(getattr(self._voice, "setuptts_on_gpu", False))
+
+    def _fall_back_to_cpu(self, failed_voice, exc: BaseException):
+        """The card failed mid-job: carry on with the same voice on the processor."""
+        with self._swap_lock:
+            if self._voice is failed_voice:
+                from app.services import gpu_accel
+
+                gpu_accel.mark_failed(str(exc) or type(exc).__name__)
+                _evict(self._path, True)
+                self._voice = _load(self._path, False)
+                self._run_lock = (getattr(self._voice, "setuptts_run_lock", None)
+                                  or threading.Lock())
+            return self._voice, self._run_lock
+
     def cancel(self) -> None:
         self._cancelled = True
 
@@ -655,3 +756,33 @@ class PiperSynthesizer:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+#: Ordinary narrative prose for the GPU speed check (sentences of mixed
+#: length, a few commas), long enough that start-up costs don't dominate.
+BENCHMARK_TEXT = (
+    "The old man looked at the sea for a long time, and then he turned back toward "
+    "the village. Nobody had ever told him that the tide could move so quickly, yet "
+    "he had always known it, the way a sailor knows the weather before the clouds "
+    "arrive. He walked slowly, counting the boats that had returned, and wondered "
+    "whether his son would be among them before nightfall. The lamps were already lit "
+    "in the harbour. Somewhere a dog barked twice and fell silent. "
+)
+
+
+def benchmark(short_name: str, *, gpu: bool, text: str = BENCHMARK_TEXT * 2,
+              repeats: int = 2) -> dict:
+    """Best characters/second over *repeats* runs, on the card or the processor."""
+    with PiperSynthesizer(short_name, gpu=gpu) as synth:
+        synth.synthesize("A short warm-up sentence.", "+0%")
+        best, audio_s = 0.0, 0.0
+        for _ in range(max(1, repeats)):
+            start = time.perf_counter()
+            pcm = synth.synthesize(text, "+0%")
+            elapsed = max(1e-6, time.perf_counter() - start)
+            if len(text) / elapsed > best:
+                best = len(text) / elapsed
+                audio_s = len(pcm) / 2 / synth.sample_rate
+        return {"chars_per_s": round(best, 1), "audio_s": round(audio_s, 2),
+                "on_gpu": synth.on_gpu}
+

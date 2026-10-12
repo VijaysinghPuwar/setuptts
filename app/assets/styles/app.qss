@@ -885,6 +885,36 @@ QCheckBox::indicator:checked {
     border-color: #0A84FF;
 }
 
+/* Radio buttons match the checkboxes, round. */
+QRadioButton {
+    background: transparent;
+    spacing: 8px;
+    padding: 2px 0;
+}
+
+QRadioButton::indicator {
+    width: 14px;
+    height: 14px;
+    border-radius: 8px;
+    border: 1px solid #3A3A3F;
+    background-color: #1E1E21;
+}
+
+QRadioButton::indicator:hover {
+    border-color: #0A84FF;
+}
+
+QRadioButton::indicator:checked {
+    width: 6px;
+    height: 6px;
+    border: 5px solid #0A84FF;
+    background-color: #FFFFFF;
+}
+
+QRadioButton:disabled {
+    color: #6E6E73;
+}
+
 /* ── Scrollable dialog body ───────────────────────────────── */
 QScrollArea#dialogScroll {
     background: transparent;
