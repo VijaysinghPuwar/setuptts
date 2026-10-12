@@ -1104,3 +1104,53 @@ def test_small_machines_keep_one_run(monkeypatch):
     monkeypatch.setattr(piper_tts.os, "cpu_count", lambda: 16)
     runs, threads = piper_tts._plan_parallel_runs()
     assert runs == 2 and threads >= 2
+
+
+# ── Offline voices: long sentences spoken a clause at a time ───────────── #
+
+def test_long_sentence_is_split_after_its_commas():
+    ph = list("ɔːlðˈoʊ juː ɛskˈeɪpt jˈuːzɪŋ ðə dˈɛθ sˈʌbstɪtˌuːt dˈɑːl, "
+              "hiː stˈɪl əbtˈeɪnd pˈɑːɹt ʌv jʊɹ dᵻvˈaɪn dˈaʊ blˈʌd ænd sˈoʊl!")
+    pieces = piper_tts._split_clauses(ph)
+    assert ["".join(p) for p in pieces] == [
+        "ɔːlðˈoʊ juː ɛskˈeɪpt jˈuːzɪŋ ðə dˈɛθ sˈʌbstɪtˌuːt dˈɑːl,",
+        "hiː stˈɪl əbtˈeɪnd pˈɑːɹt ʌv jʊɹ dᵻvˈaɪn dˈaʊ blˈʌd ænd sˈoʊl!",
+    ]
+
+
+def test_short_sentences_and_short_clauses_stay_whole():
+    short = list("jˈɛs, aɪ nˈoʊ.")
+    assert piper_tts._split_clauses(short) == [short]
+    # "Yes," is too short to stand alone, even in a long sentence.
+    long_ = list("jˈɛs, aɪ nˈoʊ ðæt wˈɛl ænd ɡˈʊd ænd mˈoːɹ wˈɜːdz hˈɪɹ ænd ðˈɛɹ ænd ˈɛvɹɪwˌɛɹ ɛls")
+    assert piper_tts._split_clauses(long_) == [long_]
+
+
+def test_split_loses_no_phonemes():
+    import random
+    rng = random.Random(3)
+    for _ in range(200):
+        ph = [rng.choice(list("abcdeɪŋ ,;:")) for _ in range(rng.randint(1, 400))]
+        joined = "".join("".join(p) for p in piper_tts._split_clauses(ph))
+        # Only the spaces right after a cut are dropped.
+        assert joined.replace(" ", "") == "".join(ph).replace(" ", "")
+
+
+def test_clause_pieces_get_a_comma_pause(monkeypatch):
+    import numpy as np
+    pytest.importorskip("piper")
+    voice = _SlowFakeVoice()
+    long_clause = ["a"] * 40 + [","] + [" "] + ["b"] * 40 + ["."]
+    voice.phonemize = lambda _text: [long_clause]
+    voice.phonemes_to_ids = lambda ph: [len(ph)]
+    synth = _fake_synth(voice)
+    try:
+        pcm = synth.synthesize("x", "+0%")
+    finally:
+        synth.close()
+    samples = np.frombuffer(pcm, dtype="<i2")
+    voiced = np.flatnonzero(samples)
+    gaps = np.diff(voiced)
+    # Two clauses: one pause inside (the comma) and the sentence pause at the end.
+    assert (gaps > 1).sum() == 1
+    assert len(samples) - 1 - voiced[-1] == int(1000 * 0.12) * 1

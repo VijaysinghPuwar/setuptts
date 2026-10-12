@@ -98,6 +98,35 @@ def test_preflight_fails_fast_on_no_audio(tmp_path, monkeypatch):
     assert "startup check" in message
 
 
+def test_preflight_retries_a_passing_no_audio_hiccup(tmp_path, monkeypatch):
+    """One "no audio" at the startup check refused a whole book with a voice
+    that then worked 8 times in 8.  A hiccup must not end the job."""
+    async def fake_list_voices(*, force_refresh=False):
+        return [{"ShortName": "en-US-AndrewMultilingualNeural", "Locale": "en-US"}]
+
+    calls = {"n": 0}
+
+    def first_call_fails(_text):
+        calls["n"] += 1
+        return "no_audio" if calls["n"] == 1 else "ok"
+
+    monkeypatch.setattr(tts_worker, "list_voices", fake_list_voices)
+    monkeypatch.setattr(
+        tts_worker,
+        "build_communicate",
+        lambda **kwargs: _FakeCommunicate(kwargs["text"], first_call_fails),
+    )
+    worker = tts_worker.TTSWorker(
+        text=("One day, Jiang Yifeng finally stopped being despondent. " * 600).strip(),
+        voice="en-US-AndrewMultilingualNeural",
+        rate="+100%",
+        volume="+0%",
+        output_path=str(tmp_path / "andrew.mp3"),
+    )
+    asyncio.run(worker._run_preflight([]))      # must not raise
+    assert calls["n"] == 2
+
+
 def test_voice_language_mismatch_is_blocked_before_generation(tmp_path, monkeypatch):
     async def fake_list_voices(*, force_refresh=False):
         return [

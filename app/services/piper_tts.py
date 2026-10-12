@@ -508,6 +508,36 @@ def _cap_phonemes(phonemes: list[str], limit: int = _MAX_PHONEMES) -> list[list[
     return [p for p in pieces if p]
 
 
+#: Sentences longer than this many phonemes are spoken one clause at a time.
+#: Some voices occasionally lose their way in a long run and speak gibberish:
+#: Ryan (high) garbled "…he still obtained part of your Divine Dao blood and
+#: soul!" 8 times in 8 and another book sentence 6 in 8; split at their
+#: commas, both came out right 8 in 8.  On 120 other book sentences the split
+#: changed nothing measurable (checked with speech recognition).
+_CLAUSE_SPLIT_PHONEMES = 60
+#: No clause shorter than this is cut off on its own ("Yes," "However,").
+_MIN_CLAUSE_PHONEMES = 12
+_CLAUSE_MARKS = frozenset(",;:")
+
+
+def _split_clauses(phonemes: list[str], limit: int = _CLAUSE_SPLIT_PHONEMES) -> list[list[str]]:
+    """Cut a long sentence after its commas, semicolons and colons."""
+    if len(phonemes) <= limit:
+        return [phonemes]
+    pieces: list[list[str]] = []
+    start = 0
+    for i, ph in enumerate(phonemes):
+        end = i + 1
+        if (ph in _CLAUSE_MARKS and end - start >= _MIN_CLAUSE_PHONEMES
+                and len(phonemes) - end >= _MIN_CLAUSE_PHONEMES):
+            pieces.append(phonemes[start:end])
+            start = end
+            while start < len(phonemes) and phonemes[start] == " ":
+                start += 1
+    pieces.append(phonemes[start:])
+    return [p for p in pieces if p]
+
+
 class PiperSynthesizer:
     """Same interface as SystemSynthesizer: synthesize / cancel / close."""
 
@@ -540,6 +570,10 @@ class PiperSynthesizer:
 
         if self._cancelled:
             raise PiperCancelled("cancelled")
+        # Piper returns each run trimmed; joined back-to-back they run
+        # together, so pauses are put back in.
+        sentence_gap = bytes(2 * int(self.sample_rate * 0.12))
+        clause_gap = bytes(2 * int(self.sample_rate * 0.07))
         m = _RATE_RE.fullmatch(rate or "")
         mult = max(0.25, 1.0 + (int(m.group(1)) if m else 0) / 100.0)
         cfg = SynthesisConfig(length_scale=self._voice.config.length_scale / mult)
@@ -547,15 +581,15 @@ class PiperSynthesizer:
         # job and a preview) phonemizing at once can crash it.  Inference
         # itself is thread-safe and runs unlocked.
         with _PHONEMIZE_LOCK:
-            # (phonemes, ends_sentence): a split sentence gets no pause
-            # between its pieces, so it still sounds like one sentence.
-            pieces = [(piece, i == len(split) - 1)
+            # (phonemes, pause after): a sentence end gets the full pause, a
+            # clause the shorter pause a comma has, and a piece cut only to
+            # bound memory none, so it still sounds like one sentence.
+            pieces = [(piece, sentence_gap if i == len(split) - 1 else
+                       clause_gap if piece[-1] in _CLAUSE_MARKS else b"")
                       for sentence in self._voice.phonemize(text)
-                      for split in [_cap_phonemes(sentence)]
+                      for split in [[p for clause in _split_clauses(sentence)
+                                     for p in _cap_phonemes(clause)]]
                       for i, piece in enumerate(split)]
-        # A short pause between sentences: Piper returns each sentence
-        # trimmed, and joined back-to-back they run together.
-        gap = bytes(2 * int(self.sample_rate * 0.12))
 
         def render(phonemes: list[str]) -> bytes:
             if self._cancelled:
@@ -583,12 +617,11 @@ class PiperSynthesizer:
         else:
             rendered = [render(p) for p, _ in work]
         parts = []
-        for audio, (_, ends_sentence) in zip(rendered, work):
+        for audio, (_, pause) in zip(rendered, work):
             if not audio:
                 continue
             parts.append(audio)
-            if ends_sentence:
-                parts.append(gap)
+            parts.append(pause)
         return b"".join(parts)
 
     def cancel(self) -> None:
