@@ -62,13 +62,19 @@ class VoiceLoaderWorker(QThread):
         local_thread.start()
 
         def _local() -> list[Voice]:
-            local_thread.join(40)
+            # Joined in short steps so closing the app is not held up for
+            # the full 40 s by a slow OS voice enumeration.
+            deadline = time.monotonic() + 40
+            while local_thread.is_alive() and time.monotonic() < deadline:
+                if self.isInterruptionRequested():
+                    break
+                local_thread.join(0.1)
             return list(local)
 
         last_exc: Exception | None = None
         for attempt in range(_ATTEMPTS):
-            if attempt:
-                time.sleep(_RETRY_DELAYS_S[attempt - 1])
+            if attempt and not self._sleep(_RETRY_DELAYS_S[attempt - 1]):
+                return
             if self.isInterruptionRequested():
                 return
             try:
@@ -85,6 +91,8 @@ class VoiceLoaderWorker(QThread):
                 logger.warning("Voice loading failed (attempt %d/%d): %s",
                                attempt + 1, _ATTEMPTS, exc)
 
+        if self.isInterruptionRequested():
+            return
         logger.error("Voice loading failed", exc_info=last_exc)
         cached = self._load_cache()
         if cached:
@@ -108,6 +116,15 @@ class VoiceLoaderWorker(QThread):
         )
 
     # ------------------------------------------------------------------ #
+
+    def _sleep(self, seconds: float) -> bool:
+        """Sleep between retries; False as soon as interruption is requested."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.isInterruptionRequested():
+                return False
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        return not self.isInterruptionRequested()
 
     def _save_cache(self, voices: list[Voice]) -> None:
         if self._cache_path is None:

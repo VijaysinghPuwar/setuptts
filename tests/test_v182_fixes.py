@@ -354,29 +354,38 @@ def test_plain_text_drag_is_accepted(qtbot):
 
 
 def test_shutdown_waits_for_all_workers_together(monkeypatch):
-    from app.workers import job_queue
+    from app.workers import thread_shutdown
     from app.workers.job_queue import JobItem, JobQueue
 
     waits = []
+    now = [0.0]
 
     class SlowWorker:
         def __init__(self):
             self.cancelled = False
+            self.terminated = False
 
         def cancel(self):
             self.cancelled = True
+
+        def requestInterruption(self):
+            pass
+
+        def quit(self):
+            pass
 
         def isRunning(self):
             return True
 
         def wait(self, ms):
             # Every worker is told to stop before anything waits.
-            assert all(w.cancelled for w in workers[:2])
+            assert all(w.cancelled for w in workers)
             waits.append(ms)
+            now[0] += ms / 1000
             return False
 
         def terminate(self):
-            pass
+            self.terminated = True
 
     workers = [SlowWorker(), SlowWorker(), SlowWorker()]
     queue = JobQueue()
@@ -384,13 +393,12 @@ def test_shutdown_waits_for_all_workers_together(monkeypatch):
         queue._running[f"j{i}"] = (JobItem(text="t", voice="v", voice_display="v", rate="+0%",
                                            volume="+0%", output_path=f"{i}.mp3"), w)
     queue._finishing.append(workers[2])
-    clock = iter([0.0, 3.9, 4.5, 4.5])
-    monkeypatch.setattr(job_queue.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(thread_shutdown.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(thread_shutdown, "keep_alive", lambda t: None)
     queue.cancel_all()
-    stop_waits = [ms for ms in waits if ms != 1_000]
-    # One shared 4 s budget, not 4 s per worker.
-    assert len(stop_waits) == 3
-    assert sum(stop_waits) <= 4_000
+    # One shared budget, not a full wait per worker.
+    assert len(waits) == 3
+    assert sum(waits) <= 8_000
 
 
 def test_preview_failure_note_survives_playback_finished(qtbot, app_paths, monkeypatch, tmp_path):

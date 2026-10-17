@@ -109,6 +109,7 @@ from app.utils.paths import AppPaths, default_output_dir, open_in_file_manager
 from app.workers.job_queue import JobItem, JobQueue
 from app.workers.chunk_store import ResumeCandidate, ChunkStore
 from app.workers.preview_worker import PreviewWorker
+from app.workers.thread_shutdown import stop_threads
 from app.workers.voice_loader import VoiceLoaderWorker
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,7 @@ class OutputPanel(QWidget):
         """
         self._queue.cancel_all()
 
+        stopping: list[tuple[str, QThread]] = []
         for name, worker in [
             ("voice_loader", self._voice_loader),
             ("preview",      self._preview_worker),
@@ -255,6 +257,7 @@ class OutputPanel(QWidget):
             if not worker.isRunning():
                 continue
             logger.info("Stopping worker: %s", name)
+            stopping.append((name, worker))
 
             # Disconnect all signals first.  Any signals already queued in
             # the Qt event loop will become no-ops after disconnection, so
@@ -284,28 +287,16 @@ class OutputPanel(QWidget):
                     except (RuntimeError, TypeError):
                         pass
 
-            if hasattr(worker, "cancel"):
-                worker.cancel()
-            if hasattr(worker, "stop_playback"):
-                worker.stop_playback()
-            worker.quit()
-            if not worker.wait(4_000):
-                logger.warning("Worker %s timed out — terminating", name)
-                worker.terminate()
-                worker.wait(1_000)
-                if hasattr(worker, "_cleanup"):
-                    worker._cleanup()   # a terminated preview leaves its temp MP3
-            else:
-                logger.info("Worker %s stopped cleanly", name)
-
-        # Also keep finishing_workers alive until they exit
-        for w in list(self._finishing_workers):
-            if w.isRunning():
-                w.quit()
-                if not w.wait(2_000):
-                    w.terminate()
-                    w.wait(500)
+        stopping += [("finishing", w) for w in self._finishing_workers if w.isRunning()]
+        # Interrupted, cancelled and waited for together; one that will not
+        # stop in time is left to exit with the process (and kept referenced)
+        # rather than terminate()d while it runs Python code.
+        stop_threads(stopping, budget_s=4.0, min_wait_s=1.0)
         self._finishing_workers.clear()
+
+        # Threads from closed Get Voices / GPU dialogs (a stuck download).
+        from app.ui.dialogs.voice_manager_dialog import stop_orphans
+        stop_orphans()
 
     # ------------------------------------------------------------------ #
     # UI construction                                                      #
@@ -812,7 +803,11 @@ class OutputPanel(QWidget):
         self._set_folder_text(folder)
         idx = self._gender_combo.findText(self._settings.gender_filter)
         if idx >= 0:
+            # Silently: _on_filter_changed would save the language and source
+            # filters from widgets not restored yet, wiping both at launch.
+            self._gender_combo.blockSignals(True)
             self._gender_combo.setCurrentIndex(idx)
+            self._gender_combo.blockSignals(False)
         btn = self._source_buttons.get(self._settings.source_filter)
         if btn is not None:
             btn.setChecked(True)
@@ -828,18 +823,8 @@ class OutputPanel(QWidget):
         # prevent "QThread destroyed while running" crashes.
         old = self._voice_loader
         if old is not None and old.isRunning():
-            try:
-                old.loaded.disconnect(self._on_voices_loaded)
-                old.failed.disconnect(self._on_voices_failed)
-            except Exception:
-                pass
-            self._finishing_workers.append(old)
-            old.finished.connect(
-                lambda w=old: (
-                    self._finishing_workers.remove(w)
-                    if w in self._finishing_workers else None
-                )
-            )
+            old.requestInterruption()
+            self._keep_until_finished(old)
 
         self._voice_error_label.hide()
         self._retry_voices_btn.hide()
@@ -853,12 +838,35 @@ class OutputPanel(QWidget):
         self._voice_combo.setToolTip("")
         self._voice_count_label.setText("Connecting…")
 
-        self._voice_loader = VoiceLoaderWorker(
-            cache_path=AppPaths().cache_dir / "voices.json"
+        loader = VoiceLoaderWorker(cache_path=AppPaths().cache_dir / "voices.json")
+        # Results carry the loader that produced them: a list an old loader
+        # had already queued (Retry clicked just as it finished) must not
+        # replace the newer one, nor be read against the new loader's flags.
+        loader.loaded.connect(
+            lambda voices, w=loader: self._on_loader_result(w, self._on_voices_loaded, voices)
         )
-        self._voice_loader.loaded.connect(self._on_voices_loaded)
-        self._voice_loader.failed.connect(self._on_voices_failed)
-        self._voice_loader.start()
+        loader.failed.connect(
+            lambda message, w=loader: self._on_loader_result(w, self._on_voices_failed, message)
+        )
+        self._voice_loader = loader
+        loader.start()
+
+    def _keep_until_finished(self, worker: QThread) -> None:
+        if worker in self._finishing_workers:
+            return
+        self._finishing_workers.append(worker)
+        worker.finished.connect(
+            lambda w=worker: (
+                self._finishing_workers.remove(w)
+                if w in self._finishing_workers else None
+            )
+        )
+
+    def _on_loader_result(self, loader, handler, payload) -> None:
+        if loader is not self._voice_loader:
+            logger.info("Ignoring the result of a replaced voice loader")
+            return
+        handler(payload)
 
     def _on_voices_loaded(self, voices: list[Voice]) -> None:
         self._all_voices = voices
@@ -1047,14 +1055,19 @@ class OutputPanel(QWidget):
             f"{total} voices" if total == all_n else f"{total} of {all_n} voices"
         )
         self._preview_btn.setEnabled(True)
-        # Signals were blocked while rebuilding, so record the selection that
-        # is now visible — that is the voice Generate will use.
-        self._on_voice_selection_changed()
+        # Signals were blocked while rebuilding, so refresh what depends on
+        # the visible selection — but don't save it: a search or filter that
+        # hides the saved voice is not the user choosing another one, and
+        # saving it here replaced their voice for good on every keystroke.
+        self._refresh_for_selection()
 
     def _on_voice_selection_changed(self) -> None:
         selected = self.get_selected_voice()
         if selected:
             self._settings.voice = selected
+        self._refresh_for_selection()
+
+    def _refresh_for_selection(self) -> None:
         if not self._stop_preview_btn.isVisible():
             # A stale "Preview unavailable" belongs to the previous voice.
             self._set_preview_status("")
@@ -1222,6 +1235,9 @@ class OutputPanel(QWidget):
         for idx in range(self._voice_combo.count()):
             if self._voice_combo.itemData(idx, _ROLE_SHORT_NAME) == short_name:
                 self._voice_combo.setCurrentIndex(idx)
+                # An explicit choice; the index may not have changed (the
+                # rebuild can already sit on it), so save it here too.
+                self._settings.voice = short_name
                 return True
         return False
 
@@ -1264,8 +1280,15 @@ class OutputPanel(QWidget):
     # ------------------------------------------------------------------ #
 
     def _on_preview(self) -> None:
-        if self._preview_worker and self._preview_worker.isRunning():
-            return
+        old = self._preview_worker
+        if old is not None and old.isRunning():
+            if not self._stop_preview_btn.isHidden():
+                return   # still generating or playing
+            # It has reported playback_finished (that is what brought the
+            # Preview button back) and is only returning from run(); a click
+            # in that moment used to be silently dropped.
+            if not old.wait(1_000):
+                self._keep_until_finished(old)
         voice = self.get_selected_voice()
         rate  = self.get_rate_string()
         self._preview_btn.hide()
