@@ -244,6 +244,8 @@ class ChunkStore:
     ) -> None:
         self._dir = staging_dir
         self._manifest = manifest
+        # Set by finalize(): True when this run's rejected audio was kept.
+        self.rejected_kept = False
         staging_dir.mkdir(parents=True, exist_ok=True)
         if save_manifest:
             self._save_manifest()
@@ -745,6 +747,7 @@ class ChunkStore:
         assembled audio is moved to *rejected_path* for inspection, or
         deleted if none is given.
         """
+        self.rejected_kept = False
         records = sorted(self._manifest.chunks, key=lambda c: c.index)
         if not records:
             raise RuntimeError("No completed chunks to finalise — nothing to write.")
@@ -803,7 +806,10 @@ class ChunkStore:
                 except Exception:
                     if rejected_path is not None:
                         try:
-                            tmp_output.replace(rejected_path)
+                            # With retries: an older copy of the same name may
+                            # be open in a player or held by antivirus.
+                            _replace_with_retry(tmp_output, rejected_path)
+                            self.rejected_kept = True
                         except OSError:
                             logger.warning("Could not keep rejected output at %s",
                                            rejected_path, exc_info=True)
@@ -1148,7 +1154,7 @@ def cleanup_stale_staging(
         if not entry.is_dir():
             continue
         try:
-            if entry.resolve() in keep_resolved:
+            if entry.resolve() in keep_resolved or is_live(entry):
                 continue
             age_days = (now - entry.stat().st_mtime) / 86_400
             if age_days < max_age_days:
