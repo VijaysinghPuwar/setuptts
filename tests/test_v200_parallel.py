@@ -235,3 +235,70 @@ def test_cancel_with_sections_in_flight_leaves_no_stray_tasks(tmp_path, setup, c
         (worker._chunk_store.staging_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "cancelled"
     assert len(manifest["chunks"]) >= 3
+
+
+def test_too_many_requests_lowers_parallelism_for_the_rest_of_the_job(
+        tmp_path, setup, monkeypatch):
+    """Seen live: three sections at once drew one HTTP 429.  The job then
+    keeps to fewer sections at a time instead of being refused again."""
+    from types import SimpleNamespace
+
+    import aiohttp
+
+    def throttled():
+        info = SimpleNamespace(url=SimpleNamespace(host="api.msedgeservices.com"),
+                               real_url=None, method="GET", headers={})
+        return aiohttp.WSServerHandshakeError(info, (), status=429,
+                                              message="Invalid response status")
+
+    service = _Service()
+    original = service.communicate
+    refused = {"done": False}
+
+    def communicate(**kwargs):
+        if service.calls >= 4 and not refused["done"]:
+            refused["done"] = True
+            service.calls += 1
+
+            class _Refused:
+                async def stream(self):
+                    raise throttled()
+                    yield  # pragma: no cover - makes this an async generator
+
+            return _Refused()
+        return original(**kwargs)
+
+    setup(service)
+    monkeypatch.setattr(tts_worker, "build_communicate", communicate)
+    worker = _worker(tmp_path)
+    asyncio.run(worker._stream_generate())
+
+    assert refused["done"]
+    assert worker._parallel_cap == tts_worker._MAX_PARALLEL_CHUNKS - 1
+    cleaned = tts_worker.build_text_profile(_text()).cleaned_text.strip()
+    assert _squash((tmp_path / "book.mp3").read_bytes().decode("utf-8")) == _squash(cleaned)
+
+
+def test_only_the_section_being_waited_on_updates_the_status(tmp_path, setup):
+    """Three streams used to take turns writing the job's one status line."""
+    service = _Service()
+    setup(service)
+    worker = _worker(tmp_path)
+    statuses: list[str] = []
+    worker.status_changed.connect(statuses.append)
+    saved: list[int] = []
+    original = worker._emit_status
+
+    def spy(text):
+        if text.startswith("Chunk "):
+            saved.append(int(text.split()[1].rstrip("…")))
+        original(text)
+
+    worker._emit_status = spy
+    asyncio.run(worker._stream_generate())
+
+    shown = [int(t.split()[1].rstrip("…")) for t in statuses if t.startswith("Chunk ")]
+    # Every section asked; only the one at the head of the line was shown,
+    # so the numbers shown never go backwards.
+    assert len(saved) > len(shown) > 0
+    assert shown == sorted(shown)

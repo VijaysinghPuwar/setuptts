@@ -240,3 +240,78 @@ def test_stale_sweep_skips_a_folder_in_use(tmp_path):
         chunk_store._set_live(busy, False)
     chunk_store.cleanup_stale_staging(tmp_path, max_age_days=1)
     assert not busy.exists()
+
+
+# ── Second review round ─────────────────────────────────────────────────── #
+
+@pytest.mark.parametrize("text, expected", [
+    ("She studied art. Then she left.", ["She studied art.", "Then she left."]),
+    ("Wait a sec. He went.", ["Wait a sec.", "He went."]),
+    ("World War I. The end.", ["World War I.", "The end."]),
+    ("Take vitamin C. Then rest.", ["Take vitamin C.", "Then rest."]),
+    ("John F. Kennedy spoke. Ok.", ["John F. Kennedy spoke.", "Ok."]),
+    ("Dec. 5 came. Then.", ["Dec. 5 came.", "Then."]),
+    # Closing quotes stay with their danda; a double danda is not split.
+    ("वह बोला।” फिर गया।", ["वह बोला।”", "फिर गया।"]),
+    ("ab।। cd", ["ab।।", "cd"]),
+])
+def test_sentence_splitting_second_round(text, expected):
+    assert tts_worker._split_sentences(text) == expected
+
+
+def test_bomless_utf16_thai_still_opens():
+    from app.ui.panels.input_panel import decode_text_file
+
+    thai = "สวัสดีครับ วันนี้อากาศดีมาก เราไปเที่ยวทะเลกันเถอะ\n" * 40
+    assert decode_text_file(thai.encode("utf-16-le")) == thai
+    assert decode_text_file(thai.encode("utf-16-be")) == thai
+
+
+def test_stray_nuls_in_utf8_are_not_read_as_utf16():
+    from app.ui.panels.input_panel import decode_text_file
+
+    english = ("Hello world, this is a normal English book. " * 200).encode()
+    damaged = english[:101] + b"\x00" + english[101:301] + b"\x00" + english[301:]
+    assert decode_text_file(damaged).startswith("Hello world")
+
+
+def test_every_thread_gets_its_minimum_wait():
+    from app.workers import thread_shutdown
+
+    class _Thread:
+        def __init__(self):
+            self.waits = []
+
+        def isRunning(self):
+            return True
+
+        def wait(self, ms):
+            self.waits.append(ms)
+            return True
+
+        def requestInterruption(self):
+            pass
+
+        def quit(self):
+            pass
+
+    threads = [("a", _Thread()), ("b", _Thread()), ("c", _Thread())]
+    thread_shutdown.stop_threads(threads, budget_s=0.0, min_wait_s=1.5)
+    assert [t.waits for _, t in threads] == [[1500], [1500], [1500]]
+
+
+def test_resuming_a_folder_already_in_use_fails_instead_of_starting_over(
+        tmp_path, monkeypatch, fake_service):
+    worker = _worker(tmp_path / "book.mp3")
+    folder = tmp_path / "staging"
+    folder.mkdir()
+    worker._resume_staging_dir = folder
+
+    def in_use(*_a, **_kw):
+        raise chunk_store.StagingInUseError("busy")
+
+    monkeypatch.setattr(chunk_store.ChunkStore, "try_resume", in_use)
+    with pytest.raises(tts_worker._PreflightError) as excinfo:
+        asyncio.run(worker._stream_generate())
+    assert excinfo.value.cause.kind == "staging_in_use"
+    assert "already being generated" in tts_worker.TTSWorker._user_message(excinfo.value)

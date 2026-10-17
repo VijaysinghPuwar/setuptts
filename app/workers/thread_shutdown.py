@@ -64,7 +64,9 @@ def stop_threads(
             continue
         left = budget_s - (time.monotonic() - start)
         fair_share = left / (len(threads) - i)
-        wait_s = max(0.0, min(max(min_wait_s, fair_share), left))
+        # Never below the minimum: a slow first thread must not leave the
+        # rest a zero wait.  The budget is exceeded by at most that much.
+        wait_s = max(min_wait_s, min(fair_share, left))
         if thread.wait(int(wait_s * 1000)):
             continue
         logger.warning("Worker %s did not stop in time; leaving it to exit with the app",

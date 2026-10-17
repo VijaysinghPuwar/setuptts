@@ -737,6 +737,9 @@ class OutputPanel(QWidget):
         self._source_group.buttonClicked.connect(lambda _btn: self._on_filter_changed())
         self._get_voices_btn.clicked.connect(self._open_voice_manager)
         self._voice_combo.currentIndexChanged.connect(self._on_voice_selection_changed)
+        # A filter can show a voice that isn't the saved one; picking that
+        # same row changes no index, but it is a choice and must be saved.
+        self._voice_combo.activated.connect(self._on_voice_selection_changed)
 
         # Speed
         self._rate_slider.valueChanged.connect(self._on_rate_changed)

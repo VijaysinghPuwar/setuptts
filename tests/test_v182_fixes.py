@@ -102,12 +102,13 @@ def test_queue_refuses_second_job_with_same_id_or_staging_dir(tmp_path, monkeypa
 
 
 def test_try_resume_refuses_a_folder_another_worker_owns(app_paths):
-    from app.workers.chunk_store import ChunkStore, is_live
+    from app.workers.chunk_store import ChunkStore, StagingInUseError, is_live
 
     store, text = _saved_job(app_paths)
     first = ChunkStore.try_resume(store.staging_dir, text, "en-US-AvaNeural")
     assert first is not None
-    assert ChunkStore.try_resume(store.staging_dir, text, "en-US-AvaNeural") is None
+    with pytest.raises(StagingInUseError):
+        ChunkStore.try_resume(store.staging_dir, text, "en-US-AvaNeural")
     first.release()
     assert not is_live(store.staging_dir)
     again = ChunkStore.try_resume(store.staging_dir, text, "en-US-AvaNeural")

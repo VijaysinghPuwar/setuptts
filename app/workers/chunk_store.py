@@ -304,7 +304,9 @@ class ChunkStore:
         if not _claim_live(staging_dir):
             logger.warning("Staging folder %s is already in use — not resuming it twice",
                            staging_dir)
-            return None
+            # Not None: that means "start over", which would quietly render
+            # the whole book again beside the job already doing it.
+            raise StagingInUseError(f"{staging_dir} is already being written")
         try:
             store = cls._load_for_resume(staging_dir, text, voice)
         except BaseException:
@@ -879,6 +881,10 @@ class ChunkStore:
             "updated_at": self._manifest.updated_at,
         }
         _atomic_write_text(manifest_path, json.dumps(data, indent=2))
+
+
+class StagingInUseError(RuntimeError):
+    """A resume was asked for a staging folder another worker is writing."""
 
 
 class CoverageError(RuntimeError):

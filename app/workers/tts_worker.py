@@ -16,6 +16,7 @@ path is now more defensive:
 
 import asyncio
 import collections
+import contextvars
 import dataclasses
 import hashlib
 import html
@@ -57,6 +58,7 @@ from app.utils.power import keep_awake
 from app.workers.chunk_store import (
     ChunkStore,
     CoverageError,
+    StagingInUseError,
     cleanup_stale_staging,
 )
 
@@ -173,6 +175,8 @@ _MAX_PARALLEL_CHUNKS = 3
 # After any failed attempt the job goes back to one section at a time for
 # a while, so a struggling or throttling service is not pushed harder.
 _PARALLEL_COOLDOWN_S = 120.0
+#: Index of the section a task is working on (unset outside section tasks).
+_SECTION: contextvars.ContextVar[int] = contextvars.ContextVar("setuptts_section")
 
 # Full-width CJK sentence/clause marks are not followed by a space, so they
 # must be split points on their own; requiring "\s+" sent every Chinese or
@@ -185,7 +189,7 @@ _PARALLEL_COOLDOWN_S = 120.0
 _SENTENCE_BOUNDARY = (
     r"(?<=[.!?])\s+|(?<=[.!?][\"'”’)\]])\s+"
     r"|(?<=[。！？])(?![」』”’）】〕])\s*|(?<=[。！？][」』”’）】〕])\s*"
-    r"|(?<=[।॥۔؟။።។៕])\s*"
+    r"|(?<=[।॥۔؟။።។៕])(?![।॥\"'”’)\]»])\s*|(?<=[।॥۔؟။።។៕][\"'”’)\]»])\s*"
 )
 _CLAUSE_BOUNDARY = r"(?<=[，、；：])\s*|(?<=[,;:،؛])\s+"
 _SENTENCE_SPLIT_RE = re.compile(_SENTENCE_BOUNDARY)
@@ -195,17 +199,18 @@ _SENTENCE_SPLIT_RE = re.compile(_SENTENCE_BOUNDARY)
 _PREFIX_ABBREVIATIONS = frozenset({
     "mr", "mrs", "ms", "mx", "dr", "prof", "sr", "jr", "st", "mt", "ft",
     "rev", "gen", "col", "lt", "sgt", "capt", "cmdr", "gov", "sen", "rep",
-    "hon", "pres", "messrs", "mme", "mlle", "fig", "figs", "vol", "vols",
-    "ch", "chap", "sec", "pp", "no", "nos", "art", "eq", "ref", "vs", "cf",
-    "approx", "dept", "est", "e.g", "i.e", "viz", "al",
-    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct",
-    "nov", "dec",
+    "hon", "pres", "messrs", "mme", "mlle", "figs", "vols",
+    "chap", "pp", "nos", "eq", "vs", "cf",
+    "approx", "dept", "e.g", "i.e", "viz",
+    "jan", "feb", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov",
 })
 # These end sentences too ("...and so on, etc."), so they only hold the
 # sentence together when it plainly goes on in lower case or with a number.
 _AMBIGUOUS_ABBREVIATIONS = frozenset({
     "etc", "inc", "ltd", "co", "corp", "a.m", "p.m", "ph.d", "u.s", "u.k",
     "no", "fig", "vol", "al",
+    # Also everyday words that end sentences ("She studied art.").
+    "art", "sec", "ref", "est", "ch", "ft", "mar", "dec",
 })
 _ABBREVIATION_WORD_RE = re.compile(r"([^\s(\[\"'“‘]+)\.$")
 
@@ -222,8 +227,12 @@ def _is_abbreviation_stop(text: str, period_end: int) -> bool:
         return bool(following) and (following[0].islower() or following[0].isdigit())
     if word in _PREFIX_ABBREVIATIONS:
         return True
-    # "J. R. R. Tolkien": a lone capital initial.
-    return len(word) == 1 and word.isalpha() and match.group(1).isupper()
+    # "J. R. R. Tolkien": a lone capital initial.  Not "I.", and not a
+    # letter after a lower-case word ("plan B.", "vitamin C.").
+    if not (len(word) == 1 and word.isalpha() and match.group(1).isupper()) or word == "i":
+        return False
+    before = text[max(0, match.start(1) - 20):match.start(1)].split()
+    return not (before and before[-1][:1].islower())
 
 
 def _sentence_boundaries(text: str, limit: int | None = None) -> list[tuple[int, int]]:
@@ -1099,6 +1108,11 @@ def _redact_url_queries(text: str) -> str:
     return _URL_QUERY_RE.sub(r"\1?…", text)
 
 
+def _is_throttled(exc: BaseException | None) -> bool:
+    """The service answered HTTP 429 Too Many Requests."""
+    return isinstance(exc, aiohttp.ClientResponseError) and exc.status == 429
+
+
 class _AttemptFailure(RuntimeError):
     def __init__(
         self,
@@ -1308,6 +1322,14 @@ class TTSWorker(QThread):
         self._compatibility: VoiceCompatibilityAssessment | None = None
         self._health = _RollingHealthState()
         self._last_failure_at: float | None = None
+        # Lowered for the rest of the job each time the service says "too
+        # many requests" (HTTP 429), so a throttled job settles at a pace
+        # the service accepts instead of being refused again every cooldown.
+        self._parallel_cap = _MAX_PARALLEL_CHUNKS
+        # The section the job is waiting on.  Sections cut ahead work
+        # quietly: the job's one status line followed whichever of three
+        # streams spoke last ("Chunk 7…", "Saved chunk 5", "Retry on 6").
+        self._head_index: int | None = None
         self._stats = _JobStats()
 
     @property
@@ -1433,7 +1455,7 @@ class TTSWorker(QThread):
             if self._cancelled:
                 raise asyncio.CancelledError()
             if attempt:
-                self.stage_changed.emit(
+                self._emit_stage(
                     "waiting",
                     f"Retry {attempt}/2 on the voice check — waiting for the connection",
                 )
@@ -1458,8 +1480,8 @@ class TTSWorker(QThread):
         if self._cancelled:
             raise asyncio.CancelledError()
 
-        self.status_changed.emit("Preparing…")
-        self.stage_changed.emit("local", "Preparing text locally")
+        self._emit_status("Preparing…")
+        self._emit_stage("local", "Preparing text locally")
         self.progress.emit(3)
 
         stripped_text = self._text_profile.cleaned_text.strip()
@@ -1467,7 +1489,7 @@ class TTSWorker(QThread):
             raise ValueError("No text was available to generate after text cleanup.")
 
         if stripped_text != self._text.strip():
-            self.stage_changed.emit(
+            self._emit_stage(
                 "local",
                 "Cleaning punctuation and unicode for more reliable speech output",
             )
@@ -1482,8 +1504,8 @@ class TTSWorker(QThread):
         max_chunk_chars = chunk_plan.max_chars
         max_payload_bytes = chunk_plan.max_payload_bytes
 
-        self.status_changed.emit("Validating voice…")
-        self.stage_changed.emit(
+        self._emit_status("Validating voice…")
+        self._emit_stage(
             "remote",
             f"Validating selected voice ({self._voice}) with Microsoft",
         )
@@ -1539,7 +1561,7 @@ class TTSWorker(QThread):
         ):
             alt = _suggest_stable_long_form_voice(self._voice, voices)
             alt_hint = f"  Suggested alternative: {alt}." if alt else ""
-            self.stage_changed.emit(
+            self._emit_stage(
                 "local",
                 f"Note: '{self._voice}' is a multilingual model and may be less stable "
                 f"for long English audiobook jobs (chunk ceiling reduced to {max_chunk_chars:,} chars).{alt_hint}",
@@ -1556,10 +1578,6 @@ class TTSWorker(QThread):
 
         # ── Set up chunk staging (checkpoint / resume) ─────────────────── #
         staging_root = AppPaths().staging_dir
-        self._check_free_space(
-            staging_root, total_chars, Path(self._output_path),
-            already_staged=_staged_bytes(self._resume_staging_dir),
-        )
         # Clean up orphaned staging dirs from previous sessions — never the one
         # this job is about to resume.
         try:
@@ -1573,7 +1591,18 @@ class TTSWorker(QThread):
 
         chunk_store: ChunkStore
         if self._resume_staging_dir is not None:
-            resumed = ChunkStore.try_resume(self._resume_staging_dir, stripped_text, self._voice)
+            try:
+                resumed = ChunkStore.try_resume(
+                    self._resume_staging_dir, stripped_text, self._voice)
+            except StagingInUseError as exc:
+                raise _PreflightError(
+                    self._voice,
+                    _AttemptFailure(
+                        "staging_in_use",
+                        "This saved job is already being generated.",
+                        original=exc,
+                    ),
+                ) from exc
             if resumed is not None:
                 chunk_store = resumed
                 logger.info(
@@ -1590,7 +1619,7 @@ class TTSWorker(QThread):
                     "Could not resume from %s (mismatch or no valid data) — starting fresh",
                     self._resume_staging_dir,
                 )
-                self.stage_changed.emit(
+                self._emit_stage(
                     "local",
                     "Saved progress couldn't be reused — starting from the beginning",
                 )
@@ -1616,6 +1645,21 @@ class TTSWorker(QThread):
             )
 
         self._chunk_store = chunk_store
+        # Counted only now: staged audio from a resume that turned out not to
+        # match stays on disk and must not be subtracted.
+        resumed_ok = chunk_store.completed_count > 0 and self._resume_staging_dir is not None
+        try:
+            self._check_free_space(
+                staging_root, total_chars, Path(self._output_path),
+                already_staged=_staged_bytes(chunk_store.staging_dir) if resumed_ok else 0,
+            )
+        except _PreflightError:
+            if resumed_ok:
+                chunk_store.release()
+            else:
+                chunk_store.mark_cancelled(preserve_progress=False)
+                chunk_store.cleanup()
+            raise
 
         # ── Initialise cursor, possibly from a resume point ─────────────── #
         # The resume position is derived from the manifest's recorded chunk
@@ -1679,7 +1723,7 @@ class TTSWorker(QThread):
         )
 
         if resume_chunk_idx > 0:
-            self.stage_changed.emit(
+            self._emit_stage(
                 "local",
                 f"Resuming from chunk {resume_chunk_idx + 1} — "
                 f"{chunk_store.completed_count} chunk(s) already completed, "
@@ -1693,15 +1737,15 @@ class TTSWorker(QThread):
                 chunk_plan.ramp_chars,
             )
             if estimated_chunks > 1:
-                self.stage_changed.emit(
+                self._emit_stage(
                     "local",
                     "Preparing adaptive chunk pipeline "
                     f"(warm-up {chunk_plan.warmup_chars:,} chars, "
                     f"healthy ceiling {max_chunk_chars:,} chars)",
                 )
 
-        self.status_changed.emit("Connecting…")
-        self.stage_changed.emit(
+        self._emit_status("Connecting…")
+        self._emit_stage(
             "remote",
             "Connecting to Microsoft Neural TTS (speech.platform.bing.com)",
         )
@@ -1752,7 +1796,9 @@ class TTSWorker(QThread):
                         if estimated_total > 1
                         else f"chunk {chunk_number}"
                     )
-                    task = asyncio.ensure_future(self._process_chunk(
+                    section = contextvars.copy_context()
+                    section.run(_SECTION.set, next_idx)
+                    task = asyncio.get_running_loop().create_task(self._process_chunk(
                         text_chunk=text_chunk,
                         chunk_payload=chunk_payload,
                         chunk_idx=next_idx,
@@ -1766,7 +1812,7 @@ class TTSWorker(QThread):
                         source_text=stripped_text,
                         source_start=source_start,
                         source_end=source_end,
-                    ))
+                    ), context=section)
                     in_flight.append(_InFlightChunk(
                         task=task, index=next_idx, label=chunk_label,
                         estimated_total=estimated_total, chars=len(text_chunk),
@@ -1780,6 +1826,7 @@ class TTSWorker(QThread):
                     break
 
                 head = in_flight[0]
+                self._head_index = head.index
                 chunk_bytes, outcome = await head.task
                 in_flight.popleft()
                 chunk_label = head.label
@@ -1789,7 +1836,7 @@ class TTSWorker(QThread):
 
                 # ── Write chunk to staging ──────────────────────────────── #
                 write_started_at = time.monotonic()
-                self.stage_changed.emit("local", f"Writing {chunk_label} to disk")
+                self._emit_stage("local", f"Writing {chunk_label} to disk")
                 try:
                     chunk_store.record_chunk(
                         chunk_idx,
@@ -1904,6 +1951,7 @@ class TTSWorker(QThread):
             raise
 
         finally:
+            self._head_index = None
             await self._drain_in_flight(in_flight)
 
         if self._cancelled:
@@ -1951,7 +1999,7 @@ class TTSWorker(QThread):
             raise error
 
         # ── Assemble final file ──────────────────────────────────────────── #
-        self.stage_changed.emit("local", "Assembling final audio file from all chunks…")
+        self._emit_stage("local", "Assembling final audio file from all chunks…")
         expected_min, expected_max = (
             chunk_store.manifest.expected_duration_min_s or 0.0,
             chunk_store.manifest.expected_duration_max_s or 0.0,
@@ -2096,7 +2144,7 @@ class TTSWorker(QThread):
             f"{expected_max:.0f}s",
             coverage.summary(),
         )
-        self.stage_changed.emit(
+        self._emit_stage(
             "local",
             (
                 f"Saved {output_path.name} — {coverage.chunks_recorded} chunks, "
@@ -2108,7 +2156,7 @@ class TTSWorker(QThread):
                 )
             ),
         )
-        self.status_changed.emit("Done")
+        self._emit_status("Done")
         self.progress.emit(100)
 
     # ------------------------------------------------------------------ #
@@ -2169,8 +2217,8 @@ class TTSWorker(QThread):
             self._text_profile.script_code,
         )
 
-        self.status_changed.emit("Validating voice…")
-        self.stage_changed.emit(
+        self._emit_status("Validating voice…")
+        self._emit_stage(
             "remote",
             "Running a small startup synthesis check before the full job",
         )
@@ -2275,17 +2323,17 @@ class TTSWorker(QThread):
         )
 
         if depth == 0:
-            self.status_changed.emit(f"Chunk {chunk_number}…")
-            self.stage_changed.emit(
+            self._emit_status(f"Chunk {chunk_number}…")
+            self._emit_stage(
                 "remote",
                 f"Sending {chunk_label} to Microsoft ({len(text_chunk):,} chars / {chunk_payload:,} bytes)",
             )
         else:
-            self.stage_changed.emit(
+            self._emit_stage(
                 "remote",
                 f"Retrying {chunk_label} with a smaller recovery section ({len(text_chunk):,} chars / {chunk_payload:,} bytes)",
             )
-            self.status_changed.emit(f"Recovering chunk {chunk_number}…")
+            self._emit_status(f"Recovering chunk {chunk_number}…")
 
         last_failure: _AttemptFailure | None = None
         chunk_start = time.monotonic()
@@ -2308,8 +2356,8 @@ class TTSWorker(QThread):
                     last_failure,
                     wait,
                 )
-                self.status_changed.emit(self._retry_status_text(last_failure, attempt))
-                self.stage_changed.emit(
+                self._emit_status(self._retry_status_text(last_failure, attempt))
+                self._emit_stage(
                     "waiting",
                     f"Retry {attempt}/{_MAX_ATTEMPTS - 1} on {chunk_label} — waiting {wait:.0f} s before a fresh connection",
                 )
@@ -2451,8 +2499,8 @@ class TTSWorker(QThread):
             )
             if recovery_sub_chunks:
                 self._stats.recovery_splits += 1
-                self.status_changed.emit("Recovering failed chunk…")
-                self.stage_changed.emit(
+                self._emit_status("Recovering failed chunk…")
+                self._emit_stage(
                     "waiting",
                     f"{chunk_label} kept failing — retrying {len(recovery_sub_chunks)} smaller sections",
                 )
@@ -2665,7 +2713,7 @@ class TTSWorker(QThread):
                         if stats.audio_bytes == 0:
                             stats.first_audio_at = stats.last_event_at
                             first_audio_delay = stats.first_audio_at - stats.started_at
-                            self.stage_changed.emit(
+                            self._emit_stage(
                                 "remote",
                                 f"Receiving audio — {chunk_label} (first audio after {first_audio_delay:.1f} s)",
                             )
@@ -2829,7 +2877,7 @@ class TTSWorker(QThread):
                 _MIN_RECOVERY_PAYLOAD_BYTES,
                 int(current_payload_limit * _ADAPTIVE_SHRINK_FACTOR),
             )
-            self.stage_changed.emit(
+            self._emit_stage(
                 "local",
                 f"Reducing upcoming chunk size to keep throughput stable (≤{next_chars:,} chars)",
             )
@@ -2875,8 +2923,8 @@ class TTSWorker(QThread):
             "%s: cannot reach %s — waiting for the connection to return",
             chunk_label, synthesis_host(),
         )
-        self.status_changed.emit("Waiting for internet connection…")
-        self.stage_changed.emit(
+        self._emit_status("Waiting for internet connection…")
+        self._emit_stage(
             "waiting",
             f"No connection to Microsoft — {chunk_label} will continue "
             "automatically when the internet is back",
@@ -2895,8 +2943,8 @@ class TTSWorker(QThread):
                     "%s: connection restored after %.0fs — resuming",
                     chunk_label, time.monotonic() - started,
                 )
-                self.status_changed.emit("Connection restored — resuming…")
-                self.stage_changed.emit("remote", f"Connection restored — retrying {chunk_label}")
+                self._emit_status("Connection restored — resuming…")
+                self._emit_stage("remote", f"Connection restored — retrying {chunk_label}")
                 return True
             if time.monotonic() - started >= _OUTAGE_MAX_WAIT_S:
                 logger.error(
@@ -2904,6 +2952,18 @@ class TTSWorker(QThread):
                     chunk_label, _OUTAGE_MAX_WAIT_S / 60,
                 )
                 return False
+
+    def _speaks_for_job(self) -> bool:
+        section = _SECTION.get(None)
+        return section is None or self._head_index is None or section == self._head_index
+
+    def _emit_status(self, text: str) -> None:
+        if self._speaks_for_job():
+            self.status_changed.emit(text)
+
+    def _emit_stage(self, kind: str, text: str) -> None:
+        if self._speaks_for_job():
+            self.stage_changed.emit(kind, text)
 
     def _parallel_limit(self, committed_chunks: int) -> int:
         """How many sections may stream at once right now."""
@@ -2918,7 +2978,7 @@ class TTSWorker(QThread):
             and time.monotonic() - self._last_failure_at < _PARALLEL_COOLDOWN_S
         ):
             return 1
-        return _MAX_PARALLEL_CHUNKS
+        return min(self._parallel_cap, _MAX_PARALLEL_CHUNKS)
 
     async def _drain_in_flight(self, in_flight: "collections.deque[_InFlightChunk]") -> None:
         """Stop the sections still streaming and wait until they have."""
@@ -2939,11 +2999,15 @@ class TTSWorker(QThread):
         chunk_label: str,
     ) -> None:
         self._last_failure_at = time.monotonic()
+        if _is_throttled(failure.original) and self._parallel_cap > 1:
+            self._parallel_cap -= 1
+            logger.warning("%s: the service is limiting requests; at most %d section(s) "
+                           "at a time from now on", chunk_label, self._parallel_cap)
         if failure.kind in {"no_audio", "metadata_without_audio"}:
             self._health.no_audio_events += 1
             new_window = max(self._health.conservative_chunks_remaining, 4)
             if new_window > self._health.conservative_chunks_remaining:
-                self.stage_changed.emit(
+                self._emit_stage(
                     "waiting",
                     f"Repeated no-audio responses detected on {chunk_label} — using safer smaller chunks for the rest of the run",
                 )
@@ -2955,7 +3019,7 @@ class TTSWorker(QThread):
             if self._health.timeout_events >= 2:
                 new_window = max(self._health.conservative_chunks_remaining, 3)
                 if new_window > self._health.conservative_chunks_remaining:
-                    self.stage_changed.emit(
+                    self._emit_stage(
                         "waiting",
                         f"Repeated speech timeouts detected on {chunk_label} — reducing chunk sizes earlier",
                     )
@@ -3028,6 +3092,8 @@ class TTSWorker(QThread):
         receive_duration: float | None = None,
         write_duration: float | None = None,
     ) -> None:
+        if not self._speaks_for_job():
+            return
         cps = progress_state.spd_ema
         eta_seconds = None
         if cps > 0:
@@ -3088,19 +3154,19 @@ class TTSWorker(QThread):
             delta_chars = state.processed_chars - state.chars_at_last_stage_emit
             if delta_chars > 0 and dt > 0:
                 cps = delta_chars / dt
-                self.stage_changed.emit(
+                self._emit_stage(
                     "local",
                     f"Saved {chunk_label} ({timing_summary}) · {cps:.0f} chars/s",
                 )
             else:
-                self.stage_changed.emit(
+                self._emit_stage(
                     "local",
                     f"Saved {chunk_label} ({timing_summary})",
                 )
             state.chars_at_last_stage_emit = state.processed_chars
             state.time_at_last_stage_emit = now
         else:
-            self.stage_changed.emit(
+            self._emit_stage(
                 "local",
                 f"Saved {chunk_label} ({timing_summary})",
             )
@@ -3229,6 +3295,11 @@ class TTSWorker(QThread):
                     "Reload the voice list and choose another voice before generating."
                     f"{suggestion}"
                 )
+            if exc.cause.kind == "staging_in_use":
+                return (
+                    "This saved job is already being generated.\n\n"
+                    "Wait for it to finish, or stop it before resuming it again."
+                )
             if exc.cause.kind == "insufficient_disk":
                 return (
                     "Not enough free disk space for this job.\n\n"
@@ -3255,7 +3326,7 @@ class TTSWorker(QThread):
                 return (
                     "SetupTTS couldn't reach the Microsoft speech service.\n\n"
                     "Please check your internet connection and try again."
-                    "\n\nTechnical details: could not resolve speech.platform.bing.com "
+                    f"\n\nTechnical details: could not resolve {synthesis_host()} "
                     "during the startup check."
                 )
             if exc.cause.kind.startswith("timeout"):

@@ -9,6 +9,7 @@ Drag-and-drop a .txt/.md file onto the editor to import it.
 import locale
 import logging
 import unicodedata
+from collections import Counter
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Signal
@@ -74,11 +75,18 @@ def decode_text_file(data: bytes) -> str | None:
         # UTF-16 has a NUL in every ASCII code unit: ~50 % of bytes for
         # English, still ~8 % for Cyrillic or Greek (spaces, punctuation).
         many_nuls = total >= max(2, _UTF16_MIN_NUL_SHARE * len(sample))
-        if many_nuls:
+        if total >= 2:
             if odd_zeros >= 0.9 * total:
                 encoding = "utf-16-le"
             elif even_zeros >= 0.9 * total:
                 encoding = "utf-16-be"
+            # Thai, Lao or Khmer have no zero byte in their letters, only in
+            # spaces and line breaks (1-3 % of bytes).  With so few NULs,
+            # UTF-16 is believed only when nearly every character comes from
+            # one Unicode block; stray NULs in 8-bit text fail that.
+            if encoding and not many_nuls and not _one_block(
+                    sample[1::2] if encoding == "utf-16-le" else sample[0::2]):
+                encoding = None
         if encoding is not None:
             text = data.decode(encoding, errors="replace")
             if _looks_like_text(text):
@@ -107,7 +115,17 @@ def decode_text_file(data: bytes) -> str | None:
     return _decode_legacy(data)
 
 
-# Below this share of NUL bytes a file is not BOM-less UTF-16.
+def _one_block(high_bytes: bytes) -> bool:
+    """True if UTF-16 code units with these high bytes stay in one block."""
+    if not high_bytes:
+        return False
+    counts = sorted(Counter(b for b in high_bytes if b).values(), reverse=True)
+    top = counts[0] if counts else 0
+    return high_bytes.count(0) + top >= 0.95 * len(high_bytes)
+
+
+# Below this share of NUL bytes a file is assumed not to be BOM-less UTF-16
+# unless its characters all come from one Unicode block (see _one_block).
 _UTF16_MIN_NUL_SHARE = 0.05
 
 
