@@ -248,7 +248,8 @@ def test_stale_sweep_skips_a_folder_in_use(tmp_path):
     ("She studied art. Then she left.", ["She studied art.", "Then she left."]),
     ("Wait a sec. He went.", ["Wait a sec.", "He went."]),
     ("World War I. The end.", ["World War I.", "The end."]),
-    ("Take vitamin C. Then rest.", ["Take vitamin C.", "Then rest."]),
+    # An initial keeps a name whole, even after a lower-case word.
+    ("written by J. K. Rowling. Ok.", ["written by J. K. Rowling.", "Ok."]),
     ("John F. Kennedy spoke. Ok.", ["John F. Kennedy spoke.", "Ok."]),
     ("Dec. 5 came. Then.", ["Dec. 5 came.", "Then."]),
     # Closing quotes stay with their danda; a double danda is not split.
@@ -315,3 +316,31 @@ def test_resuming_a_folder_already_in_use_fails_instead_of_starting_over(
         asyncio.run(worker._stream_generate())
     assert excinfo.value.cause.kind == "staging_in_use"
     assert "already being generated" in tts_worker.TTSWorker._user_message(excinfo.value)
+
+
+# ── Third review round ──────────────────────────────────────────────────── #
+
+def test_repeated_ascii_with_stray_nuls_is_not_read_as_cjk():
+    from app.ui.panels.input_panel import decode_text_file
+
+    assert decode_text_file(b"=" * 1000 + b"\x00\x00").startswith("====")
+
+
+def test_bomless_utf16_khmer_opens():
+    from app.ui.panels.input_panel import decode_text_file
+
+    khmer = "សួស្តី ពិភពលោក\n" * 80
+    assert decode_text_file(khmer.encode("utf-16-le")) == khmer
+
+
+def test_a_full_disk_at_job_start_says_so(tmp_path, monkeypatch, fake_service):
+    import errno
+
+    def full(*_a, **_kw):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(chunk_store.ChunkStore, "create", full)
+    with pytest.raises(tts_worker._PreflightError) as excinfo:
+        asyncio.run(_worker(tmp_path / "book.mp3")._stream_generate())
+    assert excinfo.value.cause.kind == "insufficient_disk"
+    assert "Not enough free disk space" in tts_worker.TTSWorker._user_message(excinfo.value)

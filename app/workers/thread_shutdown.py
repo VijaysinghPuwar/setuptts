@@ -65,7 +65,8 @@ def stop_threads(
         left = budget_s - (time.monotonic() - start)
         fair_share = left / (len(threads) - i)
         # Never below the minimum: a slow first thread must not leave the
-        # rest a zero wait.  The budget is exceeded by at most that much.
+        # rest a zero wait.  So the total can pass the budget by up to the
+        # minimum for each thread still running.
         wait_s = max(min_wait_s, min(fair_share, left))
         if thread.wait(int(wait_s * 1000)):
             continue

@@ -298,7 +298,27 @@ def test_only_the_section_being_waited_on_updates_the_status(tmp_path, setup):
     asyncio.run(worker._stream_generate())
 
     shown = [int(t.split()[1].rstrip("…")) for t in statuses if t.startswith("Chunk ")]
-    # Every section asked; only the one at the head of the line was shown,
-    # so the numbers shown never go backwards.
-    assert len(saved) > len(shown) > 0
+    # Sections cut ahead asked while another was the head and were held
+    # back, so the numbers shown never go backwards.
+    assert len(saved) >= len(shown) > 0
     assert shown == sorted(shown)
+
+
+def test_a_section_that_becomes_the_head_shows_what_it_last_said(tmp_path, setup):
+    """Each section announces itself once, when it starts; sections cut
+    ahead start while another is the head.  Their status is replayed when
+    the job reaches them, so the line keeps moving ("Chunk 7…", not a
+    "Chunk 2…" that stays for the whole job)."""
+    service = _Service()
+    setup(service)
+    worker = _worker(tmp_path)
+    statuses: list[str] = []
+    worker.status_changed.connect(statuses.append)
+
+    asyncio.run(worker._stream_generate())
+
+    shown = [int(t.split()[1].rstrip("…")) for t in statuses if t.startswith("Chunk ")]
+    total = max(shown)
+    assert total > 10
+    # Every section was shown once, in order.
+    assert shown == list(range(1, total + 1))
