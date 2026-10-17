@@ -555,7 +555,7 @@ class SystemSynthesizer:
             except _HelperExited as exc:
                 # The helper died mid-speech (a voice crashed it, or it was
                 # killed from outside): a fresh one usually manages, so try
-                # once more.  A timeout is not retried ? the voice is hung,
+                # once more.  A timeout is not retried — the voice is hung,
                 # and waiting the full timeout again would only double it.
                 last = exc
                 self._kill()

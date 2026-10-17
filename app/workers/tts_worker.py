@@ -2704,11 +2704,15 @@ class TTSWorker(QThread):
                 # A cancel or timeout between events leaves the generator
                 # paused inside edge-tts's websocket and session; closing it
                 # here releases both instead of leaving them to the GC.
+                # Short, because quitting the app waits for this; a cancel
+                # that lands meanwhile is passed on once cleanup is done.
                 aclose = getattr(stream, "aclose", None)
                 if aclose is not None:
                     try:
-                        await asyncio.wait_for(aclose(), timeout=5)
-                    except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                        await asyncio.wait_for(aclose(), timeout=2)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001
                         pass
 
         try:

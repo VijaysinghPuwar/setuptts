@@ -609,7 +609,7 @@ _MAX_SPEED = 2.0
 
 
 def _speed(rate: str) -> float:
-    """Speed multiplier for an edge-style rate string ("+25%" ? 1.25)."""
+    """Speed multiplier for an edge-style rate string ("+25%" → 1.25)."""
     m = _RATE_RE.fullmatch(rate or "")
     return min(_MAX_SPEED, max(_MIN_SPEED, 1.0 + (int(m.group(1)) if m else 0) / 100.0))
 
