@@ -304,9 +304,14 @@ class MainWindow(QMainWindow):
         icon_path = resource_path("app/assets/icons/app.png")
         icon_lbl = QLabel()
         if icon_path.exists():
+            # Rendered at the screen's scale: a 26-pixel bitmap was blurry
+            # at 150 % and 200 % Windows scaling.
+            dpr = max(1.0, self.devicePixelRatioF())
+            side = round(26 * dpr)
             px = QPixmap(str(icon_path)).scaled(
-                26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
+            px.setDevicePixelRatio(dpr)
         else:
             px = QPixmap(26, 26)
             px.fill(Qt.transparent)

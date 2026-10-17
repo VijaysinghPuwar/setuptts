@@ -96,6 +96,9 @@ class AppSettings:
     def __init__(self, paths: AppPaths) -> None:
         self._path: Path = paths.settings_path
         self._data: dict[str, Any] = dict(_DEFAULTS)
+        # Set when settings.json exists but could not be read (locked by a
+        # backup or sync tool): saving defaults over it would lose it for good.
+        self._load_failed = False
         self._load()
 
     # ------------------------------------------------------------------ #
@@ -264,8 +267,24 @@ class AppSettings:
 
     def _load(self) -> None:
         if self._path.exists():
+            raw = None
+            for attempt in range(5):
+                try:
+                    raw = self._path.read_bytes()
+                    break
+                except FileNotFoundError:
+                    return
+                except OSError:
+                    if attempt == 4:
+                        self._load_failed = True
+                        logger.warning("Could not read settings; using defaults for this "
+                                       "session and leaving the file as it is.", exc_info=True)
+                        return
+                    time.sleep(0.1 * (attempt + 1))
             try:
-                loaded = json.loads(self._path.read_text(encoding="utf-8"))
+                # utf-8-sig: Notepad and Windows PowerShell write a BOM, which
+                # json.loads rejects — and every preference was reset.
+                loaded = json.loads(raw.decode("utf-8-sig"))
                 if not isinstance(loaded, dict):
                     raise ValueError("settings.json is not a JSON object")
                 # Merge; unknown keys from future versions are dropped,
@@ -295,6 +314,9 @@ class AppSettings:
         launch and silently resets every preference.  Writing to a temp file
         in the same directory and renaming makes the swap atomic.
         """
+        if self._load_failed:
+            logger.info("Not saving settings: the existing file could not be read at startup")
+            return
         payload = json.dumps(self._data, indent=2, ensure_ascii=False)
         tmp_path = self._path.with_name(self._path.name + ".tmp")
         try:
@@ -313,6 +335,7 @@ class AppSettings:
 
     def reset(self) -> None:
         self._data = dict(_DEFAULTS)
+        self._load_failed = False   # an explicit reset may replace the file
         self.save()
 
 

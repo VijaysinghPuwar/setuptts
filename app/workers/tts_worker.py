@@ -44,6 +44,8 @@ from app.services.tts_service import (
     DEFAULT_CONNECT_TIMEOUT_S,
     build_communicate,
     list_voices,
+    handshake_refusal,
+    refused_host,
     synthesis_host,
     synthesis_refused,
     system_proxy,
@@ -992,6 +994,19 @@ class JobTelemetry:
     write_duration: float | None = None
 
 
+_URL_QUERY_RE = re.compile(r"((?:wss?|https?)://[^\s'\"?]+)\?[^\s'\"]*")
+
+
+def _redact_url_queries(text: str) -> str:
+    """Drop query strings from URLs in error text.
+
+    aiohttp puts the whole websocket URL — connection id, request signature
+    and key, ~300 characters — into its errors, which filled every retry log
+    line and could reach the failure dialog.
+    """
+    return _URL_QUERY_RE.sub(r"\1?…", text)
+
+
 class _AttemptFailure(RuntimeError):
     def __init__(
         self,
@@ -1001,7 +1016,7 @@ class _AttemptFailure(RuntimeError):
         original: Exception | None = None,
         suggestion: str | None = None,
     ) -> None:
-        super().__init__(detail)
+        super().__init__(_redact_url_queries(detail))
         self.kind = kind
         self.original = original
         self.suggestion = suggestion
@@ -1288,6 +1303,12 @@ class TTSWorker(QThread):
                 # Every normal exit already released it; this covers an
                 # unexpected error, so the job shows up for resume again.
                 store.release()
+            try:
+                # Any stream still open (a cancel mid-chunk) is closed
+                # properly before the loop goes away.
+                self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            except Exception:
+                pass
             try:
                 self._loop.close()
             except Exception:
@@ -2221,7 +2242,7 @@ class TTSWorker(QThread):
                     "%s failed on attempt %d: %s [kind=%s cause=%s chars=%d range=[%s,%s) "
                     "after=%.1fs]",
                     chunk_label, attempt + 1, exc, exc.kind,
-                    f"{type(exc.original).__name__}: {exc.original}"[:200]
+                    _redact_url_queries(f"{type(exc.original).__name__}: {exc.original}")[:200]
                     if exc.original is not None else "-",
                     len(text_chunk), source_start, source_end,
                     time.monotonic() - chunk_start,
@@ -2459,64 +2480,75 @@ class TTSWorker(QThread):
 
         async def _consume_stream() -> None:
             stream = communicate.stream().__aiter__()
-            deadline = stats.started_at + timeout_s
+            try:
+                deadline = stats.started_at + timeout_s
 
-            while True:
-                if self._cancelled:
-                    raise asyncio.CancelledError()
+                while True:
+                    if self._cancelled:
+                        raise asyncio.CancelledError()
 
-                now = time.monotonic()
-                if now >= deadline:
-                    raise asyncio.TimeoutError()
+                    now = time.monotonic()
+                    if now >= deadline:
+                        raise asyncio.TimeoutError()
 
-                if stats.audio_bytes == 0:
-                    wait_timeout = min(deadline - now, first_audio_wait)
-                else:
-                    wait_timeout = min(deadline - now, idle_wait)
-
-                try:
-                    event = await asyncio.wait_for(stream.__anext__(), timeout=max(wait_timeout, 1.0))
-                except StopAsyncIteration:
-                    break
-
-                stats.last_event_at = time.monotonic()
-
-                if event["type"] == "audio":
                     if stats.audio_bytes == 0:
-                        stats.first_audio_at = stats.last_event_at
-                        first_audio_delay = stats.first_audio_at - stats.started_at
-                        self.stage_changed.emit(
-                            "remote",
-                            f"Receiving audio — {chunk_label} (first audio after {first_audio_delay:.1f} s)",
-                        )
-                    data = event["data"]
-                    stats.audio_bytes += len(data)
-                    audio_buffer.write(data)
-                    continue
+                        wait_timeout = min(deadline - now, first_audio_wait)
+                    else:
+                        wait_timeout = min(deadline - now, idle_wait)
 
-                if event["type"] in ("WordBoundary", "SentenceBoundary"):
-                    stats.metadata_events += 1
-                    stats.boundaries.append(
-                        (
-                            int(event.get("offset", 0) or 0),
-                            int(event.get("duration", 0) or 0),
-                            str(event.get("text", "") or ""),
-                        )
-                    )
-                    if progress_state is None:
+                    try:
+                        event = await asyncio.wait_for(stream.__anext__(), timeout=max(wait_timeout, 1.0))
+                    except StopAsyncIteration:
+                        break
+
+                    stats.last_event_at = time.monotonic()
+
+                    if event["type"] == "audio":
+                        if stats.audio_bytes == 0:
+                            stats.first_audio_at = stats.last_event_at
+                            first_audio_delay = stats.first_audio_at - stats.started_at
+                            self.stage_changed.emit(
+                                "remote",
+                                f"Receiving audio — {chunk_label} (first audio after {first_audio_delay:.1f} s)",
+                            )
+                        data = event["data"]
+                        stats.audio_bytes += len(data)
+                        audio_buffer.write(data)
                         continue
 
-                    word = event.get("text", "")
-                    stats.attempt_chars = min(
-                        stats.attempt_chars + len(word) + 1,
-                        max(len(text), 1),
-                    )
-                    total_processed = min(
-                        progress_state.processed_chars + stats.attempt_chars,
-                        total_chars,
-                    )
-                    self._emit_progress_from_chars(total_processed, total_chars)
-                    self._maybe_emit_speed(total_processed, progress_state)
+                    if event["type"] in ("WordBoundary", "SentenceBoundary"):
+                        stats.metadata_events += 1
+                        stats.boundaries.append(
+                            (
+                                int(event.get("offset", 0) or 0),
+                                int(event.get("duration", 0) or 0),
+                                str(event.get("text", "") or ""),
+                            )
+                        )
+                        if progress_state is None:
+                            continue
+
+                        word = event.get("text", "")
+                        stats.attempt_chars = min(
+                            stats.attempt_chars + len(word) + 1,
+                            max(len(text), 1),
+                        )
+                        total_processed = min(
+                            progress_state.processed_chars + stats.attempt_chars,
+                            total_chars,
+                        )
+                        self._emit_progress_from_chars(total_processed, total_chars)
+                        self._maybe_emit_speed(total_processed, progress_state)
+            finally:
+                # A cancel or timeout between events leaves the generator
+                # paused inside edge-tts's websocket and session; closing it
+                # here releases both instead of leaving them to the GC.
+                aclose = getattr(stream, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await asyncio.wait_for(aclose(), timeout=5)
+                    except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                        pass
 
         try:
             await asyncio.wait_for(_consume_stream(), timeout=timeout_s)
@@ -2867,9 +2899,12 @@ class TTSWorker(QThread):
 
         # The host refused us outright: the next attempt goes to the other
         # synthesis endpoint (the legacy one began refusing everyone).
-        if isinstance(exc, aiohttp.WSServerHandshakeError) and exc.status in (401, 403):
-            refused = getattr(getattr(exc, "request_info", None), "url", None)
-            synthesis_refused(getattr(refused, "host", None))
+        refusal = handshake_refusal(exc)
+        if refusal is not None:
+            synthesis_refused(refused_host(refusal))
+            if refusal is not exc:
+                exc = refusal
+                msg = str(exc).lower()
 
         if isinstance(exc, asyncio.TimeoutError) or isinstance(
             exc, (aiohttp.ServerTimeoutError, aiohttp.SocketTimeoutError)
@@ -2908,7 +2943,7 @@ class TTSWorker(QThread):
         if isinstance(exc, aiohttp.ClientConnectorDNSError) or "getaddrinfo failed" in msg:
             return _AttemptFailure(
                 "dns",
-                f"Could not resolve speech.platform.bing.com for {chunk_label}.",
+                f"Could not resolve {synthesis_host()} for {chunk_label}.",
                 original=exc,
             )
 

@@ -154,6 +154,8 @@ class OutputPanel(QWidget):
         self._guidance_cache: tuple[tuple[int, int], object] | None = None
         self._visible_recommended_voice: str | None = None
         self._resume_candidates: list[ResumeCandidate] = []
+        self._generate_debouncing = False
+        self._preview_failed = False
         # Keep old voice-loader workers alive until their thread exits.
         # Without this, replacing self._voice_loader on retry can cause
         # the old QThread object to be GC-collected mid-run → crash.
@@ -772,6 +774,7 @@ class OutputPanel(QWidget):
         self._queue.job_completed.connect(self._on_job_completed)
         self._queue.job_failed.connect(self._on_job_failed)
         self._queue.job_cancelled.connect(self._on_job_cancelled)
+        self._queue.worker_exited.connect(lambda _job_id: self._refresh_resume_jobs())
 
     # ------------------------------------------------------------------ #
     # Called by MainWindow when input text changes                        #
@@ -779,7 +782,9 @@ class OutputPanel(QWidget):
 
     def on_has_text_changed(self, has_text: bool) -> None:
         """Immediate enable/disable of Generate as the editor fills or empties."""
-        self._generate_btn.setEnabled(has_text)
+        # Not during the post-click debounce: flushing pending typing on
+        # Generate re-enabled the button and let a double-click submit twice.
+        self._generate_btn.setEnabled(has_text and not self._generate_debouncing)
         self._generate_hint.setVisible(
             not has_text and self._density != self.DENSITY_MINIMAL
         )
@@ -1266,6 +1271,7 @@ class OutputPanel(QWidget):
         self._preview_btn.hide()
         self._stop_preview_btn.show()
         self._set_preview_status("Generating preview…")
+        self._preview_failed = False
         self._preview_worker = PreviewWorker(voice=voice, rate=rate)
         self._preview_worker.started_playing.connect(
             lambda: self._set_preview_status("Playing…")
@@ -1281,12 +1287,17 @@ class OutputPanel(QWidget):
     def _on_preview_done(self) -> None:
         self._stop_preview_btn.hide()
         self._preview_btn.show()
-        self._set_preview_status("")
+        # The worker reports a failure and then playback_finished; the
+        # "Preview unavailable" note must outlive the second signal.
+        if not self._preview_failed:
+            self._set_preview_status("")
         self._refresh_source_note()
 
     def _on_preview_failed(self, message: str) -> None:
         logger.warning("Preview failed: %s", message)
+        self._preview_failed = False
         self._on_preview_done()
+        self._preview_failed = True
         self._set_preview_status("Preview unavailable", tooltip=split_error(message).summary)
         self.status_message.emit("Preview unavailable — " + split_error(message).summary)
 
@@ -1297,6 +1308,9 @@ class OutputPanel(QWidget):
     def _on_generate(self) -> None:
         # ── Debounce: disable for 1.5 s to prevent rapid double-click ──── #
         # Button is re-enabled by _restore_generate_btn after the timer fires.
+        if self._generate_debouncing:
+            return
+        self._generate_debouncing = True
         self._generate_btn.setEnabled(False)
         QTimer.singleShot(1500, self._restore_generate_btn)
 
@@ -1476,6 +1490,7 @@ class OutputPanel(QWidget):
 
     def _restore_generate_btn(self) -> None:
         """Re-enable the Generate button after the debounce timer fires."""
+        self._generate_debouncing = False
         parent_win = self.window()
         has_text = bool(
             parent_win.get_input_text()
@@ -1485,7 +1500,12 @@ class OutputPanel(QWidget):
 
     def _refresh_resume_jobs(self) -> None:
         try:
-            self._resume_candidates = ChunkStore.list_resume_candidates(AppPaths().staging_dir)
+            self._resume_candidates = [
+                c for c in ChunkStore.list_resume_candidates(AppPaths().staging_dir)
+                # Queued or still running: offering it again would start a
+                # second job on the same saved progress.
+                if not self._queue.has_active_job(c.job_id, str(c.staging_dir))
+            ]
         except Exception:
             logger.warning("Could not load resumable jobs", exc_info=True)
             self._resume_candidates = []
@@ -1545,7 +1565,20 @@ class OutputPanel(QWidget):
             )
         menu.exec(self._resume_job_btn.mapToGlobal(self._resume_job_btn.rect().bottomLeft()))
 
+    def _candidate_in_use(self, candidate: ResumeCandidate) -> bool:
+        if not self._queue.has_active_job(candidate.job_id, str(candidate.staging_dir)):
+            return False
+        QMessageBox.warning(
+            self,
+            "Job Already Active",
+            "This saved job is already running or queued.",
+        )
+        self._refresh_resume_jobs()
+        return True
+
     def _discard_candidate(self, candidate: ResumeCandidate) -> None:
+        if self._candidate_in_use(candidate):
+            return
         name = Path(candidate.output_path).name
         if QMessageBox.question(
             self,
@@ -1563,6 +1596,8 @@ class OutputPanel(QWidget):
         self._refresh_resume_jobs()
 
     def _resume_candidate(self, candidate: ResumeCandidate) -> None:
+        if self._candidate_in_use(candidate):
+            return
         if self._queue.has_active_output_path(candidate.output_path):
             QMessageBox.warning(
                 self,

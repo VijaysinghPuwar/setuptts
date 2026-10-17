@@ -205,6 +205,16 @@ def _set_live(staging_dir: Path, live: bool) -> None:
             _LIVE_DIRS.discard(key)
 
 
+def _claim_live(staging_dir: Path) -> bool:
+    """Mark *staging_dir* live; False if another worker already owns it."""
+    key = staging_dir.resolve()
+    with _LIVE_LOCK:
+        if key in _LIVE_DIRS:
+            return False
+        _LIVE_DIRS.add(key)
+        return True
+
+
 def is_live(staging_dir: Path) -> bool:
     """True while a worker in this process owns *staging_dir*."""
     with _LIVE_LOCK:
@@ -285,7 +295,30 @@ class ChunkStore:
         - the manifest is missing or corrupt
         - the manifest does not have preserved chunk files
         - the stored text or voice do not match the requested resume job
+        - another worker in this process is already writing the directory
         """
+        # Claimed before reading anything: two resumes of one folder would
+        # write the same chunk files and one's cleanup deletes the other's.
+        if not _claim_live(staging_dir):
+            logger.warning("Staging folder %s is already in use — not resuming it twice",
+                           staging_dir)
+            return None
+        try:
+            store = cls._load_for_resume(staging_dir, text, voice)
+        except BaseException:
+            _set_live(staging_dir, False)
+            raise
+        if store is None:
+            _set_live(staging_dir, False)
+        return store
+
+    @classmethod
+    def _load_for_resume(
+        cls,
+        staging_dir: Path,
+        text: str | None,
+        voice: str | None,
+    ) -> "Optional[ChunkStore]":
         manifest = _load_manifest(staging_dir)
         if manifest is None:
             return None
@@ -347,7 +380,6 @@ class ChunkStore:
         store = cls(staging_dir, manifest, save_manifest=False)
         if changed:
             store._save_manifest()
-        _set_live(staging_dir, True)
         return store
 
     @staticmethod
@@ -753,6 +785,10 @@ class ChunkStore:
                         )
                     out.write(payload)
                     expected_bytes += record.audio_bytes
+                # On disk before the rename: the staging chunks are deleted
+                # right after, so a power cut must not leave a zeroed book.
+                out.flush()
+                os.fsync(out.fileno())
 
             actual_bytes = tmp_output.stat().st_size
             if actual_bytes != expected_bytes:

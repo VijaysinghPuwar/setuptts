@@ -18,6 +18,7 @@ Usage
 import sys
 import os
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -108,6 +109,9 @@ class JobQueue(QObject):
     job_completed      = Signal(object)       # JobItem
     job_failed         = Signal(object)       # JobItem
     job_cancelled      = Signal(object)       # JobItem
+    # A worker thread has exited and let go of its staging folder (cancelled
+    # jobs exit some time after job_cancelled).
+    worker_exited      = Signal(str)          # job_id
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -151,6 +155,8 @@ class JobQueue(QObject):
             raise ValueError(
                 "A job writing to this output path is already running or queued."
             )
+        if job_id and self.has_active_job(job_id, resume_staging_dir):
+            raise ValueError("This job is already running or queued.")
 
         item = JobItem(
             text=text, voice=voice, voice_display=voice_display,
@@ -206,22 +212,27 @@ class JobQueue(QObject):
             item.status = "cancelled"
             self.job_cancelled.emit(item)
 
+        # Every worker is told to stop first and then all share one wait:
+        # cancelling and waiting one at a time (4 s each, on the UI thread)
+        # kept the window frozen past Windows' "Not Responding" mark.
+        stopping = []
         for job_id, (item, worker) in list(self._running.items()):
             logger.info("Stopping worker for job: %s", job_id)
             item.status = "cancelled"
             worker.cancel()
-            if not worker.wait(4_000):
-                logger.warning("Worker %s timed out — terminating", job_id)
-                worker.terminate()
-                worker.wait(1_000)
+            stopping.append((job_id, worker))
+        stopping += [("", w) for w in self._finishing]
         self._running.clear()
 
-        # Also wait for any workers that were individually cancelled
-        for worker in self._finishing:
-            if worker.isRunning():
-                if not worker.wait(4_000):
-                    worker.terminate()
-                    worker.wait(1_000)
+        deadline = time.monotonic() + 4.0
+        for job_id, worker in stopping:
+            if not worker.isRunning():
+                continue
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not worker.wait(remaining_ms):
+                logger.warning("Worker %s timed out — terminating", job_id or "(cancelled)")
+                worker.terminate()
+                worker.wait(1_000)
         self._finishing.clear()
         self._active_workers.clear()
 
@@ -248,6 +259,26 @@ class JobQueue(QObject):
         # path; a new job on the same file must wait for it.
         for worker in self._finishing:
             if worker.isRunning() and _path_key(worker._output_path) == norm:
+                return True
+        return False
+
+    def has_active_job(self, job_id: str, staging_dir: str | None = None) -> bool:
+        """
+        True if *job_id* (or a job resuming from *staging_dir*) is queued,
+        running, or cancelled but still finishing.
+
+        A resumed job keeps its saved job's id and staging folder; two of
+        them would share the folder and overwrite each other's chunks.
+        """
+        items = [item for item, _ in self._running.values()]
+        items += self._pending
+        items += self._cancelled_running.values()
+        staging_key = _path_key(staging_dir) if staging_dir else None
+        for item in items:
+            if item.id == job_id:
+                return True
+            if (staging_key and item.resume_staging_dir
+                    and _path_key(item.resume_staging_dir) == staging_key):
                 return True
         return False
 
@@ -341,6 +372,7 @@ class JobQueue(QObject):
         # Keyed by the queue's id, not worker._job_id: the worker takes a new
         # id when a resume has to start over.
         self._cancelled_running.pop(job_id, None)
+        self.worker_exited.emit(job_id)
 
     def _on_stage_changed(self, job_id: str, kind: str, text: str) -> None:
         if job_id in self._running:

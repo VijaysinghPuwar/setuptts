@@ -610,6 +610,56 @@ _MIN_CLAUSE_PHONEMES = 12
 _CLAUSE_MARKS = frozenset(",;:")
 
 
+#: espeak-ng keeps at most ~1 000 phonemes per clause and silently drops the
+#: rest.  Prose never gets near it, but digits and symbols expand a lot: one
+#: comma-free run of 34 five-digit numbers came back with the next 160
+#: numbers missing, and a 300-digit token read as its first few digits.  Runs
+#: are cut (at a word gap, with a comma) well before the limit.
+_CLAUSE_COST_BUDGET = 600
+_CLAUSE_END_CHARS = frozenset(".,;:!?。、，；：！？")
+_EXPANDING_SYMBOLS = frozenset("$%&@#+=/:€£¥°×÷<>~^|\\*")
+_LONG_DIGITS_RE = re.compile(r"\d{13,}")
+_TOKEN_RE = re.compile(r"\S+|\s+")
+
+
+def _token_cost(token: str) -> int:
+    """Rough phonemes espeak-ng produces for *token* (generous for digits)."""
+    cost = 0
+    for ch in token:
+        if ch.isdigit():
+            cost += 10
+        elif ch in _EXPANDING_SYMBOLS:
+            cost += 8
+        else:
+            cost += 1
+    return cost
+
+
+def _bound_clauses(text: str, budget: int = _CLAUSE_COST_BUDGET) -> str:
+    """Add clause breaks so no clause overflows espeak-ng's phoneme buffer."""
+    # A very long digit string is one "word" espeak cannot fit; read it in
+    # groups of three instead.
+    text = _LONG_DIGITS_RE.sub(
+        lambda m: " ".join(m.group()[i:i + 3] for i in range(0, len(m.group()), 3)), text)
+    out: list[str] = []
+    cost = 0
+    for tok in _TOKEN_RE.findall(text):
+        if tok.isspace():
+            out.append(tok)
+            continue
+        tok_cost = _token_cost(tok)
+        if cost and cost + tok_cost > budget:
+            while out and out[-1].isspace():
+                out.pop()
+            out.append(", ")
+            cost = 0
+        out.append(tok)
+        cost += tok_cost
+        if tok[-1] in _CLAUSE_END_CHARS:
+            cost = 0
+    return "".join(out)
+
+
 def _split_clauses(phonemes: list[str], limit: int = _CLAUSE_SPLIT_PHONEMES) -> list[list[str]]:
     """Cut a long sentence after its commas, semicolons and colons."""
     if len(phonemes) <= limit:
@@ -714,7 +764,7 @@ class PiperSynthesizer:
             # bound memory none, so it still sounds like one sentence.
             pieces = [(piece, sentence_gap if i == len(split) - 1 else
                        clause_gap if piece[-1] in _CLAUSE_MARKS else b"")
-                      for sentence in self._voice.phonemize(text)
+                      for sentence in self._voice.phonemize(_bound_clauses(text))
                       for split in [[p for clause in _split_clauses(sentence)
                                      for p in _cap_phonemes(clause)]]
                       for i, piece in enumerate(split)]

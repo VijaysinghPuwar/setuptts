@@ -308,7 +308,16 @@ class InputPanel(QWidget):
         return self._editor.toPlainText().strip()
 
     def set_text(self, text: str) -> None:
-        self._editor.setPlainText(text)
+        if self._editor.document().isEmpty():
+            self._editor.setPlainText(text)
+        else:
+            # One undoable edit: setPlainText() wipes the undo stack, so
+            # opening or dropping a file over typed text lost it for good.
+            cursor = self._editor.textCursor()
+            cursor.beginEditBlock()
+            cursor.select(QTextCursor.SelectionType.Document)
+            cursor.insertText(text)
+            cursor.endEditBlock()
         self._editor.moveCursor(QTextCursor.MoveOperation.Start)
         self._editor.verticalScrollBar().setValue(0)
         # A programmatic load is a single change — no need to wait for typing
@@ -551,7 +560,8 @@ class _DropAwareTextEdit(QTextEdit):
                 event.acceptProposedAction()
                 self.drag_active.emit(True)
                 return
-        event.ignore()
+        # Plain text dragged from a browser or another app still drops in.
+        super().dragEnterEvent(event)
 
     def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
         self.drag_active.emit(False)
