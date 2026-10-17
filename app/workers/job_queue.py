@@ -18,7 +18,6 @@ Usage
 import sys
 import os
 import logging
-import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +26,7 @@ from PySide6.QtCore import QObject, Signal
 
 from app.services.local_tts import is_local_voice
 from app.workers.local_tts_worker import LocalTTSWorker
+from app.workers.thread_shutdown import stop_threads
 from app.workers.tts_worker import TTSWorker
 
 logger = logging.getLogger(__name__)
@@ -212,29 +212,23 @@ class JobQueue(QObject):
             item.status = "cancelled"
             self.job_cancelled.emit(item)
 
-        # Every worker is told to stop first and then all share one wait:
-        # cancelling and waiting one at a time (4 s each, on the UI thread)
-        # kept the window frozen past Windows' "Not Responding" mark.
+        # Every worker is told to stop first and then all are waited for
+        # together under one budget: cancelling and waiting one at a time
+        # (4 s each, on the UI thread) kept the window frozen past Windows'
+        # "Not Responding" mark.  Each still gets a fair wait, and one that
+        # will not stop is left running rather than terminate()d mid-write.
         stopping = []
         for job_id, (item, worker) in list(self._running.items()):
             logger.info("Stopping worker for job: %s", job_id)
             item.status = "cancelled"
-            worker.cancel()
             stopping.append((job_id, worker))
         stopping += [("", w) for w in self._finishing]
         self._running.clear()
 
-        deadline = time.monotonic() + 4.0
-        for job_id, worker in stopping:
-            if not worker.isRunning():
-                continue
-            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-            if not worker.wait(remaining_ms):
-                logger.warning("Worker %s timed out — terminating", job_id or "(cancelled)")
-                worker.terminate()
-                worker.wait(1_000)
+        stop_threads(stopping)
+        # stop_threads keeps any survivor referenced; dropping ours is safe.
         self._finishing.clear()
-        self._active_workers.clear()
+        self._active_workers = [w for w in self._active_workers if w.isRunning()]
 
     def is_busy(self) -> bool:
         """True if any jobs are running or pending."""

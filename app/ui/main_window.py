@@ -148,6 +148,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
 
         self._sync_window_minimum(_INPUT_PANEL_MIN, _RIGHT_PANEL_MIN)
+        self._restore_maximized()
 
         self.status_bar.showMessage("Ready")
         logger.info("MainWindow shown")
@@ -529,6 +530,9 @@ class MainWindow(QMainWindow):
         self._output_panel.job_completed.connect(self._history_panel.add_job)
         # Status messages → status bar
         self._output_panel.status_message.connect(self.status_bar.showMessage)
+        self._input_panel.status_message.connect(
+            lambda text: self.status_bar.showMessage(text, 5_000)
+        )
 
     # ------------------------------------------------------------------ #
     # Actions                                                              #
@@ -601,11 +605,24 @@ class MainWindow(QMainWindow):
         y = max(avail.top(),  min(int(y), avail.bottom() - h + 1))
         self.move(x, y)
 
+    def _restore_maximized(self) -> None:
+        # Applied after the normal size/position so un-maximizing returns to
+        # the saved window rather than the default; show() honours the state.
+        if self._settings.window_maximized:
+            self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+
     def _save_window_state(self) -> None:
-        self._settings.window_width  = self.width()
-        self._settings.window_height = self.height()
-        self._settings.window_x      = self.x()
-        self._settings.window_y      = self.y()
+        maximized = self.isMaximized()
+        self._settings.window_maximized = maximized
+        # A maximized window's own size is the whole screen; saving that made
+        # un-maximizing after a restart a no-op.  Keep the normal geometry.
+        geo = self.normalGeometry() if maximized else self.geometry()
+        if not geo.isValid():
+            geo = self.geometry()
+        self._settings.window_width  = geo.width()
+        self._settings.window_height = geo.height()
+        self._settings.window_x      = self.x() if not maximized else geo.x()
+        self._settings.window_y      = self.y() if not maximized else geo.y()
 
         # sizes()[-1] is 0 whenever the history panel is hidden; persisting
         # that would make the panel unusable (0 px tall) after a restart.

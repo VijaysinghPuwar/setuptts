@@ -343,7 +343,9 @@ def test_voice_picker_never_leaves_the_recent_header_selected(window):
     combo = panel._voice_combo
     assert combo.itemData(combo.currentIndex(), 0x0100) == "hi-IN-MadhurNeural"
     assert panel.get_selected_voice() == "hi-IN-MadhurNeural"
-    assert panel._settings.voice == "hi-IN-MadhurNeural"
+    # A filter hiding the saved voice is not a choice: the setting is kept
+    # (Generate saves the voice it actually uses).
+    assert panel._settings.voice == "en-US-AvaNeural"
 
 
 def test_both_andrew_voices_are_distinguishable_in_the_picker(window):

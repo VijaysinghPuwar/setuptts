@@ -27,6 +27,7 @@ _DEFAULTS: dict[str, Any] = {
     "window_height": 660,
     "window_x": None,
     "window_y": None,
+    "window_maximized": False,
     "show_history": True,
     "history_panel_height": 200,
     # Windows + NVIDIA, offline voices: "auto" (the faster of card and
@@ -178,6 +179,14 @@ class AppSettings:
     @window_y.setter
     def window_y(self, v: int | None) -> None:
         self._data["window_y"] = v
+
+    @property
+    def window_maximized(self) -> bool:
+        return bool(self._data.get("window_maximized", False))
+
+    @window_maximized.setter
+    def window_maximized(self, v: bool) -> None:
+        self._data["window_maximized"] = bool(v)
 
     @property
     def show_history(self) -> bool:
