@@ -9,6 +9,7 @@ Drag-and-drop a .txt/.md file onto the editor to import it.
 import locale
 import logging
 import unicodedata
+from collections import Counter
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Signal
@@ -69,10 +70,23 @@ def decode_text_file(data: bytes) -> str | None:
         even_zeros = sample[0::2].count(0)
         total = odd_zeros + even_zeros
         encoding = None
-        if odd_zeros >= 0.9 * total:
-            encoding = "utf-16-le"
-        elif even_zeros >= 0.9 * total:
-            encoding = "utf-16-be"
+        # A lone NUL trivially sits "all in one half", so a single stray
+        # byte made a UTF-8 book decode as UTF-16 garbage.  Real BOM-less
+        # UTF-16 has a NUL in every ASCII code unit: ~50 % of bytes for
+        # English, still ~8 % for Cyrillic or Greek (spaces, punctuation).
+        many_nuls = total >= max(2, _UTF16_MIN_NUL_SHARE * len(sample))
+        if total >= 2:
+            if odd_zeros >= 0.9 * total:
+                encoding = "utf-16-le"
+            elif even_zeros >= 0.9 * total:
+                encoding = "utf-16-be"
+            # Thai, Lao or Khmer have no zero byte in their letters, only in
+            # spaces and line breaks (1-3 % of bytes).  With so few NULs,
+            # UTF-16 is believed only when nearly every character comes from
+            # one Unicode block; stray NULs in 8-bit text fail that.
+            if encoding and not many_nuls and not _one_block(
+                    sample[1::2] if encoding == "utf-16-le" else sample[0::2]):
+                encoding = None
         if encoding is not None:
             text = data.decode(encoding, errors="replace")
             if _looks_like_text(text):
@@ -84,13 +98,53 @@ def decode_text_file(data: bytes) -> str | None:
             text = _strict(data, candidate)
             if _plausible_cjk(text):
                 return text
-        return None   # not a text file
+        if many_nuls:
+            return None   # not a text file
+        # A few stray NULs (a glitch in a save or copy) in 8-bit text: drop
+        # them.  Binary files are still refused — the rest fails the text check.
+        text = decode_text_file(data.replace(b"\x00", b""))
+        return text if text is not None and _looks_like_text(text) else None
 
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         pass
+    text = _mostly_utf8(data)
+    if text is not None:
+        return text
     return _decode_legacy(data)
+
+
+def _one_block(high_bytes: bytes) -> bool:
+    """True if UTF-16 code units with these high bytes stay in one block."""
+    if not high_bytes:
+        return False
+    counts = sorted(Counter(b for b in high_bytes if b).values(), reverse=True)
+    top = counts[0] if counts else 0
+    return high_bytes.count(0) + top >= 0.95 * len(high_bytes)
+
+
+# Below this share of NUL bytes a file is assumed not to be BOM-less UTF-16
+# unless its characters all come from one Unicode block (see _one_block).
+_UTF16_MIN_NUL_SHARE = 0.05
+
+
+def _mostly_utf8(data: bytes) -> str | None:
+    """
+    UTF-8 with a few bad bytes (a truncated character, one pasted cp1252
+    quote).  Strict UTF-8 failing anywhere used to send the whole book to
+    cp1252, garbling every accented letter and curly quote in it.
+
+    Only accepted when there is real UTF-8 beyond the damage: a cp1252 file
+    with a handful of accents also has few invalid bytes, but no valid
+    multi-byte sequences, and must still go to the legacy decoders.
+    """
+    text = data.decode("utf-8", errors="replace")
+    bad = text.count("�")
+    if bad > 0.001 * len(text):
+        return None
+    good_non_ascii = sum(1 for ch in text if ord(ch) > 0x7F) - bad
+    return text if good_non_ascii > bad else None
 
 
 # Legacy (pre-Unicode) encodings Windows editors still save in.  Each is only
@@ -289,6 +343,8 @@ class InputPanel(QWidget):
     #: Fires immediately on every edit with whether there is any text at all —
     #: cheap, so the Generate button never lags behind the editor.
     has_text_changed = Signal(bool)
+    #: Short note for the window status bar (a refused drop).
+    status_message = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -297,6 +353,8 @@ class InputPanel(QWidget):
         self._settle_timer.setInterval(_TEXT_SETTLE_MS)
         self._settle_timer.timeout.connect(self._emit_settled_text)
         self._had_text = False
+        self._word_count = 0
+        self._char_count = 0
         self._build_ui()
         self._connect_signals()
 
@@ -308,7 +366,16 @@ class InputPanel(QWidget):
         return self._editor.toPlainText().strip()
 
     def set_text(self, text: str) -> None:
-        self._editor.setPlainText(text)
+        if self._editor.document().isEmpty():
+            self._editor.setPlainText(text)
+        else:
+            # One undoable edit: setPlainText() wipes the undo stack, so
+            # opening or dropping a file over typed text lost it for good.
+            cursor = self._editor.textCursor()
+            cursor.beginEditBlock()
+            cursor.select(QTextCursor.SelectionType.Document)
+            cursor.insertText(text)
+            cursor.endEditBlock()
         self._editor.moveCursor(QTextCursor.MoveOperation.Start)
         self._editor.verticalScrollBar().setValue(0)
         # A programmatic load is a single change — no need to wait for typing
@@ -415,6 +482,7 @@ class InputPanel(QWidget):
     def _connect_signals(self) -> None:
         self._editor.textChanged.connect(self._on_text_changed)
         self._editor.file_dropped.connect(self._load_file)
+        self._editor.file_rejected.connect(self._on_file_rejected)
         self._editor.drag_active.connect(self._on_drag_state)
         self._import_btn.clicked.connect(self._open_file_dialog)
         self._clear_btn.clicked.connect(self.clear)
@@ -432,8 +500,14 @@ class InputPanel(QWidget):
         self._settle_timer.start()
 
     def _emit_settled_text(self) -> None:
+        text = self._editor.toPlainText()
+        # Counted here, once per settled change: resizeEvent only re-fits
+        # the labels, since splitting a multi-MB book on every resize step
+        # made dragging the window edge stutter.
+        self._word_count = len(text.split()) if text.strip() else 0
+        self._char_count = len(text)
         self._update_stats_bar()
-        self.text_changed.emit(self._editor.toPlainText())
+        self.text_changed.emit(text)
 
     def _update_stats_bar(self) -> None:
         """
@@ -446,9 +520,8 @@ class InputPanel(QWidget):
         drop hint — the more expendable of the two, and duplicated by the
         editor's own placeholder — gives way before the count does.
         """
-        text  = self._editor.toPlainText()
-        words = len(text.split()) if text.strip() else 0
-        chars = len(text)
+        words = self._word_count
+        chars = self._char_count
 
         # Bar width less the layout's 16 px margins either side.
         available = max(0, self._bottom_bar.width() - 32)
@@ -466,6 +539,12 @@ class InputPanel(QWidget):
         )
         self._drop_hint.setVisible(
             metrics.horizontalAdvance(count) + hint_width + 24 <= available
+        )
+
+    def _on_file_rejected(self, name: str) -> None:
+        what = f"“{name}” isn't" if name else "That isn't"
+        self.status_message.emit(
+            f"{what} a plain-text file — only .txt and .md files can be dropped here"
         )
 
     def _on_drag_state(self, active: bool) -> None:
@@ -538,6 +617,7 @@ class _DropAwareTextEdit(QTextEdit):
     """QTextEdit that emits signals for .txt/.md file drops."""
 
     file_dropped = Signal(str)
+    file_rejected = Signal(str)   # name of a dropped file that isn't text
     drag_active  = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -547,11 +627,17 @@ class _DropAwareTextEdit(QTextEdit):
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
             paths = [u.toLocalFile() for u in event.mimeData().urls()]
-            if any(p.lower().endswith((".txt", ".md")) for p in paths):
+            if any(p.lower().endswith(_DROP_SUFFIXES) for p in paths):
                 event.acceptProposedAction()
                 self.drag_active.emit(True)
                 return
-        event.ignore()
+            if _only_other_files(event.mimeData()):
+                # QTextEdit would accept it and paste "file:///…/book.docx".
+                event.ignore()
+                self.file_rejected.emit(_rejected_name(event.mimeData()))
+                return
+        # Plain text dragged from a browser or another app still drops in.
+        super().dragEnterEvent(event)
 
     def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
         self.drag_active.emit(False)
@@ -561,8 +647,30 @@ class _DropAwareTextEdit(QTextEdit):
         self.drag_active.emit(False)
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith((".txt", ".md")):
+            if path.lower().endswith(_DROP_SUFFIXES):
                 self.file_dropped.emit(path)
                 event.acceptProposedAction()
                 return
+        if _only_other_files(event.mimeData()):
+            event.ignore()
+            self.file_rejected.emit(_rejected_name(event.mimeData()))
+            return
         super().dropEvent(event)
+
+
+_DROP_SUFFIXES = (".txt", ".md")
+
+
+def _only_other_files(mime) -> bool:
+    """Local files only, none of them text — a .docx, .pdf, image…
+
+    Text dragged from a browser can carry the page's http URL as well; that
+    is not a local file, so the text itself still drops in.
+    """
+    urls = mime.urls()
+    return bool(urls) and all(u.isLocalFile() for u in urls)
+
+
+def _rejected_name(mime) -> str:
+    urls = mime.urls()
+    return Path(urls[0].toLocalFile()).name if urls else ""

@@ -15,7 +15,7 @@
   <a href="../../actions/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/VijaysinghPuwar/setuptts/build.yml?label=build"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-555">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12-3776AB">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-749%20passing-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-866%20passing-2ea44f">
 </p>
 
 <p align="center">
@@ -60,10 +60,11 @@ The hard part is not calling a speech API; it is making a **multi-hour job over 
 - **Fail-closed assembly.** Before the MP3 is written, the ranges must tile the source text exactly (no gaps, no overlaps), every chunk file must exist with the recorded size, the assembled byte count must match, and the audio length must be plausible for the text. The length check runs on a temporary file *before* it replaces anything, so a bad result can never overwrite an existing good file.
 - **Adaptive recovery.** Retries with exponential backoff and a fresh connection each time; sections that keep failing are split into smaller sub-ranges whose union must equal the original range exactly.
 - **Survives sleep and dropped Wi-Fi.** While a job runs, the computer is kept from idle-sleeping (`caffeinate` on macOS, `SetThreadExecutionState` on Windows), and kept at full speed when its window is hidden (an `NSProcessInfo` activity holds off App Nap on macOS; Windows power throttling is turned off for the process). If the service becomes unreachable, the job probes the connection and waits up to 30 minutes for it to return, without using up retries.
+- **Parallel sections, saved in order.** The service renders a section far faster than it streams it, so up to three sections stream at once (six 8,600-character sections: 128 s one at a time, 18 s three at a time; a 3.3-hour book finished in under 9 minutes). Sections are still committed to the staging folder strictly in order, so resume and the coverage checks are unchanged. The first section runs alone as a warm-up, any failure drops the job back to one section at a time for two minutes, and an HTTP 429 lowers the job's limit for good.
 - **Fast offline voices.** Piper renders two sentences at a time with the CPU cores split between them (1.75x faster on Ryan high), capped at two runs per voice across all jobs to bound memory.
 - **NVIDIA GPU for offline voices (Windows, beta).** With an optional one-time download (onnxruntime-gpu plus NVIDIA's CUDA 13 and cuDNN 9 libraries, ~1.3 GB, every file pinned by SHA-256), Piper voices can run on the graphics card. In **Automatic** mode a speed check, run in a separate process so a driver crash can't take the app down, times the same voice on the processor and the card, and the card is used only when it is clearly faster. **Graphics card** and **Processor** can also be chosen by hand. If the card fails during a job, that job carries on on the processor. macOS is unaffected and keeps the same CPU path.
 - **Responsive UI during long work.** Generation runs on `QThread` workers with their own `asyncio` loops; the UI thread only receives throttled progress signals. Up to two jobs run concurrently with per-destination conflict checks.
-- **Tested as shipped.** 749 automated tests, including 12-hour-scale simulations, network-outage and sleep/wake simulations and regression tests that fail on the pre-fix code. CI also launches the *packaged* apps — the macOS bundle, the app inside the DMG, the app installed by the real Windows installer, and the portable EXE — and has each one load the voice list and synthesise a verified sample.
+- **Tested as shipped.** 866 automated tests, including 12-hour-scale simulations, network-outage and sleep/wake simulations and regression tests that fail on the pre-fix code. CI also launches the *packaged* apps — the macOS bundle, the app inside the DMG, the app installed by the real Windows installer, and the portable EXE — and has each one load the voice list and synthesise a verified sample.
 
 ---
 

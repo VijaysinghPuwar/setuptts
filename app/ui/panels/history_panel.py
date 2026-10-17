@@ -237,7 +237,9 @@ class HistoryPanel(QWidget):
         elif action == del_a:
             if job.id is not None:
                 self._history.delete_job(job.id)
-            self._jobs.pop(row)
+            # By identity, not row: a job finishing while the menu was open
+            # inserts a row at the top and shifts every index.
+            self._jobs = [j for j in self._jobs if j is not job]
             self._populate()
 
     def _clear_all(self) -> None:

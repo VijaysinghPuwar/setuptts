@@ -16,6 +16,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import aiohttp
 import certifi
 import edge_tts
 import edge_tts.communicate
@@ -71,6 +72,30 @@ def synthesis_refused(host: str | None) -> bool:
                        synthesis_host(), urlsplit(SYNTHESIS_ENDPOINTS[new]).hostname)
         _use_endpoint(new)
         return True
+
+
+def handshake_refusal(exc: BaseException) -> "aiohttp.WSServerHandshakeError | None":
+    """
+    The HTTP 401/403 handshake error behind *exc*, or None.
+
+    edge_tts answers a 403 by correcting the clock from the reply's Date
+    header; when that fails it raises SkewAdjustmentError chained from the
+    handshake error, so the cause chain is followed.
+    """
+    current: BaseException | None = exc
+    for _ in range(5):
+        if current is None:
+            break
+        if isinstance(current, aiohttp.WSServerHandshakeError) and current.status in (401, 403):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def refused_host(exc: BaseException) -> str | None:
+    """Host named by a refusal's request URL, if it has one."""
+    url = getattr(getattr(exc, "request_info", None), "url", None)
+    return getattr(url, "host", None)
 
 
 def _parse_http_date(date: str) -> float | None:
@@ -239,15 +264,25 @@ async def generate_audio(
 
     logger.debug("Generating audio: voice=%s rate=%s output=%s", voice, rate, output_path)
 
-    communicate = build_communicate(
-        text=text,
-        voice=voice,
-        rate=rate,
-        volume=volume,
-        connect_timeout=connect_timeout,
-        receive_timeout=receive_timeout,
-    )
-    await communicate.save(str(output_path))
+    for attempt in range(2):
+        communicate = build_communicate(
+            text=text,
+            voice=voice,
+            rate=rate,
+            volume=volume,
+            connect_timeout=connect_timeout,
+            receive_timeout=receive_timeout,
+        )
+        try:
+            await communicate.save(str(output_path))
+            break
+        except Exception as exc:
+            # A refused host: switch endpoints and try once more, as long
+            # jobs do — a preview would otherwise keep failing on it.
+            refusal = handshake_refusal(exc)
+            if attempt or refusal is None:
+                raise
+            synthesis_refused(refused_host(refusal))
     logger.debug("Audio saved: %s  size=%d bytes", output_path, output_path.stat().st_size)
 
 

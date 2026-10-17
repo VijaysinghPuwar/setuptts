@@ -3,6 +3,7 @@ import hashlib
 
 import pytest
 
+from app.workers import chunk_store
 from app.workers.chunk_store import ChunkRecord, ChunkStore, CoverageError
 
 
@@ -353,6 +354,8 @@ def test_resume_after_crash_with_complete_running_manifest_can_finalize(tmp_path
     # assembly/status completion.
     store.manifest.status = "running"
     store._save_manifest()
+    # The process is gone, so nothing holds the folder any more.
+    chunk_store._set_live(store.staging_dir, False)
 
     resumed = ChunkStore.try_resume(store.staging_dir, text, "v")
     assert resumed is not None
