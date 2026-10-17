@@ -130,6 +130,16 @@ def main() -> None:
         from app.services import gpu_accel
         gpu_accel.startup(settings.gpu_mode)
 
+    # Clear temp folders and partial voice downloads left by a run that was
+    # killed.  Off the UI thread (the temp folder can be large); this copy
+    # holds the single-instance lock, so nothing it removes is in use.
+    try:
+        import threading
+        from app.services.local_tts import sweep_stale_files
+        threading.Thread(target=sweep_stale_files, name="stale-sweep", daemon=True).start()
+    except Exception:  # noqa: BLE001 - housekeeping must never stop startup
+        logger.warning("Could not start the stale file sweep", exc_info=True)
+
     # Set app-wide icon (taskbar, dock, dialogs)
     icon_path = paths.icon_path
     if icon_path.exists():
