@@ -18,6 +18,7 @@ import asyncio
 import collections
 import contextvars
 import dataclasses
+import errno
 import hashlib
 import html
 from dataclasses import dataclass, field
@@ -227,12 +228,10 @@ def _is_abbreviation_stop(text: str, period_end: int) -> bool:
         return bool(following) and (following[0].islower() or following[0].isdigit())
     if word in _PREFIX_ABBREVIATIONS:
         return True
-    # "J. R. R. Tolkien": a lone capital initial.  Not "I.", and not a
-    # letter after a lower-case word ("plan B.", "vitamin C.").
-    if not (len(word) == 1 and word.isalpha() and match.group(1).isupper()) or word == "i":
-        return False
-    before = text[max(0, match.start(1) - 20):match.start(1)].split()
-    return not (before and before[-1][:1].islower())
+    # "J. R. R. Tolkien": a lone capital initial (but not "I.").  "Plan B."
+    # looks the same; keeping a name whole matters more, and either way
+    # only moves where a section is cut.
+    return len(word) == 1 and word.isalpha() and match.group(1).isupper() and word != "i"
 
 
 def _sentence_boundaries(text: str, limit: int | None = None) -> list[tuple[int, int]]:
@@ -1330,6 +1329,11 @@ class TTSWorker(QThread):
         # quietly: the job's one status line followed whichever of three
         # streams spoke last ("Chunk 7…", "Saved chunk 5", "Retry on 6").
         self._head_index: int | None = None
+        # The latest status / stage line of each section in flight, shown
+        # when that section becomes the one the job waits on — otherwise a
+        # retry or an outage wait it hit earlier would never be seen.
+        self._section_status: dict[int, str] = {}
+        self._section_stage: dict[int, tuple[str, str]] = {}
         self._stats = _JobStats()
 
     @property
@@ -1590,59 +1594,19 @@ class TTSWorker(QThread):
             pass
 
         chunk_store: ChunkStore
-        if self._resume_staging_dir is not None:
-            try:
-                resumed = ChunkStore.try_resume(
-                    self._resume_staging_dir, stripped_text, self._voice)
-            except StagingInUseError as exc:
-                raise _PreflightError(
-                    self._voice,
-                    _AttemptFailure(
-                        "staging_in_use",
-                        "This saved job is already being generated.",
-                        original=exc,
-                    ),
-                ) from exc
-            if resumed is not None:
-                chunk_store = resumed
-                logger.info(
-                    "Resuming job %s — %d chunks already completed (%d chars consumed)",
-                    self._job_id,
-                    chunk_store.completed_count,
-                    chunk_store.manifest.chars_consumed,
-                )
-            else:
-                # Start over under a *new* id so the old staging directory is
-                # left exactly as it was.  Reusing the id overwrote its
-                # manifest, destroying whatever progress it still held.
-                logger.warning(
-                    "Could not resume from %s (mismatch or no valid data) — starting fresh",
-                    self._resume_staging_dir,
-                )
-                self._emit_stage(
-                    "local",
-                    "Saved progress couldn't be reused — starting from the beginning",
-                )
-                self._job_id = uuid.uuid4().hex
-                chunk_store = ChunkStore.create(
-                    staging_root,
-                    self._job_id,
-                    voice=self._voice,
-                    rate=self._rate,
-                    volume=self._volume,
-                    output_path=self._output_path,
-                    text=stripped_text,
-                )
-        else:
-            chunk_store = ChunkStore.create(
-                staging_root,
-                self._job_id,
-                voice=self._voice,
-                rate=self._rate,
-                volume=self._volume,
-                output_path=self._output_path,
-                text=stripped_text,
-            )
+        try:
+            chunk_store = self._open_chunk_store(staging_root, stripped_text)
+        except OSError as exc:
+            if exc.errno != errno.ENOSPC:
+                raise
+            raise _PreflightError(
+                self._voice,
+                _AttemptFailure(
+                    "insufficient_disk",
+                    f"The disk is full: {exc.strerror or exc}.",
+                    original=exc,
+                ),
+            ) from exc
 
         self._chunk_store = chunk_store
         # Counted only now: staged audio from a resume that turned out not to
@@ -1826,7 +1790,7 @@ class TTSWorker(QThread):
                     break
 
                 head = in_flight[0]
-                self._head_index = head.index
+                self._make_head(head.index)
                 chunk_bytes, outcome = await head.task
                 in_flight.popleft()
                 chunk_label = head.label
@@ -1952,6 +1916,8 @@ class TTSWorker(QThread):
 
         finally:
             self._head_index = None
+            self._section_status.clear()
+            self._section_stage.clear()
             await self._drain_in_flight(in_flight)
 
         if self._cancelled:
@@ -2162,6 +2128,63 @@ class TTSWorker(QThread):
     # ------------------------------------------------------------------ #
     # Disk space pre-flight                                                #
     # ------------------------------------------------------------------ #
+
+    def _open_chunk_store(self, staging_root: Path, stripped_text: str) -> ChunkStore:
+        """The staging store for this job: the resumed one, or a new one."""
+        if self._resume_staging_dir is not None:
+            try:
+                resumed = ChunkStore.try_resume(
+                    self._resume_staging_dir, stripped_text, self._voice)
+            except StagingInUseError as exc:
+                raise _PreflightError(
+                    self._voice,
+                    _AttemptFailure(
+                        "staging_in_use",
+                        "This saved job is already being generated.",
+                        original=exc,
+                    ),
+                ) from exc
+            if resumed is not None:
+                logger.info(
+                    "Resuming job %s — %d chunks already completed (%d chars consumed)",
+                    self._job_id,
+                    resumed.completed_count,
+                    resumed.manifest.chars_consumed,
+                )
+                return resumed
+            else:
+                # Start over under a *new* id so the old staging directory is
+                # left exactly as it was.  Reusing the id overwrote its
+                # manifest, destroying whatever progress it still held.
+                logger.warning(
+                    "Could not resume from %s (mismatch or no valid data) — starting fresh",
+                    self._resume_staging_dir,
+                )
+                self._emit_stage(
+                    "local",
+                    "Saved progress couldn't be reused — starting from the beginning",
+                )
+                self._job_id = uuid.uuid4().hex
+                chunk_store = ChunkStore.create(
+                    staging_root,
+                    self._job_id,
+                    voice=self._voice,
+                    rate=self._rate,
+                    volume=self._volume,
+                    output_path=self._output_path,
+                    text=stripped_text,
+                )
+        else:
+            chunk_store = ChunkStore.create(
+                staging_root,
+                self._job_id,
+                voice=self._voice,
+                rate=self._rate,
+                volume=self._volume,
+                output_path=self._output_path,
+                text=stripped_text,
+            )
+        return chunk_store
 
     def _check_free_space(
         self,
@@ -2958,12 +2981,32 @@ class TTSWorker(QThread):
         return section is None or self._head_index is None or section == self._head_index
 
     def _emit_status(self, text: str) -> None:
+        section = _SECTION.get(None)
+        if section is not None:
+            self._section_status[section] = text
         if self._speaks_for_job():
             self.status_changed.emit(text)
 
     def _emit_stage(self, kind: str, text: str) -> None:
+        section = _SECTION.get(None)
+        if section is not None:
+            self._section_stage[section] = (kind, text)
         if self._speaks_for_job():
             self.stage_changed.emit(kind, text)
+
+    def _make_head(self, index: int) -> None:
+        """The job now waits on section *index*: show what it last said."""
+        if self._head_index == index:
+            return
+        self._head_index = index
+        for done in [i for i in self._section_status if i < index]:
+            del self._section_status[done]
+        for done in [i for i in self._section_stage if i < index]:
+            del self._section_stage[done]
+        if index in self._section_status:
+            self.status_changed.emit(self._section_status[index])
+        if index in self._section_stage:
+            self.stage_changed.emit(*self._section_stage[index])
 
     def _parallel_limit(self, committed_chunks: int) -> int:
         """How many sections may stream at once right now."""

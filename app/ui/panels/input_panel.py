@@ -119,9 +119,13 @@ def _one_block(high_bytes: bytes) -> bool:
     """True if UTF-16 code units with these high bytes stay in one block."""
     if not high_bytes:
         return False
-    counts = sorted(Counter(b for b in high_bytes if b).values(), reverse=True)
-    top = counts[0] if counts else 0
-    return high_bytes.count(0) + top >= 0.95 * len(high_bytes)
+    counts = Counter(b for b in high_bytes if b)
+    if not counts:
+        return False
+    block, top = counts.most_common(1)[0]
+    # Thai is U+0E00, Khmer U+1780 …: high bytes 0x01-0x1F.  Misread ASCII
+    # pairs have printable high bytes (0x20 and up) and would decode as CJK.
+    return block < 0x20 and high_bytes.count(0) + top >= 0.95 * len(high_bytes)
 
 
 # Below this share of NUL bytes a file is assumed not to be BOM-less UTF-16
@@ -278,6 +282,11 @@ def _plausible_cjk(text: str | None) -> bool:
     letters = [ch for ch in sample if ch.isalpha()]
     cjk = sum(1 for ch in letters if _is_cjk(ch))
     if cjk < 3 or cjk < 0.6 * len(letters) or not _mostly_in(text, _is_cjk):
+        return False
+    # Prose uses many different characters; "====" read as UTF-16 is one
+    # ideograph ("㴽") over and over.
+    distinct = len({ch for ch in letters if _is_cjk(ch)})
+    if distinct < min(10, max(3, cjk // 20)):
         return False
     is_korean = sum(1 for ch in letters if _is_hangul(ch)) >= 0.5 * len(letters)
     return is_korean or sample.count(" ") <= 0.08 * len(sample)
