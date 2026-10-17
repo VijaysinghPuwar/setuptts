@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -216,11 +217,18 @@ def fetch_catalog(*, force_refresh: bool = False) -> list[CatalogVoice]:
             tmp.write_bytes(body)
             replace_with_retry(tmp, cache)
         except Exception:
+            stale = None
             if cache.exists():
-                logger.warning("Voice catalog refresh failed; using cached copy", exc_info=True)
-                raw = json.loads(cache.read_text(encoding="utf-8"))
-            else:
+                # A damaged cache must not replace the network error with a
+                # JSON one: the user needs to hear they are offline.
+                try:
+                    stale = json.loads(cache.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    logger.warning("Cached voice catalog is unreadable", exc_info=True)
+            if stale is None:
                 raise
+            logger.warning("Voice catalog refresh failed; using cached copy", exc_info=True)
+            raw = stale
     return _parse_catalog(raw)
 
 
@@ -266,11 +274,17 @@ def download_voice(
     total = voice.size_bytes
     done = 0
     staged: list[tuple[Path, Path]] = []
+    # Each download writes under its own names: a retry started while an
+    # abandoned download of the same voice is still winding down must not
+    # share (and have deleted under it) that download's partial files.
+    tag = uuid.uuid4().hex[:12]
+    parts: list[Path] = []
     try:
         # Config first (tiny) so the model rename is the commit point.
         for rel, meta in sorted(voice.files.items(), key=lambda kv: kv[0].endswith(".onnx")):
             final = dest / Path(rel).name
-            part = final.with_name(final.name + ".part")
+            part = final.with_name(f"{final.name}.{tag}.part")
+            parts.append(part)
             md5 = hashlib.md5()
             size = 0
             with _open(f"{HF_BASE}/{rel}?download=true", timeout=60) as resp, open(part, "wb") as fh:
@@ -302,13 +316,29 @@ def download_voice(
     finally:
         # Cleanup must never mask the real error (a .part still being scanned
         # can't be deleted yet on Windows).
-        leftovers = [part for part, _ in staged]
-        leftovers += [dest / (Path(rel).name + ".part") for rel in voice.files]
-        for part in leftovers:
+        for part in parts:
             try:
                 part.unlink(missing_ok=True)
             except OSError:
                 logger.debug("Could not remove %s", part, exc_info=True)
+
+
+def sweep_stale_parts(max_age_s: float) -> int:
+    """
+    Delete partial voice downloads (``*.part``) older than *max_age_s*, left
+    when the app was killed mid-download.  A download in progress writes to
+    its file constantly, so it is never this old.  Returns the number removed.
+    """
+    cutoff = time.time() - max_age_s
+    removed = 0
+    for part in user_dir().glob("*.part"):
+        try:
+            if part.is_file() and part.stat().st_mtime < cutoff:
+                part.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def remove_voice(key: str) -> bool:
@@ -571,6 +601,30 @@ class PiperCancelled(PiperError):
 
 
 _RATE_RE = re.compile(r"\s*([+-]?\d+)\s*%\s*")
+#: Speed range for the rate setting.  The UI goes from -50% to +100%; past
+#: about 2x the models garble words rather than speaking faster, so a
+#: hand-edited or out-of-range rate is held at the UI's limits.
+_MIN_SPEED = 0.25
+_MAX_SPEED = 2.0
+
+
+def _speed(rate: str) -> float:
+    """Speed multiplier for an edge-style rate string ("+25%" ? 1.25)."""
+    m = _RATE_RE.fullmatch(rate or "")
+    return min(_MAX_SPEED, max(_MIN_SPEED, 1.0 + (int(m.group(1)) if m else 0) / 100.0))
+
+
+def _plain_text(text: str) -> str:
+    """
+    Text with Piper's inline-phoneme syntax made inert.
+
+    Piper reads anything inside "[[ ... ]]" as raw phonemes, so wiki-style
+    links ("[[Paris]]") came out as letter noises or were skipped.  Breaking
+    up the brackets leaves them as ordinary punctuation, which is not spoken.
+    """
+    while "[[" in text:
+        text = text.replace("[[", "[ [")
+    return text
 
 
 #: Longest phoneme run sent to the model at once (~40-60 words).  The model's
@@ -752,9 +806,7 @@ class PiperSynthesizer:
         # together, so pauses are put back in.
         sentence_gap = bytes(2 * int(self.sample_rate * 0.12))
         clause_gap = bytes(2 * int(self.sample_rate * 0.07))
-        m = _RATE_RE.fullmatch(rate or "")
-        mult = max(0.25, 1.0 + (int(m.group(1)) if m else 0) / 100.0)
-        cfg = SynthesisConfig(length_scale=self._voice.config.length_scale / mult)
+        cfg = SynthesisConfig(length_scale=self._voice.config.length_scale / _speed(rate))
         # espeak-ng keeps global state and is not thread-safe; two jobs (or a
         # job and a preview) phonemizing at once can crash it.  Inference
         # itself is thread-safe and runs unlocked.
@@ -764,7 +816,7 @@ class PiperSynthesizer:
             # bound memory none, so it still sounds like one sentence.
             pieces = [(piece, sentence_gap if i == len(split) - 1 else
                        clause_gap if piece[-1] in _CLAUSE_MARKS else b"")
-                      for sentence in self._voice.phonemize(_bound_clauses(text))
+                      for sentence in self._voice.phonemize(_bound_clauses(_plain_text(text)))
                       for split in [[p for clause in _split_clauses(sentence)
                                      for p in _cap_phonemes(clause)]]
                       for i, piece in enumerate(split)]
