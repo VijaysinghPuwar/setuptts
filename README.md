@@ -178,7 +178,7 @@ Progress appears under **Active Jobs**: stage, percentage, section count, speed 
 
 - **Online voices need internet.** They come from Microsoft's service (the voices behind Edge's Read Aloud), used without an official API agreement, so availability can change. Their speed depends on the service, not your CPU. Offline and built-in voices work without internet and use the CPU.
 - Output: online voices 24 kHz, 48 kbit/s mono MP3; Kokoro voices 24 kHz, Piper and built-in voices 22 kHz, all 64 kbit/s mono MP3.
-- Kokoro voices need about 1.5–2 GB of free memory while they speak (it is released when the job ends) and run at roughly 6x realtime on an Apple M-series processor. Japanese and Chinese Kokoro voices are not offered: they need pronunciation data the app doesn't include.
+- Kokoro voices use about 1.3 GB of memory while they speak, or about 2.3 GB on computers with 16 GB or more, which speak two pieces at once for ~25% more speed; it is released when the job ends. They run at roughly 6x realtime on an Apple M-series processor. Japanese and Chinese Kokoro voices are not offered: they need pronunciation data the app doesn't include.
 - macOS 15 or later on Apple Silicon (the bundled Qt requires it); Windows 10/11, 64-bit.
 
 ## Troubleshooting
