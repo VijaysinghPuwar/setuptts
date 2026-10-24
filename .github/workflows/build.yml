@@ -116,7 +116,7 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          dist/SetupTTS.app/Contents/MacOS/SetupTTS --selftest selftest-app.json --network --bundled-voice \
+          dist/SetupTTS.app/Contents/MacOS/SetupTTS --selftest selftest-app.json --network --bundled-voice --kokoro \
             || { cat selftest-app.json; exit 1; }
           cat selftest-app.json
           python3 -c "import json,sys; d=json.load(open('selftest-app.json')); \
@@ -273,10 +273,11 @@ jobs:
         shell: pwsh
         run: |
           @'
-          param([string]$Exe, [string]$Out, [string]$Version, [switch]$Network, [switch]$BundledVoice)
+          param([string]$Exe, [string]$Out, [string]$Version, [switch]$Network, [switch]$BundledVoice, [switch]$Kokoro)
           $argList = @("--selftest", "`"$Out`"")
           if ($Network) { $argList += "--network" }
           if ($BundledVoice) { $argList += "--bundled-voice" }
+          if ($Kokoro) { $argList += "--kokoro" }
           $env:QT_QPA_PLATFORM = "offscreen"
           $p = Start-Process -FilePath $Exe -ArgumentList $argList -Wait -PassThru
           if (!(Test-Path $Out)) { Write-Error "no self-test output from $Exe (exit $($p.ExitCode))"; exit 1 }
@@ -290,7 +291,7 @@ jobs:
         shell: pwsh
         run: |
           $ver = if ("${{ github.event_name }}" -eq "push") { "${{ steps.ver.outputs.version }}" } else { "" }
-          ./selftest.ps1 -Exe "dist\SetupTTS\SetupTTS.exe" -Out "$pwd\selftest-onedir.json" -Version $ver -Network -BundledVoice
+          ./selftest.ps1 -Exe "dist\SetupTTS\SetupTTS.exe" -Out "$pwd\selftest-onedir.json" -Version $ver -Network -BundledVoice -Kokoro
 
       # GPU support (optional NVIDIA download, see app/services/gpu_accel.py).
       # The runner has no graphics card, but the riskiest part can still be

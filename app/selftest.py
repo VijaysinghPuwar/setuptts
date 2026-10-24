@@ -1,5 +1,5 @@
 """
-Packaged-build self test:  SetupTTS --selftest <result.json> [--network]
+Packaged-build self test:  SetupTTS --selftest <result.json> [--network] [--kokoro]
 
 Run by CI against the *frozen* app — the .app bundle, the installed Windows
 EXE and the portable EXE — to catch what only breaks after PyInstaller: a
@@ -12,7 +12,10 @@ sentence through the same code the app uses, verifying the audio is complete.
 
 Offline voices are always checked: the Piper runtime must load, the bundled
 voice must speak when present (--bundled-voice makes its absence a failure),
-and the OS built-in voices are listed and the first one spoken.
+and the OS built-in voices are listed and the first one spoken.  Kokoro's
+pronunciation step (espeak-ng through Piper's bridge) is always checked;
+--kokoro also downloads the Kokoro model and its best voice into a temporary
+folder and speaks a sentence with them.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ def run(argv: list[str]) -> int:
     # offline-voice check must still speak — on the processor, with the
     # card's failure recorded.
     gpu_startup = "--gpu-startup" in argv
+    kokoro_download = "--kokoro" in argv
 
     results: dict = {"checks": {}, "ok": False}
 
@@ -154,12 +158,52 @@ def run(argv: list[str]) -> int:
             raise RuntimeError(f"implausible duration {seconds}")
         return f"{len(found)} voices; {system_tts.system_display_name(found[0]['ShortName'])}: {seconds:.1f} s"
 
+    def kokoro_runtime():
+        from app.services import kokoro_tts
+
+        if not kokoro_tts.kokoro_available():
+            raise RuntimeError("Kokoro runtime (onnxruntime / espeak-ng) failed to import")
+        pieces = kokoro_tts.plan_pieces("SetupTTS checks Kokoro. Bonjour!", "a")
+        if not pieces or not kokoro_tts.tokenize(pieces[0].phonemes):
+            raise RuntimeError("espeak-ng produced no phonemes")
+        french = kokoro_tts.plan_pieces("Bonjour tout le monde.", "f")
+        if not french:
+            raise RuntimeError("espeak-ng produced no French phonemes")
+        return f"{len(kokoro_tts.VOICES)} voices; phonemes ok"
+
+    def kokoro_voice():
+        import shutil
+        import tempfile
+        from app.services import kokoro_tts
+        from app.services.local_tts import synthesize_to_mp3
+        from app.utils.mp3_duration import mp3_duration_seconds
+
+        root = Path(tempfile.mkdtemp(prefix="setuptts-kokoro-"))
+        (root / "voices").mkdir()
+        kokoro_tts.user_dir = lambda: root         # leave the user's voices alone
+        out = root / "kokoro.mp3"
+        try:
+            kokoro_tts.download_voice(kokoro_tts.KokoroCatalogVoice(kokoro_tts.DEFAULT_VOICE))
+            short = kokoro_tts.KOKORO_PREFIX + kokoro_tts.DEFAULT_VOICE
+            synthesize_to_mp3(short, "SetupTTS Kokoro voice check. The quick brown fox "
+                              "jumps over the lazy dog.", "+0%", out)
+            seconds = mp3_duration_seconds(out)
+        finally:
+            kokoro_tts._evict_all()
+            shutil.rmtree(root, ignore_errors=True)
+        if not seconds or seconds < 2:
+            raise RuntimeError(f"implausible duration {seconds}")
+        return f"{kokoro_tts.DEFAULT_VOICE}: {seconds:.1f} s"
+
     check("assets", assets)
     check("imports", imports)
     check("tls", tls)
     check("qt_gui", qt_gui)
     check("offline_voice", offline_voice)
     check("system_voices", system_voices)
+    check("kokoro_runtime", kokoro_runtime)
+    if kokoro_download:
+        check("kokoro_voice", kokoro_voice)
 
     if network:
         import asyncio

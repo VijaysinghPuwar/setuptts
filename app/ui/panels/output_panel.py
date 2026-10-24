@@ -91,7 +91,13 @@ from PySide6.QtWidgets import (
 from app.config.settings import AppSettings
 from app.models.job import Job, JobStatus
 from app.models.voice import Voice, persona_name
-from app.services.local_tts import SOURCE_ONLINE, SOURCE_PIPER, SOURCE_SYSTEM, source_of
+from app.services.local_tts import (
+    SOURCE_KOKORO,
+    SOURCE_ONLINE,
+    SOURCE_PIPER,
+    SOURCE_SYSTEM,
+    source_of,
+)
 from app.services.history_service import HistoryService
 from app.services.system_tts import current_short_name
 from app.services.tts_quality import (
@@ -373,12 +379,13 @@ class OutputPanel(QWidget):
         self._get_voices_btn = QPushButton("+ Get voices")
         self._get_voices_btn.setObjectName("headerLinkButton")
         self._get_voices_btn.setToolTip(
-            "Download free offline voices that work without internet")
+            "Download free offline voices that work without internet,\n"
+            "including lifelike Kokoro HD voices")
         hdr.addWidget(self._get_voices_btn)
         ly.addLayout(hdr)
 
         # Where the voice comes from: Microsoft's online service, an offline
-        # neural voice (Piper), or a voice built into the operating system.
+        # neural voice (Kokoro HD or Piper), or a voice built into the OS.
         tabs = QFrame()
         tabs.setObjectName("sourceTabs")
         tl = QHBoxLayout(tabs)
@@ -943,7 +950,8 @@ class OutputPanel(QWidget):
 
         filtered = self._all_voices
         if source:
-            filtered = [v for v in filtered if v.source == source]
+            kinds = _TAB_SOURCES.get(source, (source,))
+            filtered = [v for v in filtered if v.source in kinds]
         if locale:
             filtered = [v for v in filtered if v.locale == locale]
         if gender != "All":
@@ -971,9 +979,10 @@ class OutputPanel(QWidget):
 
         if not self._filtered_voices:
             source = self._current_source_filter()
-            if source == SOURCE_PIPER and not any(v.source == SOURCE_PIPER for v in self._all_voices):
+            kinds = _TAB_SOURCES.get(source, (source,))
+            if source == SOURCE_PIPER and not any(v.source in kinds for v in self._all_voices):
                 empty = "No offline voices yet — click + Get voices"
-            elif source and not any(v.source == source for v in self._all_voices):
+            elif source and not any(v.source in kinds for v in self._all_voices):
                 empty = "No voices of this kind on this computer"
             else:
                 empty = "No voices match your search"
@@ -1009,7 +1018,9 @@ class OutputPanel(QWidget):
 
         # Group by source (Online, Offline, Built-in) when more than one is
         # listed, under disabled header rows like "Recently Used".
-        rest.sort(key=lambda v: _SOURCE_ORDER.get(v.source, 9))
+        # Kokoro voices list their best-rated first within each language.
+        rest.sort(key=lambda v: (_SOURCE_ORDER.get(v.source, 9), v.locale,
+                                 _kokoro_rank(v.short_name)))
         grouped = len({v.source for v in rest}) > 1
         first_real = 1 if recent_in else -1
         current_source = None
@@ -1066,7 +1077,8 @@ class OutputPanel(QWidget):
         for v in self._all_voices:
             counts[v.source] = counts.get(v.source, 0) + 1
         for key, _label, tip in _SOURCE_TABS:
-            n = len(self._all_voices) if key == "" else counts.get(key, 0)
+            n = (len(self._all_voices) if key == "" else
+                 sum(counts.get(k, 0) for k in _TAB_SOURCES.get(key, (key,))))
             plural = "" if n == 1 else "s"
             self._source_buttons[key].setToolTip(f"{tip}\n{n} voice{plural}")
 
@@ -1209,7 +1221,8 @@ class OutputPanel(QWidget):
             if all_idx >= 0:
                 self._gender_combo.setCurrentIndex(all_idx)
         # The voice may be on another source tab (a recommendation can be).
-        if self._current_source_filter() not in ("", voice.source):
+        tab = self._current_source_filter()
+        if tab and voice.source not in _TAB_SOURCES.get(tab, (tab,)):
             self._source_buttons[""].setChecked(True)
             self._settings.source_filter = ""
 
@@ -2376,21 +2389,34 @@ def _field_label(text: str) -> QLabel:
 _SOURCE_TABS = (
     ("", "All", "Every voice"),
     (SOURCE_ONLINE, "Online", "Microsoft neural voices — best quality, need internet"),
-    (SOURCE_PIPER, "Offline", "Offline neural voices — natural sound, no internet needed"),
+    (SOURCE_PIPER, "Offline",
+     "Offline neural voices (Kokoro HD and Piper) — natural sound, no internet needed"),
     (SOURCE_SYSTEM, "Built-in", "Voices built into your computer (Cortana, David, Zira…)"),
 )
-_SOURCE_ORDER = {SOURCE_ONLINE: 0, SOURCE_PIPER: 1, SOURCE_SYSTEM: 2}
+#: The Offline tab lists both offline engines.
+_TAB_SOURCES = {SOURCE_PIPER: (SOURCE_PIPER, SOURCE_KOKORO)}
+_SOURCE_ORDER = {SOURCE_ONLINE: 0, SOURCE_KOKORO: 1, SOURCE_PIPER: 2, SOURCE_SYSTEM: 3}
 _SOURCE_HEADERS = {
     SOURCE_ONLINE: "Microsoft Online",
+    SOURCE_KOKORO: "Offline HD (Kokoro)",
     SOURCE_PIPER: "Offline Neural",
     SOURCE_SYSTEM: "Built into this computer",
 }
 _SOURCE_NOTES = {
     SOURCE_ONLINE: "Online voice · needs internet",
+    SOURCE_KOKORO: "Offline HD voice (Kokoro) · runs on this computer, no internet needed",
     SOURCE_PIPER: "Offline voice · runs on this computer, no internet needed",
     SOURCE_SYSTEM: "Built-in voice · works offline",
 }
-_SOURCE_TAGS = {SOURCE_PIPER: "Offline", SOURCE_SYSTEM: "Built-in"}
+_SOURCE_TAGS = {SOURCE_KOKORO: "Offline HD", SOURCE_PIPER: "Offline", SOURCE_SYSTEM: "Built-in"}
+
+
+def _kokoro_rank(short_name: str) -> int:
+    from app.services import kokoro_tts
+
+    if not kokoro_tts.is_kokoro_voice(short_name):
+        return 0
+    return kokoro_tts.grade_rank(short_name[len(kokoro_tts.KOKORO_PREFIX):])
 
 
 def _voice_display(v: Voice) -> str:
