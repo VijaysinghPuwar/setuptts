@@ -6,7 +6,7 @@
 
 <p align="center">
   A desktop app that turns text into MP3 audio with Microsoft's neural voices,
-  free offline voices and your computer's built-in voices,<br>
+  lifelike offline Kokoro HD voices, free Piper voices and your computer's built-in voices,<br>
   built to finish 12-hour audiobooks without silently losing a sentence.
 </p>
 
@@ -15,7 +15,7 @@
   <a href="../../actions/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/VijaysinghPuwar/setuptts/build.yml?label=build"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-555">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12-3776AB">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-749%20passing-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-818%20passing-2ea44f">
 </p>
 
 <p align="center">
@@ -46,6 +46,7 @@ Three kinds of voices, all in one picker (**All · Online · Offline · Built-in
 | Voices | Needs internet | What you get |
 |--------|----------------|--------------|
 | **Online** — Microsoft neural | Yes | 300+ voices in 70+ languages, best quality |
+| **Offline HD** — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) neural | No | 41 lifelike voices in 7 languages (US and UK English, Spanish, French, Hindi, Italian, Brazilian Portuguese) in **+ Get voices**: one 325 MB model shared by all, then under 1 MB per voice |
 | **Offline** — [Piper](https://github.com/rhasspy/piper) neural | No | One English voice included; ~170 more in ~50 languages one click away in **+ Get voices** |
 | **Built-in** — your OS | No | Windows: Cortana, David, Zira, Mark and any installed SAPI / Narrator voice. macOS: every system voice |
 
@@ -60,10 +61,11 @@ The hard part is not calling a speech API; it is making a **multi-hour job over 
 - **Fail-closed assembly.** Before the MP3 is written, the ranges must tile the source text exactly (no gaps, no overlaps), every chunk file must exist with the recorded size, the assembled byte count must match, and the audio length must be plausible for the text. The length check runs on a temporary file *before* it replaces anything, so a bad result can never overwrite an existing good file.
 - **Adaptive recovery.** Retries with exponential backoff and a fresh connection each time; sections that keep failing are split into smaller sub-ranges whose union must equal the original range exactly.
 - **Survives sleep and dropped Wi-Fi.** While a job runs, the computer is kept from idle-sleeping (`caffeinate` on macOS, `SetThreadExecutionState` on Windows), and kept at full speed when its window is hidden (an `NSProcessInfo` activity holds off App Nap on macOS; Windows power throttling is turned off for the process). If the service becomes unreachable, the job probes the connection and waits up to 30 minutes for it to return, without using up retries.
+- **Offline HD voices without new dependencies.** Kokoro-82M (Apache-2.0) runs as ONNX on the same onnxruntime and espeak-ng that Piper uses, so it works the same on macOS and Windows with nothing extra to install. espeak-ng's phonemes are mapped to Kokoro's alphabet as the model's own tools do; text is packed into runs of about 100–250 phonemes, the model's sweet spot; each run's built-in padding is trimmed and even pauses are put back, so joins sound natural. Every download is pinned to a fixed revision and checked by SHA-256. The full-precision model is used because the half-precision build returned silent (NaN) audio for about one passage in four; a run that ever comes back invalid is spoken in two halves rather than left as a gap.
 - **Fast offline voices.** Piper renders two sentences at a time with the CPU cores split between them (1.75x faster on Ryan high), capped at two runs per voice across all jobs to bound memory.
-- **NVIDIA GPU for offline voices (Windows, beta).** With an optional one-time download (onnxruntime-gpu plus NVIDIA's CUDA 13 and cuDNN 9 libraries, ~1.3 GB, every file pinned by SHA-256), Piper voices can run on the graphics card. In **Automatic** mode a speed check, run in a separate process so a driver crash can't take the app down, times the same voice on the processor and the card, and the card is used only when it is clearly faster. **Graphics card** and **Processor** can also be chosen by hand. If the card fails during a job, that job carries on on the processor. macOS is unaffected and keeps the same CPU path.
+- **NVIDIA GPU for offline voices (Windows, beta).** With an optional one-time download (onnxruntime-gpu plus NVIDIA's CUDA 13 and cuDNN 9 libraries, ~1.3 GB, every file pinned by SHA-256), Piper and Kokoro voices can run on the graphics card. In **Automatic** mode a speed check, run in a separate process so a driver crash can't take the app down, times the same voice on the processor and the card, and the card is used only when it is clearly faster. **Graphics card** and **Processor** can also be chosen by hand. If the card fails during a job, that job carries on on the processor. macOS is unaffected and keeps the same CPU path.
 - **Responsive UI during long work.** Generation runs on `QThread` workers with their own `asyncio` loops; the UI thread only receives throttled progress signals. Up to two jobs run concurrently with per-destination conflict checks.
-- **Tested as shipped.** 749 automated tests, including 12-hour-scale simulations, network-outage and sleep/wake simulations and regression tests that fail on the pre-fix code. CI also launches the *packaged* apps — the macOS bundle, the app inside the DMG, the app installed by the real Windows installer, and the portable EXE — and has each one load the voice list and synthesise a verified sample.
+- **Tested as shipped.** 818 automated tests, including 12-hour-scale simulations, network-outage and sleep/wake simulations and regression tests that fail on the pre-fix code. CI also launches the *packaged* apps — the macOS bundle, the app inside the DMG, the app installed by the real Windows installer, and the portable EXE — and has each one load the voice list and synthesise a verified sample.
 
 ---
 
@@ -80,7 +82,7 @@ flowchart TB
     subgraph Jobs["Background work"]
         JQ["JobQueue<br/>2 concurrent jobs"]
         W["TTSWorker<br/>QThread + asyncio"]
-        LW["LocalTTSWorker<br/>Piper · OS voices"]
+        LW["LocalTTSWorker<br/>Kokoro · Piper · OS voices"]
         VL["VoiceLoaderWorker"]
     end
 
@@ -139,6 +141,7 @@ flowchart TD
 | Laptop lid closed during a job | The computer sleeps (the OS always does this on battery); the job pauses and continues after wake |
 | Window hidden or screen locked during a job | The job keeps full speed: App Nap (macOS) and Efficiency mode (Windows) are held off until the last job ends |
 | An offline voice garbles a long sentence | Long sentences are spoken a clause at a time, which stops the occasional gibberish from some voices |
+| A Kokoro run returns invalid (silent) audio | Detected, and that part is spoken in two halves instead of being left as a gap |
 | App closed or crashes mid-book | Finished sections survive on disk; **Resume Unfinished Job** continues from the first unverified section |
 | Disk full or file locked while saving | Job stops with a plain explanation and stays resumable |
 | A chunk file or the manifest is damaged | Resume trusts only the verified contiguous prefix and regenerates the rest |
@@ -155,7 +158,7 @@ flowchart TD
 | Layer | Technology |
 |---|---|
 | UI | PySide6 (Qt 6) — widgets, QThread, QLocalServer |
-| Speech | edge-tts over aiohttp websockets (online); Piper on onnxruntime (offline); SAPI / OneCore and `say` (built-in) |
+| Speech | edge-tts over aiohttp websockets (online); Kokoro and Piper on onnxruntime (offline); SAPI / OneCore and `say` (built-in) |
 | Storage | SQLite (history), JSON manifest + per-section MP3 files (resume) |
 | Packaging | PyInstaller; DMG via create-dmg; Inno Setup installer; single-file portable EXE |
 | CI/CD | GitHub Actions: tests on macOS and Windows, packaged-app self-tests, release publishing |
@@ -174,7 +177,8 @@ Progress appears under **Active Jobs**: stage, percentage, section count, speed 
 ## Requirements and limitations
 
 - **Online voices need internet.** They come from Microsoft's service (the voices behind Edge's Read Aloud), used without an official API agreement, so availability can change. Their speed depends on the service, not your CPU. Offline and built-in voices work without internet and use the CPU.
-- Output: online voices 24 kHz, 48 kbit/s mono MP3; offline and built-in voices 22 kHz, 64 kbit/s mono MP3.
+- Output: online voices 24 kHz, 48 kbit/s mono MP3; Kokoro voices 24 kHz, Piper and built-in voices 22 kHz, all 64 kbit/s mono MP3.
+- Kokoro voices need about 1.5–2 GB of free memory while they speak (it is released when the job ends) and run at roughly 6x realtime on an Apple M-series processor. Japanese and Chinese Kokoro voices are not offered: they need pronunciation data the app doesn't include.
 - macOS 15 or later on Apple Silicon (the bundled Qt requires it); Windows 10/11, 64-bit.
 
 ## Troubleshooting
@@ -229,6 +233,8 @@ QT_QPA_PLATFORM=offscreen pytest -q
 ```bash
 python scripts/stress_voices.py                                   # every voice source, hostile text
 python scripts/stress_voices.py --text-file book.txt --rate +100%  # passages of a book through many voices
+python scripts/stress_voices.py --sources kokoro                    # every Kokoro voice (downloads them)
+python scripts/stress_longform.py --hours 12 --voice kokoro:af_heart  # a 12-hour book through the real job worker
 ```
 
 ### Check a packaged build

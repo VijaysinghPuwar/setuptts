@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "setuptts"
-version = "1.8.1"
+version = "1.9.0"
 description = "Professional text-to-audio desktop application"
 requires-python = ">=3.11"
 dependencies = [
