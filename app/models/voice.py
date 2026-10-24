@@ -14,7 +14,7 @@ def persona_name(short_name: str) -> str:
     picker listed two identical entries that behave differently — the
     multilingual model is chunked and recovered differently on long jobs.
     """
-    if short_name and short_name.startswith(("system:", "piper:")):
+    if short_name and short_name.startswith(("system:", "piper:", "kokoro:")):
         from app.services.local_tts import local_display_name
         return local_display_name(short_name)
     persona = short_name.split("-")[-1] if short_name else short_name
@@ -34,6 +34,7 @@ class Voice:
     locale: str          # e.g. "en-US"
     gender: str          # "Female" | "Male" | "" (unknown, some local voices)
     source: str = "online"   # "online" (Microsoft) | "system" (OS built-in) | "piper" (offline neural)
+    #                           | "kokoro" (offline HD neural)
 
     @property
     def is_local(self) -> bool:
@@ -42,7 +43,7 @@ class Voice:
 
     @property
     def source_label(self) -> str:
-        return {"system": "Built-in", "piper": "Offline"}.get(self.source, "Online")
+        return {"system": "Built-in", "piper": "Offline", "kokoro": "Offline HD"}.get(self.source, "Online")
 
     @property
     def persona(self) -> str:

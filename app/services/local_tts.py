@@ -1,10 +1,11 @@
 """
-Voices that run on this computer: OS built-in voices and offline Piper voices.
+Voices that run on this computer: OS built-in voices, offline Piper voices and
+offline HD Kokoro voices.
 
-Both engines expose the same small synthesizer interface —
+Every engine exposes the same small synthesizer interface —
 ``synthesize(text, rate) -> bytes`` (16-bit mono PCM at ``sample_rate``),
 ``cancel()`` and ``close()`` — so one worker, one preview path and one MP3
-writer serve both.
+writer serve them all.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import os
 from pathlib import Path
 from typing import Protocol
 
-from app.services import piper_tts, system_tts
+from app.services import kokoro_tts, piper_tts, system_tts
 from app.utils.file_ops import replace_with_retry
 from app.utils.output_paths import next_free_path
 
@@ -26,6 +27,7 @@ MP3_BITRATE_KBPS = 64
 SOURCE_ONLINE = "online"
 SOURCE_SYSTEM = "system"
 SOURCE_PIPER = "piper"
+SOURCE_KOKORO = "kokoro"
 
 
 class LocalSynthesizer(Protocol):
@@ -36,11 +38,13 @@ class LocalSynthesizer(Protocol):
     def close(self) -> None: ...
 
 
-CANCELLED_ERRORS = (system_tts.SystemSpeechCancelled, piper_tts.PiperCancelled)
+CANCELLED_ERRORS = (system_tts.SystemSpeechCancelled, piper_tts.PiperCancelled,
+                    kokoro_tts.KokoroCancelled)
 
 
 def is_local_voice(short_name: str | None) -> bool:
-    return system_tts.is_system_voice(short_name) or piper_tts.is_piper_voice(short_name)
+    return (system_tts.is_system_voice(short_name) or piper_tts.is_piper_voice(short_name)
+            or kokoro_tts.is_kokoro_voice(short_name))
 
 
 def source_of(short_name: str | None) -> str:
@@ -48,6 +52,8 @@ def source_of(short_name: str | None) -> str:
         return SOURCE_SYSTEM
     if piper_tts.is_piper_voice(short_name):
         return SOURCE_PIPER
+    if kokoro_tts.is_kokoro_voice(short_name):
+        return SOURCE_KOKORO
     return SOURCE_ONLINE
 
 
@@ -56,6 +62,8 @@ def local_display_name(short_name: str) -> str:
         return system_tts.system_display_name(short_name)
     if piper_tts.is_piper_voice(short_name):
         return piper_tts.display_name(short_name[len(piper_tts.PIPER_PREFIX):])
+    if kokoro_tts.is_kokoro_voice(short_name):
+        return kokoro_tts.display_name(short_name[len(kokoro_tts.KOKORO_PREFIX):])
     return short_name
 
 
@@ -63,6 +71,8 @@ def local_locale(short_name: str) -> str:
     """Best-effort locale for a local ShortName when only the name is known."""
     if piper_tts.is_piper_voice(short_name):
         return short_name[len(piper_tts.PIPER_PREFIX):].split("-")[0].replace("_", "-")
+    if kokoro_tts.is_kokoro_voice(short_name):
+        return kokoro_tts.locale_for(short_name[len(kokoro_tts.KOKORO_PREFIX):])
     return ""
 
 
@@ -71,6 +81,8 @@ def make_synthesizer(short_name: str) -> LocalSynthesizer:
         return system_tts.SystemSynthesizer(short_name)
     if piper_tts.is_piper_voice(short_name):
         return piper_tts.PiperSynthesizer(short_name)
+    if kokoro_tts.is_kokoro_voice(short_name):
+        return kokoro_tts.KokoroSynthesizer(short_name)
     raise ValueError(f"Not a local voice: {short_name}")
 
 
@@ -78,10 +90,13 @@ def list_local_voices() -> list[dict]:
     """Every installed local voice (never raises)."""
     voices = []
     try:
+        voices.extend(kokoro_tts.list_kokoro_voices())
+    except Exception:  # noqa: BLE001
+        logger.warning("Listing Kokoro voices failed", exc_info=True)
+    try:
         voices.extend(piper_tts.list_piper_voices())
     except Exception:  # noqa: BLE001
-        import logging
-        logging.getLogger(__name__).warning("Listing Piper voices failed", exc_info=True)
+        logger.warning("Listing Piper voices failed", exc_info=True)
     voices.extend(system_tts.list_system_voices())
     return voices
 
