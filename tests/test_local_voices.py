@@ -773,6 +773,7 @@ def test_voice_manager_dialog_lists_and_marks_installed(qapp, qtbot, monkeypatch
     dialog = vmd.VoiceManagerDialog()
     qtbot.addWidget(dialog)
     dialog._on_catalog([voice])
+    dialog._engine_combo.setCurrentIndex(dialog._engine_combo.findData("piper"))
     assert dialog._table.rowCount() == 1
     btn = dialog._table.cellWidget(0, vmd._COL_ACTION)
     assert btn.text() == "Download" and btn.isEnabled()

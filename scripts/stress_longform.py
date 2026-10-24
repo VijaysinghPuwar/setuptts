@@ -4,6 +4,10 @@ real speech service with exactly the worker the app uses.
 
     python scripts/stress_longform.py --hours 10 --voice en-US-AndrewNeural
     python scripts/stress_longform.py --text-file "ch 25.txt" --repeat 20
+    python scripts/stress_longform.py --hours 12 --voice kokoro:af_heart
+
+Offline and built-in voices run through the app's LocalTTSWorker, online
+voices through TTSWorker.
 
 Text is a public-domain novel (Project Gutenberg), trimmed to roughly the
 character count that the voice needs for the requested length.  All app data
@@ -27,7 +31,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-# Measured on real jobs: Andrew at -5 % speaks ~15.8 source chars per second.
+# Measured on real jobs: Andrew at -5 % speaks ~15.8 source chars per second;
+# Kokoro's Heart at +0 % ~15.1.
 _CHARS_PER_AUDIO_SECOND = 15.8
 _GUTENBERG = "https://www.gutenberg.org/cache/epub/2701/pg2701.txt"   # Moby-Dick
 
@@ -54,6 +59,8 @@ def main() -> int:
     ap.add_argument("--rate", default="-5%")
     ap.add_argument("--workdir", default=str(ROOT / "stress_out"))
     ap.add_argument("--text-file", help="use this text instead of the novel")
+    ap.add_argument("--chars-per-second", type=float, default=_CHARS_PER_AUDIO_SECOND,
+                    help="source characters per second of audio, to size the text")
     ap.add_argument("--repeat", type=int, default=1,
                     help="with --text-file: repeat the text this many times")
     args = ap.parse_args()
@@ -67,6 +74,8 @@ def main() -> int:
     from app import APP_VERSION
     from app.utils.app_logging import setup_logging
     from app.utils.paths import AppPaths
+    from app.services.local_tts import is_local_voice
+    from app.workers.local_tts_worker import LocalTTSWorker
     from app.workers.tts_worker import TTSWorker
 
     paths = AppPaths()
@@ -77,18 +86,19 @@ def main() -> int:
     if args.text_file:
         src = Path(args.text_file)
         text = "\n\n".join([src.read_text(encoding="utf-8-sig").strip()] * max(1, args.repeat))
-        out_mp3 = work / f"stress_{args.voice}_{src.stem}_x{args.repeat}.mp3"
+        out_mp3 = work / f"stress_{args.voice.replace(':', '_')}_{src.stem}_x{args.repeat}.mp3"
     else:
-        target_chars = int(args.hours * 3600 * _CHARS_PER_AUDIO_SECOND)
+        target_chars = int(args.hours * 3600 * args.chars_per_second)
         text = _load_text(target_chars, work / "source_book.txt")
-        out_mp3 = work / f"stress_{args.voice}_{args.hours:g}h.mp3"
+        out_mp3 = work / f"stress_{args.voice.replace(':', '_')}_{args.hours:g}h.mp3"
     summary_path = out_mp3.with_suffix(".json")
     log.info("Stress start: version=%s voice=%s rate=%s chars=%d target_hours=%.1f out=%s",
              APP_VERSION, args.voice, args.rate, len(text), args.hours, out_mp3)
     print(f"[stress] {len(text):,} chars -> {out_mp3}", flush=True)
 
     app = QCoreApplication(sys.argv)
-    worker = TTSWorker(text, args.voice, args.rate, "+0%", str(out_mp3))
+    worker_cls = LocalTTSWorker if is_local_voice(args.voice) else TTSWorker
+    worker = worker_cls(text, args.voice, args.rate, "+0%", str(out_mp3))
     started = time.monotonic()
     result: dict = {"version": APP_VERSION, "voice": args.voice, "rate": args.rate,
                     "chars": len(text), "target_hours": args.hours}
