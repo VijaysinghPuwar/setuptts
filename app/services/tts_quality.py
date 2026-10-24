@@ -14,9 +14,19 @@ from typing import Any
 _ZERO_WIDTH_RE = re.compile(r"[\u00ad\u200b\u200e\u200f\u202a-\u202e\u2060\ufeff]")
 # Symbols ("So") that carry meaning and that the voices read aloud.
 _SPOKEN_SYMBOLS = frozenset("°©®™℃℉№℗")
+# Kept out of NFKC, which turns ™ into "TM", № into "No" and ⅔ into
+# "2⁄3" — read as letters and digits instead of the words they stand for.
+_NFKC_KEEP_RE = re.compile("[°©®™℃℉№℗¼½¾⅐-⅞]+")
+# Emoji skin-tone modifiers: left behind when the emoji itself is removed,
+# they were read aloud ("medium skin tone").
+_SKIN_TONES = frozenset(chr(c) for c in range(0x1F3FB, 0x1F400))
+# Wikipedia-style reference marks: "Paris[2]", "France[3][4]".
+_CITATION_RE = re.compile(r"\[\d+(?:\s*[,–-]\s*\d+)*\]")
 _ELLIPSIS_RE = re.compile(r"(?:\.{4,}|…+)")
 _REPEATED_PUNCT_RE = re.compile(r"([!?])\1{2,}")
-_MARKDOWN_BULLET_RE = re.compile(r"(?m)^[ \t]*[-*]\s+")
+# [ \t]+, not \s+: a scene-break line of just "*" took the blank lines
+# after it — and with them the paragraph break.
+_MARKDOWN_BULLET_RE = re.compile(r"(?m)^[ \t]*[-*][ \t]+")
 _UNICODE_BULLET_RE = re.compile(r"[•▪■●◦◆◇▶►▸▹➜➤➝]+")
 _NOISY_DECORATION_RE = re.compile(r"[※★☆✦✧✩✪✫✬✭✮✯❖❥♡♥♦♣♠]+")
 _EXTRA_DASH_RE = re.compile(r"[‐‑‒–—―]{2,}")
@@ -464,12 +474,23 @@ def _drop_stray_joiners(text: str) -> str:
     return "".join(out)
 
 
+def _nfkc_keeping_symbols(text: str) -> str:
+    parts = []
+    last = 0
+    for m in _NFKC_KEEP_RE.finditer(text):
+        parts.append(unicodedata.normalize("NFKC", text[last:m.start()]))
+        parts.append(m.group())
+        last = m.end()
+    parts.append(unicodedata.normalize("NFKC", text[last:]))
+    return "".join(parts)
+
+
 def normalize_text_for_tts(text: str) -> str:
     """Clean punctuation and noisy unicode without changing the meaning."""
     if not text:
         return ""
 
-    text = unicodedata.normalize("NFKC", text)
+    text = _nfkc_keeping_symbols(text)
     text = text.translate(_PUNCT_TRANSLATION)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _ZERO_WIDTH_RE.sub("", text)
@@ -488,7 +509,7 @@ def normalize_text_for_tts(text: str) -> str:
             continue
 
         category = unicodedata.category(char)
-        if category.startswith("C"):
+        if category.startswith("C") or char in _SKIN_TONES:
             cleaned_chars.append(" ")
             continue
         if category == "So" and char not in _SPOKEN_SYMBOLS:
@@ -577,6 +598,7 @@ def _normalize_bracketed_prefix(line: str) -> str:
 
 
 def _normalize_bracketed_fragments(line: str) -> str:
+    line = _CITATION_RE.sub("", line)
     fragments = [match.group(1).strip() for match in _BRACKETED_SEGMENT_RE.finditer(line)]
     if not fragments:
         return line
@@ -592,7 +614,19 @@ def _normalize_bracketed_fragments(line: str) -> str:
     if not stripped and len(cleaned_fragments) >= 2:
         return ". ".join(cleaned_fragments)
 
-    return _BRACKETED_SEGMENT_RE.sub(lambda match: _clean_fragment(match.group(1)), line)
+    def _unwrap(match: re.Match) -> str:
+        inner = _clean_fragment(match.group(1))
+        # "a[i]" must not become "ai"; CJK brackets are quotes and stay unspaced.
+        if match.group(0)[0] in "[{" and inner:
+            before = line[match.start() - 1] if match.start() else ""
+            after = line[match.end()] if match.end() < len(line) else ""
+            if before.isalnum():
+                inner = " " + inner
+            if after.isalnum():
+                inner += " "
+        return inner
+
+    return _BRACKETED_SEGMENT_RE.sub(_unwrap, line)
 
 
 #: Above this length the UI's voice hint profiles a sample, not the whole text.
@@ -650,7 +684,13 @@ def build_text_profile(text: str) -> TextProfile:
             reason="The text does not contain enough alphabetic content.",
         )
 
-    if script_counts.get("hiragana", 0) or script_counts.get("katakana", 0):
+    kana = script_counts.get("hiragana", 0) + script_counts.get("katakana", 0)
+    japanese = kana + script_counts.get("han", 0)
+    other = max((count for script, count in script_counts.items()
+                 if script not in ("hiragana", "katakana", "han")), default=0)
+    # Kana marks Japanese only when Japanese is the main script: one
+    # katakana word ("ラーメン") made a whole English book "Japanese".
+    if kana and japanese >= other and kana >= 0.1 * japanese:
         dominant_script = "japanese"
         dominant_count = (
             script_counts.get("hiragana", 0)

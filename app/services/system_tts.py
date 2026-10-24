@@ -341,6 +341,34 @@ class SystemSpeechCancelled(SystemSpeechError):
     pass
 
 
+class _HelperExited(SystemSpeechError):
+    """The helper closed its output mid-request (crashed or was killed)."""
+
+
+_TEMP_PREFIX = "setuptts_sys_"
+
+
+def sweep_stale_temp_dirs(max_age_s: float) -> int:
+    """
+    Delete temp folders left by synthesizers that were never closed (the app
+    was killed mid-job).  They hold pieces of the book's text.  A folder in
+    use gains a file every chunk, so its time stays recent.  Returns the
+    number removed.
+    """
+    import time
+
+    cutoff = time.time() - max_age_s
+    removed = 0
+    for entry in Path(tempfile.gettempdir()).glob(_TEMP_PREFIX + "*"):
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += not entry.exists()
+        except OSError:
+            continue
+    return removed
+
+
 def _read_wav(path: Path) -> bytes:
     """16-bit mono PCM at SAMPLE_RATE from a WAV file."""
     with wave.open(str(path), "rb") as wf:
@@ -392,7 +420,10 @@ class SystemSynthesizer:
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._cancelled = False
-        self._tmpdir = Path(tempfile.mkdtemp(prefix="setuptts_sys_"))
+        self._tmpdir = Path(tempfile.mkdtemp(prefix=_TEMP_PREFIX))
+        # Helpers killed by cancel(), waited for in close() rather than on
+        # the thread that cancelled (usually the UI thread).
+        self._killed: list[subprocess.Popen] = []
         self._count = 0
         self.sample_rate = SAMPLE_RATE
 
@@ -409,7 +440,9 @@ class SystemSynthesizer:
         wav_path = self._tmpdir / f"out_{self._count}.wav"
         if sys.platform == "darwin":
             text = _say_safe(text)
-        text_path.write_text(text, encoding="utf-8")
+        # errors="replace": a lone surrogate (from a damaged PDF or EPUB) can't
+        # be encoded and would fail the whole chunk; it becomes "?" instead.
+        text_path.write_text(text, encoding="utf-8", errors="replace")
         try:
             if sys.platform == "win32":
                 self._speak_windows(text_path, wav_path, rate)
@@ -433,7 +466,9 @@ class SystemSynthesizer:
 
     def cancel(self) -> None:
         self._cancelled = True
-        self._kill()
+        # Called from the UI thread: kill, but don't wait for the process to
+        # go (up to seconds on a busy machine); close() reaps it.
+        self._kill(wait=False)
 
     def close(self) -> None:
         proc = self._proc
@@ -444,6 +479,13 @@ class SystemSynthesizer:
             except Exception:  # noqa: BLE001
                 pass
         self._kill()
+        with self._lock:
+            killed, self._killed = self._killed, []
+        for proc in killed:
+            try:
+                proc.wait(timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def __enter__(self) -> "SystemSynthesizer":
@@ -488,7 +530,7 @@ class SystemSynthesizer:
         if self._cancelled:
             raise SystemSpeechCancelled("cancelled")
         if not result or not result[0]:
-            raise SystemSpeechError("The system speech helper exited unexpectedly")
+            raise _HelperExited("The system speech helper exited unexpectedly")
         return result[0].decode("utf-8", "replace").strip()
 
     def _speak_windows(self, text_path: Path, wav_path: Path, rate: str) -> None:
@@ -508,13 +550,24 @@ class SystemSynthesizer:
                 last = exc
                 self._kill()
                 continue
-            reply = self._readline(proc, _SPEAK_TIMEOUT_S)
+            try:
+                reply = self._readline(proc, _SPEAK_TIMEOUT_S)
+            except _HelperExited as exc:
+                # The helper died mid-speech (a voice crashed it, or it was
+                # killed from outside): a fresh one usually manages, so try
+                # once more.  A timeout is not retried — the voice is hung,
+                # and waiting the full timeout again would only double it.
+                last = exc
+                self._kill()
+                continue
             if reply == "OK":
                 return
             raise SystemSpeechError(
                 "The system voice could not speak this text"
                 + (f": {reply[4:]}" if reply.startswith("ERR ") else f" ({reply!r})")
             )
+        if isinstance(last, SystemSpeechError):
+            raise last
         raise SystemSpeechError(f"The system speech helper could not be started: {last}")
 
     # -- macOS ---------------------------------------------------------- #
@@ -544,12 +597,19 @@ class SystemSynthesizer:
                 f"{(err or b'').decode('utf-8', 'replace').strip()[:300]}"
             )
 
-    def _kill(self) -> None:
+    def _kill(self, wait: bool = True) -> None:
         with self._lock:
             proc, self._proc = self._proc, None
         if proc is not None and proc.poll() is None:
             try:
                 proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            if not wait:
+                with self._lock:
+                    self._killed.append(proc)
+                return
+            try:
                 proc.wait(timeout=3)
             except Exception:  # noqa: BLE001
                 pass

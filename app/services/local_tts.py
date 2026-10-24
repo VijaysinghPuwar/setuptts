@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Protocol
 
@@ -101,6 +102,47 @@ def list_local_voices() -> list[dict]:
     return voices
 
 
+_VOLUME_RE = re.compile(r"\s*([+-]?\d+)\s*%\s*")
+
+
+def volume_gain(volume: str | None) -> float:
+    """
+    Linear gain for an edge-style volume string ("+0%", "-20%", "+10%").
+
+    Online voices get the volume from the service; local voices render at a
+    fixed level, so the same setting is applied to their samples instead.
+    Anything unreadable means "unchanged".
+    """
+    match = _VOLUME_RE.fullmatch(volume or "")
+    if not match:
+        return 1.0
+    return max(0.0, 1.0 + int(match.group(1)) / 100.0)
+
+
+def apply_gain(pcm: bytes, gain: float) -> bytes:
+    """16-bit PCM scaled by *gain*, clipped so loud peaks don't wrap around."""
+    if gain == 1.0 or not pcm:
+        return pcm
+    import numpy as np
+
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) * gain
+    return np.clip(np.rint(samples), -32768, 32767).astype("<i2").tobytes()
+
+
+def sweep_stale_files(max_age_s: float = 24 * 3600) -> None:
+    """
+    Remove what hard-killed runs leave behind: system-voice temp folders
+    (which hold the book's text) and half-downloaded Piper voices.  Anything
+    still in use is touched far more often than once a day, so only files
+    older than *max_age_s* go.  Best effort; never raises.
+    """
+    for sweep in (system_tts.sweep_stale_temp_dirs, piper_tts.sweep_stale_parts):
+        try:
+            sweep(max_age_s)
+        except Exception:  # noqa: BLE001 - housekeeping must not break startup
+            logger.debug("Stale file sweep failed", exc_info=True)
+
+
 class Mp3Writer:
     """
     Streams PCM into one MP3 file.  Written to ``<path>.part`` and moved into
@@ -109,21 +151,24 @@ class Mp3Writer:
     """
 
     def __init__(self, path: str | Path, sample_rate: int,
-                 bitrate_kbps: int = MP3_BITRATE_KBPS) -> None:
+                 bitrate_kbps: int = MP3_BITRATE_KBPS, *, gain: float = 1.0) -> None:
         import lameenc
 
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._part = self.path.with_name(self.path.name + ".part")
-        self._fh = open(self._part, "wb")
+        # Encoder first: if it can't be set up (a bad sample rate), nothing
+        # has been opened yet, so no handle or empty .part is left behind.
         self._enc = lameenc.Encoder()
         self._enc.set_bit_rate(bitrate_kbps)
         self._enc.set_in_sample_rate(sample_rate)
         self._enc.set_channels(1)
         self._enc.set_quality(2)
         self._rate = sample_rate
+        self._gain = gain
         self.samples = 0
         self._done = False
+        self._fh = open(self._part, "wb")
 
     @property
     def duration_seconds(self) -> float:
@@ -134,6 +179,8 @@ class Mp3Writer:
             if len(pcm) % 2:
                 pcm = pcm[:-1]
             self.samples += len(pcm) // 2
+            if self._gain != 1.0:
+                pcm = apply_gain(pcm, self._gain)
             self._fh.write(self._enc.encode(pcm))
 
     def write_silence(self, seconds: float) -> None:

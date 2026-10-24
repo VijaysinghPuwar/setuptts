@@ -24,6 +24,7 @@ from app.services.local_tts import (
     Mp3Writer,
     local_display_name,
     make_synthesizer,
+    volume_gain,
 )
 from app.services.tts_quality import build_text_profile
 from app.utils.power import keep_awake
@@ -111,7 +112,10 @@ class LocalTTSWorker(QThread):
             if self._cancelled:
                 synth.cancel()
                 return
-            writer = Mp3Writer(self._output_path, synth.sample_rate)
+            # Local voices render at a fixed level; the volume setting is
+            # applied to the samples on their way into the MP3.
+            writer = Mp3Writer(self._output_path, synth.sample_rate,
+                               gain=volume_gain(self._volume))
 
             done_chars = 0
             silent = 0

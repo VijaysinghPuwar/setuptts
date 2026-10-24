@@ -205,6 +205,16 @@ def _set_live(staging_dir: Path, live: bool) -> None:
             _LIVE_DIRS.discard(key)
 
 
+def _claim_live(staging_dir: Path) -> bool:
+    """Mark *staging_dir* live; False if another worker already owns it."""
+    key = staging_dir.resolve()
+    with _LIVE_LOCK:
+        if key in _LIVE_DIRS:
+            return False
+        _LIVE_DIRS.add(key)
+        return True
+
+
 def is_live(staging_dir: Path) -> bool:
     """True while a worker in this process owns *staging_dir*."""
     with _LIVE_LOCK:
@@ -234,6 +244,8 @@ class ChunkStore:
     ) -> None:
         self._dir = staging_dir
         self._manifest = manifest
+        # Set by finalize(): True when this run's rejected audio was kept.
+        self.rejected_kept = False
         staging_dir.mkdir(parents=True, exist_ok=True)
         if save_manifest:
             self._save_manifest()
@@ -285,7 +297,32 @@ class ChunkStore:
         - the manifest is missing or corrupt
         - the manifest does not have preserved chunk files
         - the stored text or voice do not match the requested resume job
+        - another worker in this process is already writing the directory
         """
+        # Claimed before reading anything: two resumes of one folder would
+        # write the same chunk files and one's cleanup deletes the other's.
+        if not _claim_live(staging_dir):
+            logger.warning("Staging folder %s is already in use — not resuming it twice",
+                           staging_dir)
+            # Not None: that means "start over", which would quietly render
+            # the whole book again beside the job already doing it.
+            raise StagingInUseError(f"{staging_dir} is already being written")
+        try:
+            store = cls._load_for_resume(staging_dir, text, voice)
+        except BaseException:
+            _set_live(staging_dir, False)
+            raise
+        if store is None:
+            _set_live(staging_dir, False)
+        return store
+
+    @classmethod
+    def _load_for_resume(
+        cls,
+        staging_dir: Path,
+        text: str | None,
+        voice: str | None,
+    ) -> "Optional[ChunkStore]":
         manifest = _load_manifest(staging_dir)
         if manifest is None:
             return None
@@ -347,7 +384,6 @@ class ChunkStore:
         store = cls(staging_dir, manifest, save_manifest=False)
         if changed:
             store._save_manifest()
-        _set_live(staging_dir, True)
         return store
 
     @staticmethod
@@ -713,6 +749,7 @@ class ChunkStore:
         assembled audio is moved to *rejected_path* for inspection, or
         deleted if none is given.
         """
+        self.rejected_kept = False
         records = sorted(self._manifest.chunks, key=lambda c: c.index)
         if not records:
             raise RuntimeError("No completed chunks to finalise — nothing to write.")
@@ -753,6 +790,10 @@ class ChunkStore:
                         )
                     out.write(payload)
                     expected_bytes += record.audio_bytes
+                # On disk before the rename: the staging chunks are deleted
+                # right after, so a power cut must not leave a zeroed book.
+                out.flush()
+                os.fsync(out.fileno())
 
             actual_bytes = tmp_output.stat().st_size
             if actual_bytes != expected_bytes:
@@ -767,7 +808,10 @@ class ChunkStore:
                 except Exception:
                     if rejected_path is not None:
                         try:
-                            tmp_output.replace(rejected_path)
+                            # With retries: an older copy of the same name may
+                            # be open in a player or held by antivirus.
+                            _replace_with_retry(tmp_output, rejected_path)
+                            self.rejected_kept = True
                         except OSError:
                             logger.warning("Could not keep rejected output at %s",
                                            rejected_path, exc_info=True)
@@ -837,6 +881,10 @@ class ChunkStore:
             "updated_at": self._manifest.updated_at,
         }
         _atomic_write_text(manifest_path, json.dumps(data, indent=2))
+
+
+class StagingInUseError(RuntimeError):
+    """A resume was asked for a staging folder another worker is writing."""
 
 
 class CoverageError(RuntimeError):
@@ -1112,7 +1160,7 @@ def cleanup_stale_staging(
         if not entry.is_dir():
             continue
         try:
-            if entry.resolve() in keep_resolved:
+            if entry.resolve() in keep_resolved or is_live(entry):
                 continue
             age_days = (now - entry.stat().st_mtime) / 86_400
             if age_days < max_age_days:

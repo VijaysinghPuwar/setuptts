@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from app.services import kokoro_tts, piper_tts
 from app.services.kokoro_tts import KokoroCatalogVoice
 from app.services.piper_tts import CatalogVoice
+from app.workers.thread_shutdown import stop_threads
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,21 @@ def _adopt(thread: QThread | None) -> None:
         thread.setParent(None)
         _ORPHANS.append(thread)
         thread.finished.connect(lambda t=thread: _ORPHANS.remove(t) if t in _ORPHANS else None)
+
+
+def stop_orphans(budget_s: float = 3.0) -> None:
+    """At app exit: cancel orphaned threads and wait briefly for them.
+
+    _ORPHANS alone was not enough — it is cleared with the module during
+    interpreter teardown, destroying a thread still running a download.
+    Any that outlive the wait are kept alive by stop_threads until exit.
+    """
+    running = [t for t in _ORPHANS if t.isRunning()]
+    if running:
+        stop_threads([(type(t).__name__, t) for t in running],
+                     budget_s=budget_s, min_wait_s=0.5)
+
+
 _QUALITY_LABELS = {"x_low": "Basic", "low": "Good", "medium": "Better", "high": "Best"}
 
 _ENGINES = (("", "All voices"), ("kokoro", "Kokoro HD"), ("piper", "Piper"))

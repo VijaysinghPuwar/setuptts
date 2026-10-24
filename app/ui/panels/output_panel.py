@@ -115,6 +115,7 @@ from app.utils.paths import AppPaths, default_output_dir, open_in_file_manager
 from app.workers.job_queue import JobItem, JobQueue
 from app.workers.chunk_store import ResumeCandidate, ChunkStore
 from app.workers.preview_worker import PreviewWorker
+from app.workers.thread_shutdown import stop_threads
 from app.workers.voice_loader import VoiceLoaderWorker
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,8 @@ class OutputPanel(QWidget):
         self._guidance_cache: tuple[tuple[int, int], object] | None = None
         self._visible_recommended_voice: str | None = None
         self._resume_candidates: list[ResumeCandidate] = []
+        self._generate_debouncing = False
+        self._preview_failed = False
         # Keep old voice-loader workers alive until their thread exits.
         # Without this, replacing self._voice_loader on retry can cause
         # the old QThread object to be GC-collected mid-run → crash.
@@ -250,6 +253,7 @@ class OutputPanel(QWidget):
         """
         self._queue.cancel_all()
 
+        stopping: list[tuple[str, QThread]] = []
         for name, worker in [
             ("voice_loader", self._voice_loader),
             ("preview",      self._preview_worker),
@@ -259,6 +263,7 @@ class OutputPanel(QWidget):
             if not worker.isRunning():
                 continue
             logger.info("Stopping worker: %s", name)
+            stopping.append((name, worker))
 
             # Disconnect all signals first.  Any signals already queued in
             # the Qt event loop will become no-ops after disconnection, so
@@ -288,28 +293,16 @@ class OutputPanel(QWidget):
                     except (RuntimeError, TypeError):
                         pass
 
-            if hasattr(worker, "cancel"):
-                worker.cancel()
-            if hasattr(worker, "stop_playback"):
-                worker.stop_playback()
-            worker.quit()
-            if not worker.wait(4_000):
-                logger.warning("Worker %s timed out — terminating", name)
-                worker.terminate()
-                worker.wait(1_000)
-                if hasattr(worker, "_cleanup"):
-                    worker._cleanup()   # a terminated preview leaves its temp MP3
-            else:
-                logger.info("Worker %s stopped cleanly", name)
-
-        # Also keep finishing_workers alive until they exit
-        for w in list(self._finishing_workers):
-            if w.isRunning():
-                w.quit()
-                if not w.wait(2_000):
-                    w.terminate()
-                    w.wait(500)
+        stopping += [("finishing", w) for w in self._finishing_workers if w.isRunning()]
+        # Interrupted, cancelled and waited for together; one that will not
+        # stop in time is left to exit with the process (and kept referenced)
+        # rather than terminate()d while it runs Python code.
+        stop_threads(stopping, budget_s=4.0, min_wait_s=1.0)
         self._finishing_workers.clear()
+
+        # Threads from closed Get Voices / GPU dialogs (a stuck download).
+        from app.ui.dialogs.voice_manager_dialog import stop_orphans
+        stop_orphans()
 
     # ------------------------------------------------------------------ #
     # UI construction                                                      #
@@ -751,6 +744,9 @@ class OutputPanel(QWidget):
         self._source_group.buttonClicked.connect(lambda _btn: self._on_filter_changed())
         self._get_voices_btn.clicked.connect(self._open_voice_manager)
         self._voice_combo.currentIndexChanged.connect(self._on_voice_selection_changed)
+        # A filter can show a voice that isn't the saved one; picking that
+        # same row changes no index, but it is a choice and must be saved.
+        self._voice_combo.activated.connect(self._on_voice_selection_changed)
 
         # Speed
         self._rate_slider.valueChanged.connect(self._on_rate_changed)
@@ -779,6 +775,7 @@ class OutputPanel(QWidget):
         self._queue.job_completed.connect(self._on_job_completed)
         self._queue.job_failed.connect(self._on_job_failed)
         self._queue.job_cancelled.connect(self._on_job_cancelled)
+        self._queue.worker_exited.connect(lambda _job_id: self._refresh_resume_jobs())
 
     # ------------------------------------------------------------------ #
     # Called by MainWindow when input text changes                        #
@@ -786,7 +783,9 @@ class OutputPanel(QWidget):
 
     def on_has_text_changed(self, has_text: bool) -> None:
         """Immediate enable/disable of Generate as the editor fills or empties."""
-        self._generate_btn.setEnabled(has_text)
+        # Not during the post-click debounce: flushing pending typing on
+        # Generate re-enabled the button and let a double-click submit twice.
+        self._generate_btn.setEnabled(has_text and not self._generate_debouncing)
         self._generate_hint.setVisible(
             not has_text and self._density != self.DENSITY_MINIMAL
         )
@@ -814,7 +813,11 @@ class OutputPanel(QWidget):
         self._set_folder_text(folder)
         idx = self._gender_combo.findText(self._settings.gender_filter)
         if idx >= 0:
+            # Silently: _on_filter_changed would save the language and source
+            # filters from widgets not restored yet, wiping both at launch.
+            self._gender_combo.blockSignals(True)
             self._gender_combo.setCurrentIndex(idx)
+            self._gender_combo.blockSignals(False)
         btn = self._source_buttons.get(self._settings.source_filter)
         if btn is not None:
             btn.setChecked(True)
@@ -830,18 +833,8 @@ class OutputPanel(QWidget):
         # prevent "QThread destroyed while running" crashes.
         old = self._voice_loader
         if old is not None and old.isRunning():
-            try:
-                old.loaded.disconnect(self._on_voices_loaded)
-                old.failed.disconnect(self._on_voices_failed)
-            except Exception:
-                pass
-            self._finishing_workers.append(old)
-            old.finished.connect(
-                lambda w=old: (
-                    self._finishing_workers.remove(w)
-                    if w in self._finishing_workers else None
-                )
-            )
+            old.requestInterruption()
+            self._keep_until_finished(old)
 
         self._voice_error_label.hide()
         self._retry_voices_btn.hide()
@@ -855,12 +848,35 @@ class OutputPanel(QWidget):
         self._voice_combo.setToolTip("")
         self._voice_count_label.setText("Connecting…")
 
-        self._voice_loader = VoiceLoaderWorker(
-            cache_path=AppPaths().cache_dir / "voices.json"
+        loader = VoiceLoaderWorker(cache_path=AppPaths().cache_dir / "voices.json")
+        # Results carry the loader that produced them: a list an old loader
+        # had already queued (Retry clicked just as it finished) must not
+        # replace the newer one, nor be read against the new loader's flags.
+        loader.loaded.connect(
+            lambda voices, w=loader: self._on_loader_result(w, self._on_voices_loaded, voices)
         )
-        self._voice_loader.loaded.connect(self._on_voices_loaded)
-        self._voice_loader.failed.connect(self._on_voices_failed)
-        self._voice_loader.start()
+        loader.failed.connect(
+            lambda message, w=loader: self._on_loader_result(w, self._on_voices_failed, message)
+        )
+        self._voice_loader = loader
+        loader.start()
+
+    def _keep_until_finished(self, worker: QThread) -> None:
+        if worker in self._finishing_workers:
+            return
+        self._finishing_workers.append(worker)
+        worker.finished.connect(
+            lambda w=worker: (
+                self._finishing_workers.remove(w)
+                if w in self._finishing_workers else None
+            )
+        )
+
+    def _on_loader_result(self, loader, handler, payload) -> None:
+        if loader is not self._voice_loader:
+            logger.info("Ignoring the result of a replaced voice loader")
+            return
+        handler(payload)
 
     def _on_voices_loaded(self, voices: list[Voice]) -> None:
         self._all_voices = voices
@@ -1053,14 +1069,19 @@ class OutputPanel(QWidget):
             f"{total} voices" if total == all_n else f"{total} of {all_n} voices"
         )
         self._preview_btn.setEnabled(True)
-        # Signals were blocked while rebuilding, so record the selection that
-        # is now visible — that is the voice Generate will use.
-        self._on_voice_selection_changed()
+        # Signals were blocked while rebuilding, so refresh what depends on
+        # the visible selection — but don't save it: a search or filter that
+        # hides the saved voice is not the user choosing another one, and
+        # saving it here replaced their voice for good on every keystroke.
+        self._refresh_for_selection()
 
     def _on_voice_selection_changed(self) -> None:
         selected = self.get_selected_voice()
         if selected:
             self._settings.voice = selected
+        self._refresh_for_selection()
+
+    def _refresh_for_selection(self) -> None:
         if not self._stop_preview_btn.isVisible():
             # A stale "Preview unavailable" belongs to the previous voice.
             self._set_preview_status("")
@@ -1230,6 +1251,9 @@ class OutputPanel(QWidget):
         for idx in range(self._voice_combo.count()):
             if self._voice_combo.itemData(idx, _ROLE_SHORT_NAME) == short_name:
                 self._voice_combo.setCurrentIndex(idx)
+                # An explicit choice; the index may not have changed (the
+                # rebuild can already sit on it), so save it here too.
+                self._settings.voice = short_name
                 return True
         return False
 
@@ -1272,13 +1296,21 @@ class OutputPanel(QWidget):
     # ------------------------------------------------------------------ #
 
     def _on_preview(self) -> None:
-        if self._preview_worker and self._preview_worker.isRunning():
-            return
+        old = self._preview_worker
+        if old is not None and old.isRunning():
+            if not self._stop_preview_btn.isHidden():
+                return   # still generating or playing
+            # It has reported playback_finished (that is what brought the
+            # Preview button back) and is only returning from run(); a click
+            # in that moment used to be silently dropped.
+            if not old.wait(1_000):
+                self._keep_until_finished(old)
         voice = self.get_selected_voice()
         rate  = self.get_rate_string()
         self._preview_btn.hide()
         self._stop_preview_btn.show()
         self._set_preview_status("Generating preview…")
+        self._preview_failed = False
         self._preview_worker = PreviewWorker(voice=voice, rate=rate)
         self._preview_worker.started_playing.connect(
             lambda: self._set_preview_status("Playing…")
@@ -1294,12 +1326,17 @@ class OutputPanel(QWidget):
     def _on_preview_done(self) -> None:
         self._stop_preview_btn.hide()
         self._preview_btn.show()
-        self._set_preview_status("")
+        # The worker reports a failure and then playback_finished; the
+        # "Preview unavailable" note must outlive the second signal.
+        if not self._preview_failed:
+            self._set_preview_status("")
         self._refresh_source_note()
 
     def _on_preview_failed(self, message: str) -> None:
         logger.warning("Preview failed: %s", message)
+        self._preview_failed = False
         self._on_preview_done()
+        self._preview_failed = True
         self._set_preview_status("Preview unavailable", tooltip=split_error(message).summary)
         self.status_message.emit("Preview unavailable — " + split_error(message).summary)
 
@@ -1310,6 +1347,9 @@ class OutputPanel(QWidget):
     def _on_generate(self) -> None:
         # ── Debounce: disable for 1.5 s to prevent rapid double-click ──── #
         # Button is re-enabled by _restore_generate_btn after the timer fires.
+        if self._generate_debouncing:
+            return
+        self._generate_debouncing = True
         self._generate_btn.setEnabled(False)
         QTimer.singleShot(1500, self._restore_generate_btn)
 
@@ -1489,6 +1529,7 @@ class OutputPanel(QWidget):
 
     def _restore_generate_btn(self) -> None:
         """Re-enable the Generate button after the debounce timer fires."""
+        self._generate_debouncing = False
         parent_win = self.window()
         has_text = bool(
             parent_win.get_input_text()
@@ -1498,7 +1539,12 @@ class OutputPanel(QWidget):
 
     def _refresh_resume_jobs(self) -> None:
         try:
-            self._resume_candidates = ChunkStore.list_resume_candidates(AppPaths().staging_dir)
+            self._resume_candidates = [
+                c for c in ChunkStore.list_resume_candidates(AppPaths().staging_dir)
+                # Queued or still running: offering it again would start a
+                # second job on the same saved progress.
+                if not self._queue.has_active_job(c.job_id, str(c.staging_dir))
+            ]
         except Exception:
             logger.warning("Could not load resumable jobs", exc_info=True)
             self._resume_candidates = []
@@ -1558,7 +1604,20 @@ class OutputPanel(QWidget):
             )
         menu.exec(self._resume_job_btn.mapToGlobal(self._resume_job_btn.rect().bottomLeft()))
 
+    def _candidate_in_use(self, candidate: ResumeCandidate) -> bool:
+        if not self._queue.has_active_job(candidate.job_id, str(candidate.staging_dir)):
+            return False
+        QMessageBox.warning(
+            self,
+            "Job Already Active",
+            "This saved job is already running or queued.",
+        )
+        self._refresh_resume_jobs()
+        return True
+
     def _discard_candidate(self, candidate: ResumeCandidate) -> None:
+        if self._candidate_in_use(candidate):
+            return
         name = Path(candidate.output_path).name
         if QMessageBox.question(
             self,
@@ -1576,6 +1635,8 @@ class OutputPanel(QWidget):
         self._refresh_resume_jobs()
 
     def _resume_candidate(self, candidate: ResumeCandidate) -> None:
+        if self._candidate_in_use(candidate):
+            return
         if self._queue.has_active_output_path(candidate.output_path):
             QMessageBox.warning(
                 self,
