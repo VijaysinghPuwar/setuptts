@@ -124,6 +124,9 @@ class LocalTTSWorker(QThread):
                 if self._cancelled:
                     return
                 self.status_changed.emit(f"Speaking {index}/{len(chunks)}…")
+                # Announced before the part is spoken: otherwise a job of one
+                # part showed "Loading <voice>" for its whole run.
+                self.stage_changed.emit("local", f"Speaking part {index} of {len(chunks)}")
                 pcm = self._render(synth, chunk, index, len(chunks))
                 if not pcm and any(ch.isalnum() for ch in chunk):
                     silent += 1
@@ -148,8 +151,6 @@ class LocalTTSWorker(QThread):
                     phase="local",
                     detail="Speaking on this computer",
                 ))
-                self.stage_changed.emit(
-                    "local", f"Spoke part {index} of {len(chunks)} · {cps:.0f} chars/s")
 
             if self._cancelled:
                 return
