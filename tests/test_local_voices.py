@@ -26,6 +26,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt  # noqa: E402
+
 from app.models.voice import Voice, persona_name  # noqa: E402
 from app.services import local_tts, piper_tts, system_tts  # noqa: E402
 from app.services.local_tts import Mp3Writer  # noqa: E402
@@ -332,6 +334,35 @@ def test_local_worker_writes_every_chunk_in_order(qtbot, monkeypatch, tmp_path):
     assert result["progress"][-1] == 100
     assert worker.audio_duration_seconds == pytest.approx(mp3_duration_seconds(out), abs=0.2)
     assert synth.closed
+
+
+def test_local_worker_says_it_is_speaking_while_a_part_renders(qtbot, monkeypatch, tmp_path):
+    # A one-part job used to show "Loading <voice>" for its whole run: the
+    # stage only changed after a part had been spoken.
+    from app.workers import local_tts_worker
+
+    stages: list[str] = []
+    seen_while_rendering: list[str] = []
+
+    class Watching(FakeSynth):
+        def synthesize(self, text, rate):
+            seen_while_rendering.append(stages[-1])
+            return super().synthesize(text, rate)
+
+    monkeypatch.setattr(local_tts_worker.LocalTTSWorker, "__init__",
+                        _wrap_init(local_tts_worker.LocalTTSWorker.__init__, stages))
+    _, result = _run_worker(qtbot, monkeypatch, Watching(), "Hello there. " * 10,
+                            tmp_path / "s.mp3")
+    assert "done" in result
+    assert seen_while_rendering == ["Speaking part 1 of 1"]
+
+
+def _wrap_init(init, stages):
+    def wrapped(self, *a, **kw):
+        init(self, *a, **kw)
+        self.stage_changed.connect(lambda kind, text: stages.append(text),
+                                   Qt.DirectConnection)
+    return wrapped
 
 
 def test_local_worker_retries_a_failed_chunk(qtbot, monkeypatch, tmp_path):
