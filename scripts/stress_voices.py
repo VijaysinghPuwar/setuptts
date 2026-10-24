@@ -49,6 +49,10 @@ _SAMPLES = {
           "बार, क्योंकि संख्या कभी एक जैसी नहीं आती थी। " * 8,
     "ar": "كان الميناء هادئًا تحت سماء رمادية. عدّت مارا القوارب مرتين، ثم مرة "
           "ثالثة، لأن العدد لم يكن متطابقًا أبدًا. " * 8,
+    "it": "Il porto era tranquillo sotto un cielo grigio. Mara contò le barche "
+          "due volte, poi una terza, perché il numero non tornava mai uguale. " * 8,
+    "pt": "O porto estava tranquilo sob um céu cinzento. Mara contou os barcos "
+          "duas vezes, e depois uma terceira, porque o número nunca batia. " * 8,
     "ru": "Гавань лежала тихо под серым небом. Мара пересчитала лодки дважды, "
           "потом в третий раз, потому что число никогда не совпадало. " * 8,
 }
@@ -88,6 +92,8 @@ _SYSTEM = [
     ("Thomas", "fr"), ("Mónica", "es"), ("Kyoko", "ja"), ("Tingting", "zh"),
     ("Lekha", "hi"), ("Majed", "ar"), ("Milena", "ru"),
 ]
+#: Every Kokoro voice, with a sample in its language.
+_KOKORO_LANG = {"a": "en", "b": "en", "e": "es", "f": "fr", "h": "hi", "i": "it", "p": "pt"}
 _PIPER = [("en_US-lessac-medium", "en"), ("de_DE-thorsten-medium", "de"),
           ("es_ES-davefx-medium", "es"), ("fr_FR-siwis-medium", "fr")]
 
@@ -117,8 +123,18 @@ _BOOK_ONLINE = [
 _BOOK_SYSTEM = ["Samantha", "Daniel", "Karen", "Moira", "Fred"]
 
 
+def _ensure_kokoro(keys) -> set[str]:
+    from app.services import kokoro_tts
+
+    for key in keys:
+        if key not in kokoro_tts.installed_keys():
+            print(f"downloading Kokoro voice {key} …", flush=True)
+            kokoro_tts.download_voice(kokoro_tts.KokoroCatalogVoice(key))
+    return kokoro_tts.installed_keys()
+
+
 def _book_cases(sources: set[str], path: str, size: int, rate: str) -> list[dict]:
-    from app.services import piper_tts
+    from app.services import kokoro_tts, piper_tts
     from app.services.system_tts import list_system_voices
 
     segments = _book_segments(path, size)
@@ -128,6 +144,10 @@ def _book_cases(sources: set[str], path: str, size: int, rate: str) -> list[dict
     if "piper" in sources and piper_tts.piper_available():
         voices += [("piper", v["ShortName"]) for v in piper_tts.list_piper_voices()
                    if v["Locale"].startswith("en")]
+    if "kokoro" in sources and kokoro_tts.kokoro_available():
+        english = [k for k in kokoro_tts.VOICES if k[0] in "ab"]
+        voices += [("kokoro", kokoro_tts.KOKORO_PREFIX + k)
+                   for k in sorted(_ensure_kokoro(english)) if k in english]
     if "system" in sources:
         listed = list_system_voices()
         installed = {v["ShortName"] for v in listed}
@@ -144,7 +164,7 @@ def _book_cases(sources: set[str], path: str, size: int, rate: str) -> list[dict
 
 
 def _cases(sources: set[str], long_chars: int) -> list[dict]:
-    from app.services import piper_tts
+    from app.services import kokoro_tts, piper_tts
     from app.services.system_tts import list_system_voices
 
     cases: list[dict] = []
@@ -206,6 +226,21 @@ def _cases(sources: set[str], long_chars: int) -> list[dict]:
             add("piper", en, "rate:+100%", _SAMPLES["en"], "+100%")
             if long_chars:
                 add("piper", en, f"long:{long_chars}", _long_english(long_chars))
+
+    if "kokoro" in sources and kokoro_tts.kokoro_available():
+        installed = _ensure_kokoro(kokoro_tts.VOICES)
+        for key in sorted(installed, key=lambda k: (kokoro_tts.grade_rank(k), k)):
+            add("kokoro", kokoro_tts.KOKORO_PREFIX + key, f"lang:{_KOKORO_LANG[key[0]]}",
+                _SAMPLES[_KOKORO_LANG[key[0]]])
+        main = kokoro_tts.KOKORO_PREFIX + kokoro_tts.DEFAULT_VOICE
+        for kind, text in _HOSTILE.items():
+            add("kokoro", main, f"hostile:{kind}", text)
+        add("kokoro", main, "rate:+100%", _SAMPLES["en"], "+100%")
+        add("kokoro", main, "rate:-50%", _SAMPLES["en"], "-50%")
+        add("kokoro", "kokoro:bf_emma", "hostile:mixed_script", _HOSTILE["mixed_script"])
+        if long_chars:
+            add("kokoro", main, f"long:{long_chars}", _long_english(long_chars))
+            add("kokoro", "kokoro:bm_george", f"long:{long_chars}", _long_english(long_chars))
     return cases
 
 
@@ -268,7 +303,7 @@ def _validate(case: dict, path: Path) -> tuple[bool, str, float | None]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sources", default="online,system,piper")
+    ap.add_argument("--sources", default="online,system,piper,kokoro")
     ap.add_argument("--long-chars", type=int, default=30_000)
     ap.add_argument("--workdir", default=str(ROOT / "stress_out" / "voices"))
     ap.add_argument("--only", default="", help="substring filter on voice/kind")

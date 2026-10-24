@@ -31,6 +31,22 @@ def _no_real_local_voices(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _private_kokoro_dir(request, tmp_path_factory, monkeypatch):
+    """Each test starts with no Kokoro model or voices downloaded."""
+    if request.node.get_closest_marker("real_local_voices"):
+        return
+    from app.services import kokoro_tts
+
+    root = tmp_path_factory.mktemp("kokoro")
+
+    def _user_dir():
+        (root / "voices").mkdir(parents=True, exist_ok=True)
+        return root
+
+    monkeypatch.setattr(kokoro_tts, "user_dir", _user_dir)
+
+
+@pytest.fixture(autouse=True)
 def _service_always_reachable(request, monkeypatch):
     """
     Tests inject network failures; the outage probe must not open a real

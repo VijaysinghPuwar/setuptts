@@ -1093,7 +1093,7 @@ def _pick_preferred_voice(
 
 def _is_local_name(short_name: str) -> bool:
     """Built-in or offline voice (see app.services.local_tts)."""
-    return short_name.startswith(("system:", "piper:"))
+    return short_name.startswith(("system:", "piper:", "kokoro:"))
 
 
 def _voice_short_name(voice: Any) -> str:
@@ -1110,6 +1110,9 @@ def _voice_locale(voice: Any) -> str:
     if isinstance(voice, str):
         if voice.startswith("piper:"):
             return voice[len("piper:"):].split("-")[0].replace("_", "-")
+        if voice.startswith("kokoro:"):
+            from app.services.kokoro_tts import locale_for
+            return locale_for(voice[len("kokoro:"):])
         if voice.startswith("system:"):
             return ""
         parts = voice.split("-")
