@@ -386,6 +386,12 @@ QComboBox QAbstractItemView::item:selected {
     color: white;
 }
 
+/* Export card: the audiobook compression in force. */
+QLabel#compressionLabel {
+    font-size: 11px;
+    background: transparent;
+}
+
 /* ── Sliders ──────────────────────────────────────────────── */
 QSlider::groove:horizontal {
     height: 4px;

@@ -37,6 +37,7 @@ from edge_tts import exceptions as edge_exceptions
 from edge_tts.communicate import escape, remove_incompatible_characters
 from PySide6.QtCore import QThread, Signal
 
+from app.services import compression as audio_compression
 from app.services.tts_quality import (
     TextProfile,
     VoiceCompatibilityAssessment,
@@ -881,7 +882,8 @@ class _AttemptStats:
 
 # The service streams audio-24khz-48kbitrate-mono-mp3: constant 48 kbit/s, so
 # a byte count converts exactly to seconds of audio.
-_MP3_BYTES_PER_SECOND = 48_000 // 8
+_SERVICE_BITRATE_KBPS = 48
+_MP3_BYTES_PER_SECOND = _SERVICE_BITRATE_KBPS * 1000 // 8
 _TICKS_PER_SECOND = 10_000_000
 # Measured against the live service: complete audio ends 0.02–0.06 s past the
 # last boundary's end, while a boundary arrives up to ~5 s before its audio is
@@ -1295,9 +1297,11 @@ class TTSWorker(QThread):
         allow_voice_mismatch: bool = False,
         job_id: str | None = None,
         resume_staging_dir: Path | None = None,
+        compression: str = "off",
     ) -> None:
         super().__init__()
         self._text = text
+        self._compression = compression
         self._voice = voice
         self._rate = rate
         self._volume = volume
@@ -1400,6 +1404,8 @@ class TTSWorker(QThread):
                 # rather than as cancelled with a finished MP3 on disk.
                 logger.info("Cancel arrived after %s was complete — keeping it",
                             self._output_path)
+            elif self._output_written:
+                self._compress_output()
 
             elapsed = time.monotonic() - start
             logger.info(
@@ -2979,6 +2985,48 @@ class TTSWorker(QThread):
     def _speaks_for_job(self) -> bool:
         section = _SECTION.get(None)
         return section is None or self._head_index is None or section == self._head_index
+
+    def _compress_output(self) -> None:
+        """
+        Shrink the finished, verified MP3 to the chosen audiobook level.
+
+        Runs on the worker thread after the event loop is done, so the cancel
+        flag is the only interrupt.  Whatever happens, a complete file stays
+        on disk: compression replaces the original only once the smaller copy
+        has been checked, and a cancel or failure keeps the original as is.
+        """
+        profile = audio_compression.profile_for(self._compression)
+        if profile is None:
+            return
+        name = Path(self._output_path).name
+        self._emit_status("Compressing…")
+        self._emit_stage("local", f"Compressing for audiobook ({profile.label})")
+
+        def on_progress(pct: int) -> None:
+            self._emit_status(f"Compressing… {pct}%")
+
+        try:
+            result = audio_compression.compress_mp3_in_place(
+                self._output_path,
+                self._compression,
+                source_bitrate_kbps=_SERVICE_BITRATE_KBPS,
+                should_cancel=lambda: self._cancelled,
+                on_progress=on_progress,
+            )
+        except audio_compression.CompressionCancelled:
+            logger.info("Compression cancelled; keeping the uncompressed %s", name)
+            self._emit_stage("local", f"Saved {name} (not compressed)")
+            self._emit_status("Done")
+            return
+        if result is not None:
+            self._emit_stage(
+                "local",
+                f"Saved {name} — compressed {result.saved_fraction:.0%} smaller "
+                f"({profile.label})",
+            )
+        else:
+            self._emit_stage("local", f"Saved {name}")
+        self._emit_status("Done")
 
     def _emit_status(self, text: str) -> None:
         section = _SECTION.get(None)

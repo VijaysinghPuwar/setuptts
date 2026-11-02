@@ -106,13 +106,17 @@ _pip_h = [m for m in _pip_h
           and m not in ("piper.http_server", "piper.phonemize_hebrew")]
 _onx_d, _onx_b, _onx_h = collect_all("onnxruntime")
 _lam_d, _lam_b, _lam_h = collect_all("lameenc")
+# miniaudio decodes online-voice MP3 for audiobook compression; it is a cffi
+# extension, so cffi's _cffi_backend has to travel with it.
+_mia_d, _mia_b, _mia_h = collect_all("miniaudio")
 
 # ── Hidden imports (identical to setuptts.spec) ───────────────────── #
 _hidden = [
     *collect_submodules("edge_tts"),
     *_aio_h, *_sig_h, *_fzl_h, *_mdi_h, *_yrl_h,
-    *_pip_h, *_onx_h, *_lam_h,
+    *_pip_h, *_onx_h, *_lam_h, *_mia_h,
     "piper", "piper.voice", "onnxruntime", "numpy", "lameenc", "wave",
+    "miniaudio", "_miniaudio", "_cffi_backend",
     "aiohttp", "aiosignal", "frozenlist", "multidict", "yarl",
     "attrs", "attr",
     "asyncio",
@@ -141,7 +145,7 @@ a = Analysis(
     pathex=[str(ROOT)],
     binaries=[
         *_aio_b, *_sig_b, *_fzl_b, *_mdi_b, *_yrl_b,
-        *_pip_b, *_onx_b, *_lam_b,
+        *_pip_b, *_onx_b, *_lam_b, *_mia_b,
     ],
     datas=[
         # Everything in app/assets except the bundled offline voice: a onefile
@@ -153,7 +157,7 @@ a = Analysis(
         *edge_tts_datas,
         *certifi_datas,
         *_aio_d, *_sig_d, *_fzl_d, *_mdi_d, *_yrl_d,
-        *_pip_d, *_onx_d, *_lam_d,
+        *_pip_d, *_onx_d, *_lam_d, *_mia_d,
     ],
     hiddenimports=_hidden,
     hookspath=[],
