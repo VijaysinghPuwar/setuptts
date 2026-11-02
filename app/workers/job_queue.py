@@ -51,6 +51,8 @@ class JobItem:
     output_path:   str
     allow_voice_mismatch: bool = False
     resume_staging_dir: str = ""
+    # Audiobook compression level for the saved file (app.services.compression).
+    compression: str = "off"
 
     # Derived / mutable
     id:          str   = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -146,6 +148,7 @@ class JobQueue(QObject):
         *,
         job_id: str | None = None,
         resume_staging_dir: str | None = None,
+        compression: str = "off",
     ) -> str:
         """
         Add a job to the queue.  Returns the new job's ID.
@@ -164,10 +167,11 @@ class JobQueue(QObject):
             allow_voice_mismatch=allow_voice_mismatch,
             id=job_id or uuid.uuid4().hex[:8],
             resume_staging_dir=resume_staging_dir or "",
+            compression=compression,
         )
         logger.info(
-            "Job queued: id=%s voice=%s output=%s",
-            item.id, voice, output_path,
+            "Job queued: id=%s voice=%s output=%s compression=%s",
+            item.id, voice, output_path, compression,
         )
         self._pending.append(item)
         self.job_submitted.emit(item)
@@ -305,6 +309,7 @@ class JobQueue(QObject):
             allow_voice_mismatch=item.allow_voice_mismatch,
             job_id=item.id,
             resume_staging_dir=Path(item.resume_staging_dir) if item.resume_staging_dir else None,
+            compression=item.compression,
         )
 
         jid = item.id

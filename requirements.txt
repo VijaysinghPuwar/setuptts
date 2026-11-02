@@ -17,3 +17,6 @@ piper-tts==1.8.0
 onnxruntime==1.30.0
 numpy==2.5.3
 lameenc==1.8.4
+#  - Audiobook compression decodes online-voice MP3 with miniaudio (cffi).
+miniaudio==1.71
+cffi==2.1.1

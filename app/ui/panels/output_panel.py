@@ -140,6 +140,7 @@ class OutputPanel(QWidget):
 
     job_completed  = Signal(object)   # Job model instance
     status_message = Signal(str)
+    settings_requested = Signal()     # "Change" next to the compression level
 
     def __init__(
         self,
@@ -567,8 +568,40 @@ class OutputPanel(QWidget):
         self._browse_btn = QPushButton("Browse")
         folder_row.addWidget(self._browse_btn)
         ly.addLayout(folder_row)
+        ly.addSpacing(8)
+
+        # Audiobook compression in force, so a smaller file is no surprise.
+        self._compression_label = QLabel()
+        self._compression_label.setObjectName("compressionLabel")
+        self._compression_label.setWordWrap(True)
+        self._compression_label.setTextFormat(Qt.RichText)
+        self._compression_label.setTextInteractionFlags(Qt.LinksAccessibleByMouse
+                                                        | Qt.LinksAccessibleByKeyboard)
+        self._compression_label.linkActivated.connect(lambda _l: self.settings_requested.emit())
+        ly.addWidget(self._compression_label)
+        self.refresh_compression_label()
 
         return card
+
+    def refresh_compression_label(self) -> None:
+        """Show the compression level new files will be saved with."""
+        from app.services import compression
+
+        level = self._settings.compression
+        profile = compression.profile_for(level)
+        if profile is None:
+            summary = "Off (original quality)"
+        else:
+            summary = f"{profile.label} · ~{profile.mb_per_hour:.0f} MB/hour"
+        self._compression_label.setText(
+            f'<span style="color:#9A9A9F;">Compression: {summary}</span>'
+            f'&nbsp;&nbsp;<a href="settings" style="color:#0A84FF; text-decoration:none;">'
+            f'Change</a>'
+        )
+        self._compression_label.setAccessibleName(f"Audiobook compression: {summary}")
+        self._compression_label.setToolTip(
+            "Saved MP3 files are compressed for spoken word. Change the level in Settings."
+        )
 
     # ── Pinned action footer (never scrolls away) ─────────────────────── #
 
@@ -1469,6 +1502,7 @@ class OutputPanel(QWidget):
                 text=text, voice=voice, voice_display=voice_display,
                 rate=rate, volume=volume, output_path=output_path,
                 allow_voice_mismatch=allow_voice_mismatch,
+                compression=self._settings.compression,
             )
         except ValueError:
             QMessageBox.warning(
@@ -1728,6 +1762,7 @@ class OutputPanel(QWidget):
                 allow_voice_mismatch=False,
                 job_id=candidate.job_id,
                 resume_staging_dir=str(candidate.staging_dir),
+                compression=self._settings.compression,
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Job Already Active", str(exc))

@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from app.services.compression import normalize_level
 from app.utils.paths import AppPaths
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,10 @@ _DEFAULTS: dict[str, Any] = {
     # Windows + NVIDIA, offline voices: "auto" (the faster of card and
     # processor, from the speed check) | "gpu" | "cpu".
     "gpu_mode": "auto",
+    # Audiobook compression of the saved MP3: "off" | "light" | "balanced"
+    # | "smallest" (see app.services.compression).  On by default — spoken
+    # word does not need the voices' native bitrate.
+    "compression": "balanced",
 }
 
 GPU_MODES = ("auto", "gpu", "cpu")
@@ -259,6 +264,14 @@ class AppSettings:
     @gpu_mode.setter
     def gpu_mode(self, value: str) -> None:
         self._data["gpu_mode"] = value if value in GPU_MODES else "auto"
+
+    @property
+    def compression(self) -> str:
+        return normalize_level(self._data.get("compression"))
+
+    @compression.setter
+    def compression(self, value: str) -> None:
+        self._data["compression"] = normalize_level(value)
 
     def rate_string(self) -> str:
         """Return rate as edge_tts expects: '+5%' or '-10%'."""

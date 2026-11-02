@@ -19,8 +19,10 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from app.services.compression import local_bitrate_kbps
 from app.services.local_tts import (
     CANCELLED_ERRORS,
+    MP3_BITRATE_KBPS,
     Mp3Writer,
     local_display_name,
     make_synthesizer,
@@ -37,8 +39,8 @@ logger = logging.getLogger(__name__)
 CHUNK_CHARS = 1_200
 _NO_PAYLOAD_LIMIT = 10**9
 _RETRIES = 2
-#: 64 kbit/s MP3 ≈ 8 KB/s of audio; narration ≈ 15 chars/s.
-_BYTES_PER_CHAR = 8_000 / 15
+#: Narration runs at about 15 characters per second of audio.
+_CHARS_PER_SECOND = 15
 
 
 class _NothingToSay(ValueError):
@@ -64,6 +66,7 @@ class LocalTTSWorker(QThread):
         output_path: str,
         *,
         job_id: str | None = None,
+        compression: str = "off",
         **_ignored,
     ) -> None:
         super().__init__()
@@ -73,6 +76,8 @@ class LocalTTSWorker(QThread):
         self._volume = volume
         self._output_path = output_path
         self._job_id = job_id or uuid.uuid4().hex
+        # Local audio is encoded once, straight at the compression bitrate.
+        self._bitrate_kbps = local_bitrate_kbps(compression, MP3_BITRATE_KBPS)
         self._cancelled = False
         self._synth = None
         self.audio_duration_seconds: float | None = None
@@ -115,7 +120,7 @@ class LocalTTSWorker(QThread):
             # Local voices render at a fixed level; the volume setting is
             # applied to the samples on their way into the MP3.
             writer = Mp3Writer(self._output_path, synth.sample_rate,
-                               gain=volume_gain(self._volume))
+                               self._bitrate_kbps, gain=volume_gain(self._volume))
 
             done_chars = 0
             silent = 0
@@ -169,8 +174,9 @@ class LocalTTSWorker(QThread):
             elapsed = time.monotonic() - start
             self.progress.emit(100)
             self.status_changed.emit("Done")
-            logger.info("Local generation complete: voice=%s chars=%d audio=%.1fs elapsed=%.1fs",
-                        self._voice, total_chars, writer.duration_seconds, elapsed)
+            logger.info("Local generation complete: voice=%s chars=%d audio=%.1fs "
+                        "bitrate=%dkbps elapsed=%.1fs", self._voice, total_chars,
+                        writer.duration_seconds, self._bitrate_kbps, elapsed)
             self.completed.emit(self._output_path, elapsed)
         except CANCELLED_ERRORS:
             logger.info("Local generation cancelled: %s", self._output_path)
@@ -217,7 +223,8 @@ class LocalTTSWorker(QThread):
         target = Path(self._output_path).parent
         try:
             target.mkdir(parents=True, exist_ok=True)
-            need = int(total_chars * _BYTES_PER_CHAR * 1.2)
+            bytes_per_char = self._bitrate_kbps * 1000 / 8 / _CHARS_PER_SECOND
+            need = int(total_chars * bytes_per_char * 1.2)
             free = shutil.disk_usage(target).free
         except OSError:
             return

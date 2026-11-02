@@ -195,11 +195,45 @@ def run(argv: list[str]) -> int:
             raise RuntimeError(f"implausible duration {seconds}")
         return f"{kokoro_tts.DEFAULT_VOICE}: {seconds:.1f} s"
 
+    def compression():
+        # Audiobook compression decodes with miniaudio (a cffi extension) and
+        # re-encodes with lameenc: both must load inside the frozen bundle.
+        import math
+        import struct
+        import tempfile
+        from app.services import compression as audio_compression
+        from app.services.local_tts import Mp3Writer
+        from app.utils.mp3_duration import mp3_duration_seconds
+
+        import miniaudio  # noqa: F401
+        out = Path(tempfile.gettempdir()) / "setuptts-selftest-compress.mp3"
+        try:
+            writer = Mp3Writer(out, 24000, 48)
+            rate = 24000
+            pcm = b"".join(struct.pack("<h", int(6000 * math.sin(2 * math.pi * 330 * i / rate)
+                                                 * (0.6 + 0.4 * math.sin(2 * math.pi * 3 * i / rate))))
+                           for i in range(rate * 6))
+            writer.write(pcm)
+            writer.finish()
+            before = mp3_duration_seconds(out)
+            result = audio_compression.compress_mp3_in_place(
+                out, audio_compression.BALANCED, source_bitrate_kbps=48)
+            if result is None:
+                raise RuntimeError("compression made no smaller file")
+            after = mp3_duration_seconds(out)
+        finally:
+            out.unlink(missing_ok=True)
+        if not after or abs(after - before) > 0.5:
+            raise RuntimeError(f"length changed {before} -> {after}")
+        return (f"{result.original_bytes} -> {result.compressed_bytes} bytes, "
+                f"{after:.1f} s")
+
     check("assets", assets)
     check("imports", imports)
     check("tls", tls)
     check("qt_gui", qt_gui)
     check("offline_voice", offline_voice)
+    check("compression", compression)
     check("system_voices", system_voices)
     check("kokoro_runtime", kokoro_runtime)
     if kokoro_download:

@@ -530,6 +530,7 @@ class MainWindow(QMainWindow):
         self._output_panel.job_completed.connect(self._history_panel.add_job)
         # Status messages → status bar
         self._output_panel.status_message.connect(self.status_bar.showMessage)
+        self._output_panel.settings_requested.connect(self._open_settings)
         self._input_panel.status_message.connect(
             lambda text: self.status_bar.showMessage(text, 5_000)
         )
@@ -545,6 +546,7 @@ class MainWindow(QMainWindow):
             # chosen in Settings was ignored and then overwritten by the
             # sidebar's value on the next Generate.
             self._output_panel.apply_default_folder()
+            self._output_panel.refresh_compression_label()
 
     def _open_about(self) -> None:
         from app.ui.dialogs.about_dialog import AboutDialog
