@@ -36,7 +36,16 @@ SMALLEST = "smallest"
 
 #: Every accepted setting value, in the order the Settings dialog lists them.
 LEVELS = (OFF, LIGHT, BALANCED, SMALLEST)
-DEFAULT_LEVEL = BALANCED
+#: Light by default.  Online audio arrives already compressed (48 kbit/s), so
+#: every level re-encodes it, and below 40 kbit/s that second encode is
+#: audible: the encoder drops to 22 kHz / 16 kHz, rolls off the treble, and
+#: the speech turns swirly, echo-like.  At 40 kbit/s the sample rate and the
+#: band up to ~11 kHz are kept and the result stays close to the original.
+DEFAULT_LEVEL = LIGHT
+
+#: The default before v2.2.1.  Settings saved by v2.2.0 hold it even when the
+#: user never chose it; see AppSettings._load.
+PREVIOUS_DEFAULT_LEVEL = BALANCED
 
 
 @dataclass(frozen=True)
@@ -58,9 +67,9 @@ PROFILES: dict[str, CompressionProfile] = {
     LIGHT: CompressionProfile(LIGHT, "Light", 40,
                               "Near-original clarity, a little smaller"),
     BALANCED: CompressionProfile(BALANCED, "Balanced", 32,
-                                 "Clear narration; the best balance of size and quality for audiobooks"),
+                                 "Noticeably smaller; online voices can sound slightly muffled or echoey"),
     SMALLEST: CompressionProfile(SMALLEST, "Smallest", 24,
-                                 "Smallest files; speech stays clear but a little less crisp"),
+                                 "Smallest files; speech loses crispness and online voices sound echoey"),
 }
 
 #: LAME quality 5 is its default ("good"): within earshot of 2 for speech at

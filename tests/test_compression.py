@@ -101,8 +101,58 @@ def _settings(tmp_path):
     return AppSettings(Paths())
 
 
-def test_compression_is_on_by_default(tmp_path):
-    assert _settings(tmp_path).compression == compression.DEFAULT_LEVEL == "balanced"
+def test_compression_is_on_by_default_at_the_light_level(tmp_path):
+    # Light, not Balanced: stronger levels re-encode the already-compressed
+    # online audio hard enough to sound echoey (v2.2.1).
+    assert _settings(tmp_path).compression == compression.DEFAULT_LEVEL == "light"
+
+
+def _write_settings(tmp_path, data: dict) -> None:
+    (tmp_path / "settings.json").write_text(json.dumps(data))
+
+
+def test_untouched_v220_default_moves_to_light(tmp_path):
+    # v2.2.0 saved its default ("balanced") like any other value.
+    _write_settings(tmp_path, {"compression": "balanced", "rate": 12})
+    s = _settings(tmp_path)
+    assert s.compression == "light"
+    assert s.rate == 12
+    s.save()
+    stored = json.loads((tmp_path / "settings.json").read_text())
+    assert stored["compression"] == "light"
+    assert stored["compression_user_set"] is False
+
+
+@pytest.mark.parametrize("level", ["off", "light", "smallest"])
+def test_other_saved_levels_are_kept(tmp_path, level):
+    # Anything other than the old default was a deliberate choice.
+    _write_settings(tmp_path, {"compression": level})
+    assert _settings(tmp_path).compression == level
+
+
+def test_a_level_the_user_picked_is_never_migrated(tmp_path):
+    _write_settings(tmp_path, {"compression": "balanced", "compression_user_set": True})
+    assert _settings(tmp_path).compression == "balanced"
+
+
+def test_choosing_a_level_in_settings_marks_it_as_the_users(qtbot, tmp_path):
+    from app.ui.dialogs.settings_dialog import SettingsDialog
+    from app.utils.paths import AppPaths
+
+    settings = _settings(tmp_path)
+    dialog = SettingsDialog(settings, AppPaths())
+    qtbot.addWidget(dialog)
+    dialog._save()          # saving without touching the level ...
+    assert _settings(tmp_path).compression_user_set is False   # ... is not a choice
+
+    settings = _settings(tmp_path)
+    dialog = SettingsDialog(settings, AppPaths())
+    qtbot.addWidget(dialog)
+    dialog._compression_combo.setCurrentIndex(dialog._compression_combo.findData("balanced"))
+    dialog._save()
+    reloaded = _settings(tmp_path)
+    assert reloaded.compression == "balanced"
+    assert reloaded.compression_user_set is True
 
 
 def test_compression_setting_round_trips_and_survives_bad_values(tmp_path):
@@ -116,10 +166,10 @@ def test_compression_setting_round_trips_and_survives_bad_values(tmp_path):
 
     (tmp_path / "settings.json").write_text(json.dumps({"compression": 42, "rate": 9}))
     loaded = _settings(tmp_path)
-    assert loaded.compression == "balanced"
+    assert loaded.compression == "light"
     assert loaded.rate == 9, "a bad compression value must not reset other settings"
     (tmp_path / "settings.json").write_text(json.dumps({"compression": "ultra"}))
-    assert _settings(tmp_path).compression == "balanced"
+    assert _settings(tmp_path).compression == "light"
 
 
 # ------------------------------------------------------------------ #
@@ -148,6 +198,32 @@ def test_compress_shrinks_keeps_length_and_sound(tmp_path, level):
     assert not list(tmp_path.glob("*.part")), "no temporary file may be left behind"
     # Not just smaller: it must still be the same audio.
     assert _similarity(original, _decode(src)) > 0.95
+
+
+def _band_db(x: np.ndarray, lo: float, hi: float, rate: int = RATE) -> float:
+    spectrum = np.abs(np.fft.rfft(x * np.hanning(x.size))) ** 2
+    freqs = np.fft.rfftfreq(x.size, 1 / rate)
+    return 10 * np.log10(spectrum[(freqs >= lo) & (freqs < hi)].sum() + 1e-12)
+
+
+def test_default_level_keeps_the_sample_rate_and_the_treble(tmp_path):
+    # The echoey sound of v2.2.0's default came from re-encoding the 48 kbit/s
+    # online audio at 32 kbit/s: the encoder resamples to 22 kHz and rolls
+    # off everything above ~7 kHz.  The default must keep 24 kHz and the
+    # speech band intact.
+    import miniaudio
+
+    src = _make_mp3(tmp_path / "book.mp3", seconds=20)
+    original = _decode(src)
+    assert compression.compress_mp3_in_place(
+        src, compression.DEFAULT_LEVEL, source_bitrate_kbps=48) is not None
+    assert miniaudio.mp3_get_file_info(str(src)).sample_rate == RATE
+    compressed = _decode(src)
+    n = min(original.size, compressed.size)
+    for lo, hi in [(0, 4_000), (4_000, 7_000), (7_000, 10_000)]:
+        assert _band_db(compressed[:n], lo, hi) == pytest.approx(
+            _band_db(original[:n], lo, hi), abs=1.5), f"{lo}-{hi} Hz band changed"
+    assert _similarity(original, compressed) > 0.98
 
 
 def test_off_and_already_small_files_are_left_alone(tmp_path):
@@ -371,10 +447,13 @@ def test_settings_dialog_offers_and_saves_compression(qtbot, tmp_path):
     qtbot.addWidget(dialog)
     combo = dialog._compression_combo
     assert [combo.itemData(i) for i in range(combo.count())] == list(compression.LEVELS)
-    assert combo.currentData() == "balanced"
+    assert combo.currentData() == "light"
     assert "recommended" in combo.currentText()
     assert "MB per hour" in combo.currentText()
-    assert "32 kbit/s" in dialog._compression_note.text()
+    assert "40 kbit/s" in dialog._compression_note.text()
+    # Only the default is marked recommended.
+    assert [combo.itemData(i) for i in range(combo.count())
+            if "recommended" in combo.itemText(i)] == ["light"]
 
     combo.setCurrentIndex(combo.findData("off"))
     assert "native quality" in dialog._compression_note.text()
@@ -393,7 +472,7 @@ def test_export_card_shows_the_level_and_links_to_settings(qtbot, tmp_path, monk
     panel = OutputPanel(settings=settings, history=HistoryService(tmp_path / "h.db"))
     qtbot.addWidget(panel)
     label = panel._compression_label
-    assert "Balanced" in label.text() and "14 MB/hour" in label.text()
+    assert "Light" in label.text() and "18 MB/hour" in label.text()
 
     settings.compression = "off"
     panel.refresh_compression_label()

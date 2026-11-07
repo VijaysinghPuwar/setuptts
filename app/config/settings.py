@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from app.services.compression import normalize_level
+from app.services.compression import DEFAULT_LEVEL, PREVIOUS_DEFAULT_LEVEL, normalize_level
 from app.utils.paths import AppPaths
 
 logger = logging.getLogger(__name__)
@@ -35,9 +35,13 @@ _DEFAULTS: dict[str, Any] = {
     # processor, from the speed check) | "gpu" | "cpu".
     "gpu_mode": "auto",
     # Audiobook compression of the saved MP3: "off" | "light" | "balanced"
-    # | "smallest" (see app.services.compression).  On by default — spoken
-    # word does not need the voices' native bitrate.
-    "compression": "balanced",
+    # | "smallest" (see app.services.compression).  Light by default — spoken
+    # word does not need the voices' native bitrate, but stronger levels
+    # audibly degrade the already-compressed online audio.
+    "compression": DEFAULT_LEVEL,
+    # True once the user has picked a compression level in Settings, so a
+    # later change of default never overrides their choice.
+    "compression_user_set": False,
 }
 
 GPU_MODES = ("auto", "gpu", "cpu")
@@ -273,6 +277,14 @@ class AppSettings:
     def compression(self, value: str) -> None:
         self._data["compression"] = normalize_level(value)
 
+    @property
+    def compression_user_set(self) -> bool:
+        return bool(self._data.get("compression_user_set", False))
+
+    @compression_user_set.setter
+    def compression_user_set(self, value: bool) -> None:
+        self._data["compression_user_set"] = bool(value)
+
     def rate_string(self) -> str:
         """Return rate as edge_tts expects: '+5%' or '-10%'."""
         r = self.rate
@@ -319,12 +331,28 @@ class AppSettings:
                         except (TypeError, ValueError, OverflowError):
                             logger.warning("Ignoring invalid setting %s=%r; using default %r",
                                            key, loaded[key], _DEFAULTS[key])
+                self._migrate_compression_default()
             except Exception:
                 logger.warning("Could not load settings; using defaults.", exc_info=True)
                 try:
                     self._path.replace(self._path.with_name(self._path.name + ".corrupt"))
                 except OSError:
                     pass
+
+    def _migrate_compression_default(self) -> None:
+        """
+        Move users still on v2.2.0's default (Balanced) to the new one.
+
+        v2.2.0 saved its default into settings.json like any other value, so
+        "balanced" there usually means "never touched".  Balanced re-encodes
+        online audio hard enough to sound echoey; only a level the user
+        picked in Settings (compression_user_set) is kept.
+        """
+        if (not self._data.get("compression_user_set")
+                and self._data.get("compression") == PREVIOUS_DEFAULT_LEVEL):
+            logger.info("Compression: moving the old default %r to %r",
+                        PREVIOUS_DEFAULT_LEVEL, DEFAULT_LEVEL)
+            self._data["compression"] = DEFAULT_LEVEL
 
     def save(self) -> None:
         """
