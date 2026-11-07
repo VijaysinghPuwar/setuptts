@@ -183,16 +183,18 @@ flowchart TD
 | Speed | Set by the service | ~6–7× realtime on Apple M-series | Depends on voice and CPU |
 | Memory while speaking | Small | ~1.3 GB (~2.4 GB on 16 GB+ machines, which run two pieces at once) | Up to two runs per voice |
 
-**Audiobook compression** is on by default. Spoken word doesn't need the voices' native bitrate, so saved files are made smaller. Pick the level in **Settings ▸ Audiobook compression**; the Export card shows the one in use.
+**Audiobook compression** is on by default at **Light**. Spoken word doesn't need the voices' native bitrate, so saved files are made a little smaller. Pick the level in **Settings ▸ Audiobook compression**; the Export card shows the one in use.
 
 | Level | Bitrate | Size per hour of audio | vs. online native |
 |---|---|---|---|
 | Off | native | ~22 MB online, ~29 MB offline | — |
-| Light | 40 kbit/s | ~18 MB | 17% smaller |
-| **Balanced** (default) | 32 kbit/s | ~14 MB | 33% smaller |
+| **Light** (default) | 40 kbit/s | ~18 MB | 17% smaller |
+| Balanced | 32 kbit/s | ~14 MB | 33% smaller |
 | Smallest | 24 kbit/s | ~11 MB | 50% smaller |
 
-Offline voices are encoded straight at the chosen bitrate. Online audio arrives at 48 kbit/s, so the finished file is re-encoded once its coverage has been verified. The original is only replaced after the smaller copy has been checked to decode to the same length. If the re-encode fails, or the job is cancelled during it, the full-quality file is kept. On real speech, all three levels correlate at 0.99 or higher with the original waveform.
+Offline voices are encoded straight at the chosen bitrate. Online audio arrives at 48 kbit/s, so the finished file is re-encoded once its coverage has been verified. The original is only replaced after the smaller copy has been checked to decode to the same length. If the re-encode fails, or the job is cancelled during it, the full-quality file is kept.
+
+Light keeps online audio at its native 24 kHz, and everything up to about 11 kHz is unchanged. **Balanced** and **Smallest** re-encode the already-compressed online audio hard enough to hear. The encoder drops to 22 / 16 kHz and rolls off the treble, so voices can sound muffled, swirly or echoey. They are fine for offline voices, which are encoded only once. Choose **Off** for the online voices' exact original audio.
 
 Measured on a MacBook Pro M5: a 1.75-million-character web novel became **29 h 24 min of audio in 3 h 51 min** with Kokoro Heart. Memory stayed flat at 2.4 GB. There was no gap longer than 2 s, and speech recognition on samples matched the text apart from character names.
 

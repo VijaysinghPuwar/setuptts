@@ -264,7 +264,10 @@ class SettingsDialog(QDialog):
     def _save(self) -> None:
         self._settings.output_dir = self._output_dir_edit.text().strip()
         self._settings.auto_switch_recommended_voice = self._auto_voice_checkbox.isChecked()
-        self._settings.compression = self._compression_combo.currentData()
+        level = self._compression_combo.currentData()
+        if level != self._settings.compression:
+            self._settings.compression_user_set = True
+        self._settings.compression = level
         self._settings.save()
         self.accept()
 

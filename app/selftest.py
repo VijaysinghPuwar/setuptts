@@ -217,7 +217,7 @@ def run(argv: list[str]) -> int:
             writer.finish()
             before = mp3_duration_seconds(out)
             result = audio_compression.compress_mp3_in_place(
-                out, audio_compression.BALANCED, source_bitrate_kbps=48)
+                out, audio_compression.DEFAULT_LEVEL, source_bitrate_kbps=48)
             if result is None:
                 raise RuntimeError("compression made no smaller file")
             after = mp3_duration_seconds(out)
